@@ -97,7 +97,7 @@ corpus は fixture なので file 単位の SHA-256 は記録する。これに�
 
 ## 親子展開（`OFFLINE_AI_PARENT_CHILD_EXPANSION`）
 
-既定OFF。`OFFLINE_AI_PARENT_CHILD_EXPANSION=true`で有効化すると、`keyword`/`hybrid`/`agentic-lite`いずれのrouteも`finalize_ranked_matches`へcorpusのchunksと`corpus_dir`（`source_root`）を渡し、見出しだけの親candidateから配下本文への展開を行う。評価は製品`skill-source`を一切読まない契約を保つため、展開有効時は必ず固定`corpus_dir`を`source_root`として渡す（`_expansion_kwargs`）。`agentic-lite`routeでは、展開が資料の実bytesを読み直す都合上、`search.SKILL_SOURCE_DIR`自体を一時的に`corpus_dir`へ差し替える（`_isolated_agentic_inputs`）。
+既定ON（2026-09-14、E:実機でのP2比較受入結果を踏まえ利用者判断で切替。`result/offline-ai/parent-child-expansion-p2-20260913/`）。`OFFLINE_AI_PARENT_CHILD_EXPANSION=false`で無効化できる。有効時は`keyword`/`hybrid`/`agentic-lite`いずれのrouteも`finalize_ranked_matches`へcorpusのchunksと`corpus_dir`（`source_root`）を渡し、見出しだけの親candidateから配下本文への展開を行う。評価は製品`skill-source`を一切読まない契約を保つため、展開有効時は必ず固定`corpus_dir`を`source_root`として渡す（`_expansion_kwargs`）。`agentic-lite`routeでは、展開が資料の実bytesを読み直す都合上、`search.SKILL_SOURCE_DIR`自体を一時的に`corpus_dir`へ差し替える（`_isolated_agentic_inputs`）。
 
 Q11（親のみ検索に当たり、配下本文はkeyword候補にすら入らない）はOFF時に`evidence_line_overlap = 0`（既知の取得漏れの再現）、ON時に`1.0`（展開による解消）を示す。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
 

@@ -1,9 +1,9 @@
 """親子展開のP1b: run_retrieval_pipeline / finalize_ranked_matches 統合試験。
 
-OFFLINE_AI_PARENT_CHILD_EXPANSION による既定OFF/ON切り替え、agentic-lite
-分離（展開前候補だけを次試行のmerge/_retry_queriesへ渡す）、8件以下の
-出力上限、sufficient追加判定経路を、keyword専用の決定的経路で検証する。
-Ollama を必要としない（chat/embedding を一切呼ばない）。
+OFFLINE_AI_PARENT_CHILD_EXPANSION による既定ON（明示的にfalseでOFF切り替え
+可能）、agentic-lite分離（展開前候補だけを次試行のmerge/_retry_queriesへ
+渡す）、8件以下の出力上限、sufficient追加判定経路を、keyword専用の決定的
+経路で検証する。Ollama を必要としない（chat/embedding を一切呼ばない）。
 """
 
 import os
@@ -34,8 +34,13 @@ def _prepare_keyword_only_pipeline(monkeypatch, tmp_path):
     )
 
 
-def test_expansion_disabled_by_default(monkeypatch, tmp_path):
-    """既定OFFでは展開が一切行われず、親candidateのみが根拠になる。"""
+def test_expansion_enabled_by_default(monkeypatch, tmp_path):
+    """既定（環境変数未設定）ONでは、見出しだけの親候補が展開される。
+
+    2026-09-14、E:実機でのP2比較受入（result/offline-ai/
+    parent-child-expansion-p2-20260913/）を経て利用者判断により既定ONへ
+    切り替えた。
+    """
     monkeypatch.delenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", raising=False)
     _write(
         tmp_path,
@@ -46,7 +51,27 @@ def test_expansion_disabled_by_default(monkeypatch, tmp_path):
 
     result = search.run_retrieval_pipeline("手順概要", model="m", mode="search")
 
-    assert all(m.get("source") != "expanded" for m in result.matches)
+    expanded = [m for m in result.matches if m.get("source") == "expanded"]
+    assert expanded, "既定ONでは展開item が根拠に含まれるべき"
+    assert any("手順の詳細本文" in m.get("snippet", "") for m in expanded)
+
+
+def test_expansion_can_be_disabled_via_env_var(monkeypatch, tmp_path):
+    """OFFLINE_AI_PARENT_CHILD_EXPANSION=false を明示すれば展開を無効化できる。"""
+    monkeypatch.setenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", "false")
+    try:
+        _write(
+            tmp_path,
+            "doc.md",
+            "# 手順概要\n\n## 手順の詳細\n手順の詳細本文をここに書く\n",
+        )
+        _prepare_keyword_only_pipeline(monkeypatch, tmp_path)
+
+        result = search.run_retrieval_pipeline("手順概要", model="m", mode="search")
+
+        assert all(m.get("source") != "expanded" for m in result.matches)
+    finally:
+        monkeypatch.delenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", raising=False)
 
 
 def test_expansion_enabled_recovers_child_body(monkeypatch, tmp_path):

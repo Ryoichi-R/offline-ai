@@ -3926,8 +3926,9 @@ def merge_and_filter_matches(
 # 返す「見出しだけの親candidate」に対し、同一資料snapshotから見出しツリーを
 # 解析し、配下の子見出しの本文範囲を実在する行範囲として展開する。
 #
-# P1a: 原文順のみで展開する純粋関数群。finalize_ranked_matches /
-# run_retrieval_pipeline へはまだ統合しない（P1bで統合し、既定OFF設定を通す）。
+# finalize_ranked_matches / run_retrieval_pipeline に統合済み。既定ON
+# （2026-09-14、P2実機比較受入 result/offline-ai/parent-child-expansion-p2-20260913/
+# の結果に基づく利用者判断）。OFFLINE_AI_PARENT_CHILD_EXPANSION=false で無効化できる。
 # ---------------------------------------------------------------------------
 
 EXPANSION_MAX_PARENTS_PER_QUERY = env_int(
@@ -3945,7 +3946,7 @@ EXPANSION_BUDGET_RATIO = env_float(
 
 
 def _parent_child_expansion_enabled() -> bool:
-    return _env_bool("OFFLINE_AI_PARENT_CHILD_EXPANSION", False)
+    return _env_bool("OFFLINE_AI_PARENT_CHILD_EXPANSION", True)
 
 
 # ファイル単位の見出しツリー memo。source chunk memo と同じ世代キー
