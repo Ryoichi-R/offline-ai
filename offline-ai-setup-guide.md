@@ -79,13 +79,13 @@ Markdownと同じ場所に`<file>.md.metadata.json`を置くと、ページ、�
 
 ## `search.bat`を使う
 
-1. `index.bat build`を起動し、Embeddingインデックスを事前構築します。進捗、概算残時間、checkpoint件数だけが表示されます。
+1. `index.bat build`を起動し、Embeddingインデックスを事前構築します。通常はファイル単位の差分更新で、追加・変更ファイルの全chunkだけを再計算し、未変更ファイルは検証後に再利用します。互換性を再確認したい復旧操作では`index.bat build --full`を使います。Embeddingモデルの識別情報（digest）をOllamaから取得できない場合、同名モデルの差し替えを検知できないため、通常のbuildでも毎回全件を再計算します。資料ファイルを1件でも読み取れない場合は、削除と誤認しないよう更新を中止して`SOURCE_SNAPSHOT_FAILED`を表示するため、ファイルを閉じてから再実行してください。進捗、再計算/再利用件数、生成件数ベースの概算残時間、checkpoint件数だけが表示されます。
 2. 長時間処理を中止する場合は`index.bat cancel`、再開する場合は`index.bat resume`を使います。Ctrl+Cの終了コードは130です。
 3. `search.bat`を起動して質問を入力します。
 4. ready状態ならkeyword、Embedding、RRF等で抽出された資料を基に回答が表示されます。missing/stale/building/cancelled/failed状態では、構築を待たず「キーワード検索のみ」で回答します。
 5. 回答と一緒に表示される根拠、route、ページ、見出し、警告を確認します。
 
-Embedding生成はOllamaの`/api/embed`配列入力を使い、件数・順序・次元・有限値を検証します。batch sizeは`OFFLINE_AI_EMBED_BATCH_SIZE`（既定16、許容1～64）、1 batchのrequest timeoutは`OFFLINE_AI_EMBED_REQUEST_TIMEOUT`（既定120秒）、index全体のfail-safe上限は`OFFLINE_AI_INDEX_MAX_SECONDS`（既定6時間）です。2026-09-07のEドライブ実測では18,284チャンクを60分以内に完走し、batch 32も安定しましたが、ピークRAM/VRAM未計測のため共通既定値は16としています。checkpointとcacheは利用者資料を含み得る実行時生成物であり、公開packageやreceiptへコピーしないでください。
+Embedding生成はOllamaの`/api/embed`配列入力を使い、件数・順序・次元・有限値を検証します。cacheには資料fileのSHA-256 manifest、モデルdigest、parser/chunk契約、ベクトル次元を保存します。モデルdigestを取得できない場合は既存Embeddingを再利用せず、全件再構築へ倒れます。batch sizeは`OFFLINE_AI_EMBED_BATCH_SIZE`（既定16、許容1～64）、1 batchのrequest timeoutは`OFFLINE_AI_EMBED_REQUEST_TIMEOUT`（既定120秒）、index全体のfail-safe上限は`OFFLINE_AI_INDEX_MAX_SECONDS`（既定6時間）です。checkpointとcacheは利用者資料を含み得る実行時生成物であり、公開packageやreceiptへコピーしないでください。
 
 検索結果は原本の真正性を保証しません。重要な判断では必ず原資料を確認してください。
 
@@ -98,7 +98,7 @@ Embedding生成はOllamaの`/api/embed`配列入力を使い、件数・順序�
 | `OFFLINE_AI_GENERATION_STALL_TIMEOUT` | `60`（秒）  | 回答生成中にOllamaから何のバイトも届かない時間の上限。thinkingデルタも受信として数える。超過時はWeb UIに「モデルからの応答が途絶えました」と表示される                                                                     |
 | `OFFLINE_AI_KEEP_ALIVE`               | `30m`       | chat/embed両モデルをOllama側に保持する時間。`gpt-oss:20b`は初回cold検索でモデルロード約32秒、検索evidence到達約80秒の実測があるため、クエリ間隔が空いても再ロードを避ける。`0`にすると応答直後に従来どおりアンロードされる |
 | `OFFLINE_AI_EMBED_CACHE_MEMO`         | `1`（有効） | `embed_cache.json`をmtime/size一致時に再読込しないメモ化。`0`にすると毎回読み直す（トラブルシュート用の退避路）                                                                                                            |
-| `OFFLINE_AI_SOURCE_CHUNK_MEMO`        | `1`（有効） | `/api/index/status`が毎回行うskill-source走査（chunk化とgeneration算出）を、(相対path, 更新時刻, サイズ)集合の一致時に省略するメモ化。`0`で無効化                                                                          |
+| `OFFLINE_AI_SOURCE_CHUNK_MEMO`        | `1`（有効） | `/api/index/status`が毎回行うskill-source走査（chunk化とgeneration算出）を、相対path・更新時刻・サイズ・実SHA-256集合の一致時に省略するメモ化。同サイズ・同mtimeの変更も見逃さない。`0`で無効化 |
 
 ### prompt予算とcontextウィンドウ（推論あり運用）
 
@@ -131,11 +131,12 @@ prompt・thinking・回答本文は同じcontextウィンドウ（`OLLAMA_NUM_CT
 
 1. `web.bat`を起動します。
 2. 表示された一回限りのbootstrap tokenでブラウザUIを開きます。
-3. 「インデックスを準備」から事前構築を開始・監視・停止します。ブラウザをreloadしてもjobは継続します。
+3. 「インデックスを準備」から差分更新の事前解析・確認・開始・監視・停止を行います。「全件再構築」は明示的に全chunkを再計算します。確認時の資料generationと開始時のgenerationが変わった場合は開始せず、再確認を求めます。ブラウザをreloadしてもjobは継続します。
 4. 検索queryと推論強度、検索タイムアウト（秒）を指定して実行します。モードは既定の「回答を作る」と「資料を探す」から選べます。後者は検索計画と回答生成を行わず、根拠だけを返します。index未準備時やEmbeddingを利用できない場合はキーワード検索へdegradeし、根拠欄にrouteと理由が表示されます。
 5. 生成中はthinking（モデルの思考過程）が「思考中…」の折りたたみ欄へ逐次表示されます。回答本文が届き始めると自動的に畳まれます。thinkingの内容はブラウザにのみ表示され、ログや履歴には文字数だけが残ります。
 6. 検索実行中は「全体残り R / N秒」がサーバーの確定deadlineを基準に1秒ごと更新表示されます。完了・エラー・利用者中止のいずれでも表示は消え、次回検索で新しい値から始まります。
-7. 回答、根拠、parser警告を確認します。「該当箇所を表示」は検索用テキストの行窓だけを表示し、資料を編集・PDFとして開く操作は行いません。正常完了後の「Markdownで保存」は質問・回答または検索結果、根拠の抜粋、実行条件をブラウザから保存します。保存先や履歴をサーバーへ渡す機能はありません。
+7. `web.bat`で起動した場合、Web画面のページ（タブ）をすべて閉じるとサーバーは自動で停止します。再読み込みや別タブが開いている間は停止しません。Embeddingインデックスの構築中は完了まで停止を待ちます。閉じた後に使うときは`web.bat`を起動し直してください。組み込みブラウザ等で閉じたことを通知できない場合は、表示中だったページは約1分、背景タブは約5分で停止します。ブラウザの省メモリ機能でタブが休止・破棄された場合も停止するため、画面に「サーバーに接続できません」と出たら`web.bat`を起動し直してください。`OFFLINE_AI_WEB_CONSOLE=1`で起動したコンソール版は従来どおりCtrl+Cで停止します。
+8. 回答、根拠、parser警告を確認します。「該当箇所を表示」は検索用テキストの行窓だけを表示し、資料を編集・PDFとして開く操作は行いません。正常完了後の「Markdownで保存」は質問・回答または検索結果、根拠の抜粋、実行条件をブラウザから保存します。保存先や履歴をサーバーへ渡す機能はありません。
 
 Web serverはloopbackへbindし、検索・根拠閲覧・health・bootstrap・Embedding index管理を提供します。全体のtimeout上限はハング防止のための最終防波堤であり、通常はその手前で生成が完了するか、無通信60秒（`OFFLINE_AI_GENERATION_STALL_TIMEOUT`）でstall検知されます。既定はサーバー起動時の`OFFLINEAI_SEARCH_TIMEOUT`（既定300秒）ですが、Web UIの「検索タイムアウト（秒）」入力で検索1回ごとに300〜600秒の範囲から上書きできます（未入力・省略時はサーバー既定）。stallの60秒は利用者設定の対象外で、全体残り時間が残っていてもモデルからの応答が60秒途絶えれば先に打ち切られます。範囲外・小数・非数値をAPIへ直接送った場合はworkerを開始せずHTTP 400 `invalid_timeout`になります。
 

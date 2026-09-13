@@ -34,7 +34,7 @@ Web UIでは「回答を作る」と「資料を探す」を選べます。「�
 2. packageをオフラインPCへ搬送します。
 3. package内の`install-offline.bat`を実行します。
 4. `skill-source`へ資料を配置します。
-5. `index.bat build`でEmbeddingインデックスを事前構築し、完了後に`search.bat`または`web.bat`を使用します。未構築・更新中でも検索はキーワード検索のみで継続します。
+5. `index.bat build`でEmbeddingインデックスを事前構築し、完了後に`search.bat`または`web.bat`を使用します。通常のbuildはファイル単位の差分更新で、未変更ファイルのEmbeddingを再利用し、追加・変更ファイルだけを再計算します。全件再構築が必要な場合だけ`index.bat build --full`を使います。未構築・更新中でも検索はキーワード検索のみで継続します。
 
 詳しくは[セットアップガイド](offline-ai-setup-guide.md)を参照してください。
 

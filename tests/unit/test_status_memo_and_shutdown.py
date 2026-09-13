@@ -78,6 +78,23 @@ def test_memo_invalidated_when_file_updated(source_root, monkeypatch):
     assert calls["n"] == 2
 
 
+def test_memo_invalidated_when_same_size_and_mtime_file_content_changes(
+    source_root, monkeypatch
+):
+    """mtime/sizeが同じでもhash差分でmemoを無効化する。"""
+    calls = _count_calls(monkeypatch)
+    target = source_root / "a.md"
+    search.load_source_chunks_cached(source_root)
+    original_stat = target.stat()
+    original_bytes = target.read_bytes()
+    target.write_bytes(original_bytes.replace("本文A".encode(), "本文Z".encode()))
+    # 内容だけを置換してから、元の時刻へ戻す。
+    assert target.stat().st_size == original_stat.st_size
+    os.utime(target, ns=(original_stat.st_mtime_ns, original_stat.st_mtime_ns))
+    search.load_source_chunks_cached(source_root)
+    assert calls["n"] == 2
+
+
 def test_memo_invalidated_when_file_deleted(source_root, monkeypatch):
     calls = _count_calls(monkeypatch)
     search.load_source_chunks_cached(source_root)

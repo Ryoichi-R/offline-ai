@@ -718,6 +718,31 @@ def detect_embed_model() -> Optional[str]:
     return None
 
 
+def get_embed_model_identity(
+    model: str, *, timeout: float = 2.0
+) -> dict[str, str] | None:
+    """Ollamaのmodel digestを取得する。取得不能なら安全側に ``None``。"""
+    requested = _canonical_model_reference(model)
+    try:
+        request = urllib.request.Request(f"{OLLAMA_HOST}/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        return None
+    for item in payload["models"]:
+        if not isinstance(item, dict):
+            continue
+        if _canonical_model_reference(str(item.get("name", ""))) != requested:
+            continue
+        digest = str(item.get("digest", "")).strip()
+        if digest:
+            return {"name": requested, "digest": digest}
+        return None
+    return None
+
+
 class EmbeddingBatchError(RuntimeError):
     """/api/embed の応答を安全に解釈できない場合の安定エラー。"""
 
@@ -1002,13 +1027,42 @@ def _line_chunks(
     return chunks
 
 
-def chunk_source_file(
-    path: Path, rel_path: str, *, max_chars: int = CHUNK_MAX_CHARS
+class SourceSnapshotError(RuntimeError):
+    """資料snapshotを完全には取得できなかった。"""
+
+    code = "SOURCE_SNAPSHOT_FAILED"
+
+    def __init__(self, failed_paths: list[str]):
+        super().__init__(
+            f"{len(failed_paths)} source file(s) could not be read or parsed: "
+            + ", ".join(failed_paths[:5])
+        )
+        self.failure_count = len(failed_paths)
+        self.failed_paths = list(failed_paths)
+
+
+class SourceChunkList(list):
+    """chunk list と、同じ走査で得た file manifest の組。
+
+    list の部分型なので既存 caller はそのまま使える。``source_complete`` が
+    False の場合は読み取り・解析できないファイルがあり、manifest は資料全体を
+    表さない（ready 判定に使ってはならない）。
+    """
+
+    source_manifest: dict[str, dict] | None = None
+    source_complete: bool = True
+
+
+def _chunk_source_bytes(
+    data: bytes,
+    path: Path,
+    rel_path: str,
+    *,
+    max_chars: int = CHUNK_MAX_CHARS,
 ) -> list[dict]:
-    """source ファイルを検索・Embedding 用チャンクへ分割する。"""
-    # 本文とhashを同じ読出しbytesから作り、途中の更新で別世代を混ぜない。
-    # 検索後に更新された資料はビューア側のhash照合で拒否される。
-    data = path.read_bytes()
+    """同じbytesから本文・hash・chunkを作り、世代混在を防ぐ。"""
+    # 不正バイトは U+FFFD として保持する。検索とindexで同じ本文・chunk_idに
+    # なるよう、decode規則を1つに固定する（EMBED_SOURCE_PARSER_VERSIONの一部）。
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
     chunks = _line_chunks(rel_path, lines, max_chars=max_chars)
@@ -1029,20 +1083,115 @@ def chunk_source_file(
     return chunks
 
 
-def build_source_chunks(source_root: Path | None = None) -> list[dict]:
-    chunks: list[dict] = []
+def chunk_source_file(
+    path: Path, rel_path: str, *, max_chars: int = CHUNK_MAX_CHARS
+) -> list[dict]:
+    """source ファイルを検索・Embedding 用チャンクへ分割する。"""
+    return _chunk_source_bytes(path.read_bytes(), path, rel_path, max_chars=max_chars)
+
+
+def _read_source_snapshot(
+    source_root: Path | None = None,
+) -> tuple[SourceChunkList, dict[str, dict], list[str]]:
+    """資料を1回走査し、chunk・file manifest・失敗pathを返す。
+
+    manifestはchunkが0件のファイルも保持する。読み取り・解析に失敗した
+    ファイルは manifest に含めず、空ファイルや削除とは区別して返す。
+    """
+    chunks = SourceChunkList()
+    files: dict[str, dict] = {}
+    failed: list[str] = []
     for path, rel in iter_source_files(source_root):
         try:
-            chunks.extend(chunk_source_file(path, rel))
-        except OSError:
+            data = path.read_bytes()
+            file_chunks = _chunk_source_bytes(data, path, rel)
+        except (OSError, ValueError):
+            failed.append(rel)
             continue
+        files[rel] = {
+            "file_sha256": hashlib.sha256(data).hexdigest(),
+            "chunk_ids": [str(chunk["chunk_id"]) for chunk in file_chunks],
+            "chunk_count": len(file_chunks),
+        }
+        chunks.extend(file_chunks)
+    chunks.source_manifest = files
+    chunks.source_complete = not failed
+    return chunks, files, failed
+
+
+def build_source_snapshot(
+    source_root: Path | None = None,
+) -> tuple[list[dict], dict[str, dict]]:
+    """index writer用の完全snapshot。1件でも読めなければ更新を保留する。"""
+    chunks, files, failed = _read_source_snapshot(source_root)
+    if failed:
+        raise SourceSnapshotError(failed)
+    return chunks, files
+
+
+def _source_manifest_from_chunks(chunks: list[dict]) -> dict[str, dict]:
+    """テスト・既存caller向けにchunk集合からmanifestを再構成する。"""
+    files: dict[str, dict] = {}
+    for chunk in chunks:
+        rel = normalize_source_path(str(chunk.get("path", "")))
+        if not rel:
+            continue
+        item = files.setdefault(
+            rel,
+            {
+                "file_sha256": str(chunk.get("file_sha256", "")),
+                "chunk_ids": [],
+                "chunk_count": 0,
+            },
+        )
+        item["chunk_ids"].append(str(chunk.get("chunk_id", "")))
+        item["chunk_count"] = len(item["chunk_ids"])
+    return files
+
+
+def _chunk_snapshot_signature(chunks: list[dict]) -> tuple:
+    """昇格直前の再読込比較用。mtimeだけは世代差としない。"""
+    signature = []
+    for chunk in chunks:
+        signature.append(
+            json.dumps(
+                {key: value for key, value in chunk.items() if key != "modifiedAt"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    return tuple(sorted(signature))
+
+
+def build_source_chunks(source_root: Path | None = None) -> list[dict]:
+    """検索read経路用のchunk集合。読めないファイルはskipし、検索を止めない。
+
+    戻り値の ``SourceChunkList`` には manifest と完全性が付き、
+    ``get_embed_index_status`` は不完全なsnapshotを ready と判定しない。
+    """
+    chunks, _files, _failed = _read_source_snapshot(source_root)
     return chunks
 
 
+def _source_manifest_for_chunks(
+    chunks: list[dict], source_manifest: dict[str, dict] | None = None
+) -> tuple[dict[str, dict], bool]:
+    """ready判定に使う manifest と、そのsnapshotが完全かを返す。"""
+    if source_manifest is not None:
+        return source_manifest, True
+    attached = getattr(chunks, "source_manifest", None)
+    if isinstance(attached, dict):
+        return attached, bool(getattr(chunks, "source_complete", True))
+    # 差し替えられた build_source_chunks や明示chunkを渡す既存caller。
+    return _source_manifest_from_chunks(chunks), True
+
+
 # build_source_chunks() / compute_embed_generation() の read 経路専用 memo。
-# キーは skill-source の (rel, st_mtime_ns, st_size) 集合であり、追加・更新・
-# 削除のいずれでもキーが変わるため自己無効化する。index build の writer 経路は
-# build_source_chunks() を直接呼び、この memo を通らない。
+# キーは skill-source の (rel, st_mtime_ns, st_size, sha256) 集合であり、追加・
+# 更新・削除に加え、同size/同mtimeの内容変更でもキーが変わり自己無効化する。
+# index build の writer 経路は build_source_snapshot() を直接呼び、この memo を
+# 通らない。
 _SOURCE_CHUNK_MEMO_KEY: tuple | None = None
 _SOURCE_CHUNK_MEMO_VALUE: list[dict] | None = None
 _EMBED_GENERATION_MEMO_KEY: tuple | None = None
@@ -1066,7 +1215,11 @@ def _source_chunk_memo_key(source_root: Path | None = None) -> tuple | None:
             stat = path.stat()
         except OSError:
             return None
-        entries.append((rel, stat.st_mtime_ns, stat.st_size))
+        try:
+            file_sha = _file_sha256(path)
+        except OSError:
+            return None
+        entries.append((rel, stat.st_mtime_ns, stat.st_size, file_sha))
     entries.sort()
     return tuple(entries)
 
@@ -1107,8 +1260,11 @@ def compute_embed_generation_cached(
     return generation
 
 
-EMBED_CACHE_VERSION = 4
-EMBED_CHECKPOINT_SCHEMA_VERSION = 2
+EMBED_CACHE_VERSION = 5
+EMBED_CHECKPOINT_SCHEMA_VERSION = 3
+EMBED_COMPATIBILITY_VERSION = 1
+EMBED_SOURCE_PARSER_VERSION = 1
+EMBED_INDEX_MODES = {"incremental", "full"}
 _EMBED_PROCESS_LOCK = threading.Lock()
 _CHECKPOINT_BATCH_RE = re.compile(r"^batch-(\d{8})\.json$")
 _CHECKPOINT_BATCH_TMP_RE = re.compile(
@@ -1201,6 +1357,7 @@ def compute_embed_generation(embed_model: str, chunks: list[dict]) -> str:
     contract = {
         "embed_model": _canonical_embed_model(embed_model),
         "cache_version": EMBED_CACHE_VERSION,
+        "source_parser_version": EMBED_SOURCE_PARSER_VERSION,
         "chunking": {
             "max_chars": CHUNK_MAX_CHARS,
             "overlap_chars": CHUNK_OVERLAP_CHARS,
@@ -1231,8 +1388,12 @@ def _safe_fsync(handle) -> None:
         pass
 
 
-def _atomic_write_json(path: Path, payload: dict) -> bool:
-    """同一directoryへのwrite、flush/fsync、replaceを一体化する。"""
+def _atomic_write_json(path: Path, payload: dict, *, before_replace=None) -> bool:
+    """同一directoryへのwrite、flush/fsync、replaceを一体化する。
+
+    ``before_replace(tmp_path)`` は書き込み済み一時ファイルの検証用hookで、
+    例外を送出すると置換せず一時ファイルを削除し、その例外を再送出する。
+    """
     if path.parent == EMBED_CHECKPOINT_PATH:
         _assert_runtime_directory_safe(EMBED_CHECKPOINT_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1244,16 +1405,25 @@ def _atomic_write_json(path: Path, payload: dict) -> bool:
         with open(tmp_path, "x", encoding="utf-8", newline="\n") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             _safe_fsync(handle)
+        if before_replace is not None:
+            before_replace(tmp_path)
         os.replace(tmp_path, path)
         return True
     except (OSError, TypeError, ValueError) as exc:
         logger.warning("atomic JSON save failed for %s: %s", path.name, exc)
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+        _unlink_quietly(tmp_path)
         return False
+    except BaseException:
+        _unlink_quietly(tmp_path)
+        raise
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _checkpoint_batch_files() -> list[Path]:
@@ -1331,12 +1501,22 @@ def _remove_checkpoint_tmp_files() -> None:
             )
 
 
-def _new_checkpoint_state(embed_model: str, generation: str | None = None) -> dict:
+def _new_checkpoint_state(
+    embed_model: str,
+    generation: str | None = None,
+    *,
+    mode: str = "incremental",
+    model_identity: dict[str, str] | None = None,
+) -> dict:
     now = _utc_now()
     return {
         "schema_version": EMBED_CHECKPOINT_SCHEMA_VERSION,
         "cache_version": EMBED_CACHE_VERSION,
         "embed_model": _canonical_embed_model(embed_model),
+        "mode": mode,
+        "compatibility": _new_embed_compatibility(
+            embed_model, model_identity, None
+        ),
         "chunking": {
             "max_chars": CHUNK_MAX_CHARS,
             "overlap_chars": CHUNK_OVERLAP_CHARS,
@@ -1349,12 +1529,25 @@ def _new_checkpoint_state(embed_model: str, generation: str | None = None) -> di
 
 
 def _checkpoint_header_matches(
-    state: dict, embed_model: str, generation: str | None = None
+    state: dict,
+    embed_model: str,
+    generation: str | None = None,
+    *,
+    mode: str = "incremental",
+    model_identity: dict[str, str] | None = None,
 ) -> bool:
     chunking = state.get("chunking") if isinstance(state.get("chunking"), dict) else {}
+    # digestが一致する場合、または作成時・現在ともにdigest不明の同名モデルだけを
+    # 同じjobの途中再開として扱う。片側だけ不明なら別モデルの可能性を排除できない。
+    compatibility_matches = _cache_ready_compatibility_matches(
+        {"version": state.get("cache_version"), "compatibility": state.get("compatibility")},
+        embed_model,
+        model_identity,
+    )
     return (
         state.get("schema_version") == EMBED_CHECKPOINT_SCHEMA_VERSION
         and state.get("cache_version") == EMBED_CACHE_VERSION
+        and state.get("mode", "incremental") == mode
         and _canonical_embed_model(state.get("embed_model"))
         == _canonical_embed_model(embed_model)
         and chunking.get("max_chars") == CHUNK_MAX_CHARS
@@ -1364,6 +1557,7 @@ def _checkpoint_header_matches(
         and (generation is None or state.get("generation") == generation)
         and isinstance(state.get("next_batch"), int)
         and state.get("next_batch") >= 1
+        and compatibility_matches
     )
 
 
@@ -1385,6 +1579,217 @@ def _valid_embedding_entry(entry: object, chunk_id: str | None = None) -> bool:
     )
 
 
+def _new_embed_compatibility(
+    embed_model: str,
+    model_identity: dict[str, str] | None,
+    embedding_dimension: int | None,
+) -> dict:
+    """cache/checkpoint共通の再利用互換契約。"""
+    return {
+        "version": EMBED_COMPATIBILITY_VERSION,
+        "model": _canonical_embed_model(embed_model),
+        "model_digest": (
+            str(model_identity.get("digest", "")).strip()
+            if isinstance(model_identity, dict)
+            else None
+        ),
+        "source_parser_version": EMBED_SOURCE_PARSER_VERSION,
+        "chunking": {
+            "max_chars": CHUNK_MAX_CHARS,
+            "overlap_chars": CHUNK_OVERLAP_CHARS,
+        },
+        "embedding_dimension": embedding_dimension,
+    }
+
+
+def _cache_compatibility_matches(
+    cache: dict,
+    embed_model: str,
+    model_identity: dict[str, str] | None,
+) -> bool:
+    """generationとは独立した、Embedding再利用の安全条件。"""
+    compatibility = cache.get("compatibility")
+    if not isinstance(compatibility, dict) or not isinstance(model_identity, dict):
+        return False
+    digest = str(model_identity.get("digest", "")).strip()
+    chunking = compatibility.get("chunking")
+    return (
+        cache.get("version") == EMBED_CACHE_VERSION
+        and compatibility.get("version") == EMBED_COMPATIBILITY_VERSION
+        and compatibility.get("model") == _canonical_embed_model(embed_model)
+        and compatibility.get("model_digest") == digest
+        and bool(digest)
+        and compatibility.get("source_parser_version") == EMBED_SOURCE_PARSER_VERSION
+        and chunking == {
+            "max_chars": CHUNK_MAX_CHARS,
+            "overlap_chars": CHUNK_OVERLAP_CHARS,
+        }
+    )
+
+
+def _cache_ready_compatibility_matches(
+    cache: dict,
+    embed_model: str,
+    model_identity: dict[str, str] | None,
+) -> bool:
+    """ready判定用の互換条件。再利用判定より緩めず、digest不明を明示的に扱う。
+
+    - cacheにdigestがある: 現在のdigestが取得でき、一致する場合だけ ready。
+    - cacheのdigestが不明（構築時に取得不能）: 現在も取得不能な場合だけ、
+      モデル名一致で ready とする。この cache の Embedding は再利用しない。
+    """
+    compatibility = cache.get("compatibility")
+    if not isinstance(compatibility, dict):
+        return False
+    base_matches = (
+        cache.get("version") == EMBED_CACHE_VERSION
+        and compatibility.get("version") == EMBED_COMPATIBILITY_VERSION
+        and compatibility.get("model") == _canonical_embed_model(embed_model)
+        and compatibility.get("source_parser_version") == EMBED_SOURCE_PARSER_VERSION
+        and compatibility.get("chunking")
+        == {"max_chars": CHUNK_MAX_CHARS, "overlap_chars": CHUNK_OVERLAP_CHARS}
+    )
+    if not base_matches:
+        return False
+    cached_digest = compatibility.get("model_digest")
+    current_digest = (
+        str(model_identity.get("digest", "")).strip()
+        if isinstance(model_identity, dict)
+        else ""
+    )
+    if cached_digest is None:
+        return not current_digest
+    return bool(current_digest) and cached_digest == current_digest
+
+
+def _cache_embedding_dimension(cache: dict) -> int | None:
+    compatibility = cache.get("compatibility")
+    if isinstance(compatibility, dict):
+        value = compatibility.get("embedding_dimension")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    dimensions = set()
+    entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
+    for entry in entries.values():
+        vector = entry.get("embedding") if isinstance(entry, dict) else None
+        if isinstance(vector, list) and vector:
+            dimensions.add(len(vector))
+    return next(iter(dimensions)) if len(dimensions) == 1 else None
+
+
+def _cache_files(cache: dict) -> dict[str, dict]:
+    manifest = cache.get("files")
+    # file manifest は version 5 形式だけが持つ。旧cacheは読込時の正規化で
+    # ``files: {}`` が補われるため、dict かどうかでは旧形式を判別できない
+    # （判別を誤ると全ファイルが「追加」と表示される）。
+    if cache.get("version") == EMBED_CACHE_VERSION and isinstance(manifest, dict):
+        return {
+            str(path): value
+            for path, value in manifest.items()
+            if isinstance(value, dict)
+        }
+    # version 4以前のcacheは、manifestが無いので再利用には使わない（互換判定で除外）。
+    # ただし事前解析の追加・変更・削除件数表示のために、entryから観測できる範囲だけ
+    # 再構成する。chunkが0件だったファイルは旧cacheに痕跡がなく「追加」に数えられる。
+    files: dict[str, dict] = {}
+    entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
+    for entry in entries.values():
+        if not isinstance(entry, dict):
+            continue
+        path = normalize_source_path(str(entry.get("path", "")))
+        if not path:
+            continue
+        item = files.setdefault(
+            path,
+            {"file_sha256": str(entry.get("file_sha256", "")), "chunk_ids": []},
+        )
+        chunk_id = str(entry.get("chunk_id", ""))
+        if chunk_id:
+            item["chunk_ids"].append(chunk_id)
+        item["chunk_count"] = len(item["chunk_ids"])
+    return files
+
+
+def _entry_matches_chunk(
+    entry: object,
+    chunk: dict,
+    *,
+    expected_dimension: int | None = None,
+) -> bool:
+    if not _valid_embedding_entry(entry, str(chunk.get("chunk_id", ""))):
+        return False
+    assert isinstance(entry, dict)
+    if (
+        entry.get("file_sha256") != chunk.get("file_sha256")
+        or entry.get("text_sha256") != chunk.get("text_sha256")
+    ):
+        return False
+    vector = entry.get("embedding")
+    return expected_dimension is None or len(vector) == expected_dimension
+
+
+def _validate_embed_cache_candidate(
+    cache: dict,
+    embed_model: str,
+    model_identity: dict[str, str] | None,
+    generation: str,
+    chunks: list[dict],
+    source_manifest: dict[str, dict],
+) -> int | None:
+    """保存前・保存後に同じ候補検証を行う。"""
+    if not _cache_header_matches(cache, embed_model, generation):
+        raise EmbedCachePersistenceError("Embedding cache header validation failed")
+    if model_identity is None:
+        compatibility = cache.get("compatibility")
+        unknown_compatibility = (
+            isinstance(compatibility, dict)
+            and compatibility.get("version") == EMBED_COMPATIBILITY_VERSION
+            and compatibility.get("model") == _canonical_embed_model(embed_model)
+            and compatibility.get("model_digest") is None
+            and compatibility.get("source_parser_version") == EMBED_SOURCE_PARSER_VERSION
+        )
+        if not unknown_compatibility:
+            raise EmbedCachePersistenceError("Embedding cache compatibility validation failed")
+    elif not _cache_compatibility_matches(cache, embed_model, model_identity):
+        raise EmbedCachePersistenceError("Embedding cache compatibility validation failed")
+    if cache.get("files") != source_manifest:
+        raise EmbedCachePersistenceError("Embedding cache manifest validation failed")
+    entries = cache.get("entries")
+    expected_ids = {str(chunk.get("chunk_id")) for chunk in chunks}
+    if not isinstance(entries, dict) or set(entries) != expected_ids:
+        raise EmbedCachePersistenceError("Embedding cache entry set validation failed")
+    compatibility = cache.get("compatibility")
+    declared_dimension = (
+        compatibility.get("embedding_dimension")
+        if isinstance(compatibility, dict)
+        and isinstance(compatibility.get("embedding_dimension"), int)
+        and not isinstance(compatibility.get("embedding_dimension"), bool)
+        and compatibility.get("embedding_dimension") > 0
+        else None
+    )
+    expected_dimension = declared_dimension or _cache_embedding_dimension(cache)
+    actual_dimension: int | None = None
+    for chunk in chunks:
+        entry = entries.get(chunk.get("chunk_id"))
+        if not _entry_matches_chunk(
+            entry, chunk, expected_dimension=expected_dimension
+        ):
+            raise EmbedCachePersistenceError("Embedding cache entry validation failed")
+        assert isinstance(entry, dict)
+        if actual_dimension is None:
+            actual_dimension = len(entry["embedding"])
+        elif len(entry["embedding"]) != actual_dimension:
+            raise EmbedCachePersistenceError("Embedding vector dimensions differ")
+        # 候補の引用情報は現行parserのchunkから組み立てる契約だが、保存後の
+        #再読込でも本文・位置が現行chunkと一致していることを確認する。
+        for key in ("path", "chunk_id", "text", "heading", "start_line", "end_line"):
+            if entry.get(key) != chunk.get(key):
+                raise EmbedCachePersistenceError("Embedding citation metadata mismatch")
+    if declared_dimension is not None and actual_dimension != declared_dimension:
+        raise EmbedCachePersistenceError("Embedding dimension metadata mismatch")
+    return actual_dimension
+
+
 def _cache_header_matches(
     cache: dict, embed_model: str, generation: str | None = None
 ) -> bool:
@@ -1399,29 +1804,8 @@ def _cache_header_matches(
     )
 
 
-def _load_checkpoint(
-    embed_model: str, generation: str | None = None
-) -> tuple[dict, dict[str, dict]]:
-    """checkpointを読み込み、不一致generationはbatchだけ整理して新規化する。"""
-    _assert_runtime_directory_safe(EMBED_CHECKPOINT_PATH)
-    state_path = EMBED_CHECKPOINT_PATH / "state.json"
-    state: dict | None = None
-    if state_path.is_file() and not state_path.is_symlink():
-        try:
-            candidate = json.loads(state_path.read_text(encoding="utf-8"))
-            if isinstance(candidate, dict):
-                state = candidate
-        except (OSError, json.JSONDecodeError):
-            logger.warning("checkpoint state is unreadable; starting a new generation")
-
-    if state is None or not _checkpoint_header_matches(state, embed_model, generation):
-        _remove_checkpoint_files(include_state=True)
-        state = _new_checkpoint_state(embed_model, generation)
-        if not _atomic_write_json(state_path, state):
-            raise EmbedCachePersistenceError("checkpoint stateの初期化に失敗しました")
-        return state, {}
-
-    _remove_checkpoint_tmp_files()
+def _read_checkpoint_batches(state: dict) -> tuple[dict[str, dict], int]:
+    """state と同じ generation/mode の batch entry を読むだけ（削除・修復しない）。"""
     entries: dict[str, dict] = {}
     highest_sequence = 0
     for batch_path in _checkpoint_batch_files():
@@ -1435,6 +1819,8 @@ def _load_checkpoint(
             if (
                 not isinstance(batch, dict)
                 or batch.get("schema_version") != EMBED_CHECKPOINT_SCHEMA_VERSION
+                or batch.get("mode", state.get("mode", "incremental"))
+                != state.get("mode", "incremental")
                 or batch.get("generation") != state.get("generation")
                 or batch.get("sequence") != sequence
                 or not isinstance(batch.get("entries"), list)
@@ -1446,6 +1832,71 @@ def _load_checkpoint(
                     entries[chunk_id] = _strip_cache_metadata(entry)
         except (OSError, json.JSONDecodeError):
             logger.warning("checkpoint batchを読み込めません: %s", batch_path.name)
+    return entries, highest_sequence
+
+
+def _peek_checkpoint_entries(
+    embed_model: str,
+    generation: str,
+    *,
+    mode: str,
+    model_identity: dict[str, str] | None,
+) -> dict[str, dict]:
+    """事前解析用。条件が一致するcheckpoint entryを、ファイルを変更せずに返す。"""
+    state_path = EMBED_CHECKPOINT_PATH / "state.json"
+    try:
+        if not state_path.is_file() or state_path.is_symlink():
+            return {}
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(state, dict) or not _checkpoint_header_matches(
+        state, embed_model, generation, mode=mode, model_identity=model_identity
+    ):
+        return {}
+    entries, _highest = _read_checkpoint_batches(state)
+    return entries
+
+
+def _load_checkpoint(
+    embed_model: str,
+    generation: str | None = None,
+    *,
+    mode: str = "incremental",
+    model_identity: dict[str, str] | None = None,
+) -> tuple[dict, dict[str, dict]]:
+    """checkpointを読み込み、不一致generationはbatchだけ整理して新規化する。"""
+    _assert_runtime_directory_safe(EMBED_CHECKPOINT_PATH)
+    state_path = EMBED_CHECKPOINT_PATH / "state.json"
+    state: dict | None = None
+    if state_path.is_file() and not state_path.is_symlink():
+        try:
+            candidate = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                state = candidate
+        except (OSError, json.JSONDecodeError):
+            logger.warning("checkpoint state is unreadable; starting a new generation")
+
+    if state is None or not _checkpoint_header_matches(
+        state,
+        embed_model,
+        generation,
+        mode=mode,
+        model_identity=model_identity,
+    ):
+        _remove_checkpoint_files(include_state=True)
+        state = _new_checkpoint_state(
+            embed_model,
+            generation,
+            mode=mode,
+            model_identity=model_identity,
+        )
+        if not _atomic_write_json(state_path, state):
+            raise EmbedCachePersistenceError("checkpoint stateの初期化に失敗しました")
+        return state, {}
+
+    _remove_checkpoint_tmp_files()
+    entries, highest_sequence = _read_checkpoint_batches(state)
     if int(state.get("next_batch", 1)) <= highest_sequence:
         state["next_batch"] = highest_sequence + 1
         state["updated_at"] = _utc_now()
@@ -1463,6 +1914,7 @@ def _persist_checkpoint_batch(state: dict, entries: list[dict]) -> bool:
         "schema_version": EMBED_CHECKPOINT_SCHEMA_VERSION,
         "generation": generation,
         "sequence": sequence,
+        "mode": state.get("mode", "incremental"),
         "entries": [_strip_cache_metadata(entry) for entry in entries],
     }
     batch_path = EMBED_CHECKPOINT_PATH / f"batch-{sequence:08d}.json"
@@ -1554,11 +2006,13 @@ def _embed_writer_lock():
 
 
 def _empty_embed_cache() -> dict:
-    """空の Embedding キャッシュ構造を返す（chunk embedding / version 3）。"""
+    """空のEmbedding cache（file manifestと互換契約を含む）。"""
     return {
         "version": EMBED_CACHE_VERSION,
         "embed_model": None,
         "generation": None,
+        "compatibility": None,
+        "files": {},
         "chunking": {
             "max_chars": CHUNK_MAX_CHARS,
             "overlap_chars": CHUNK_OVERLAP_CHARS,
@@ -1568,8 +2022,9 @@ def _empty_embed_cache() -> dict:
 
 
 # load_embed_cache() の read 経路専用 memo。キーは (絶対path, st_mtime_ns, st_size)。
-# writer 経路（build_or_update_embed_index 内の3箇所）は use_memo=False で必ず
-# fresh load し、save_embed_cache 成功時に破棄する。返るdictは共有参照であり、
+# cache は同一directoryの一時ファイルからの原子的置換でだけ更新されるため、
+# 置換で mtime/size が変わる。writer 経路は use_memo=False で必ず fresh load し、
+# 昇格（save_embed_cache / build 完了）時に同一プロセスの memo を破棄する。返るdictは共有参照であり、
 # read 経路（retrieval / status）は変更してはならない（read-only 契約）。
 _EMBED_CACHE_MEMO_KEY: tuple | None = None
 _EMBED_CACHE_MEMO_VALUE: dict | None = None
@@ -1724,17 +2179,23 @@ def _normalize_embed_cache(data) -> dict:
     data.setdefault("version", 1)
     data.setdefault("embed_model", None)
     data.setdefault("chunking", {})
+    data.setdefault("compatibility", None)
+    data.setdefault("files", {})
     return data
 
 
-def _load_embed_cache_from_disk() -> dict:
-    streamed = _load_embed_cache_streaming(EMBED_CACHE_PATH)
+def _load_embed_cache_file(path: Path) -> dict:
+    streamed = _load_embed_cache_streaming(path)
     if streamed is not None:
         return _normalize_embed_cache(streamed)
     try:
-        return _normalize_embed_cache(json.loads(EMBED_CACHE_PATH.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError):
+        return _normalize_embed_cache(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return _empty_embed_cache()
+
+
+def _load_embed_cache_from_disk() -> dict:
+    return _load_embed_cache_file(EMBED_CACHE_PATH)
 
 
 def _load_embed_cache_impl(*, use_memo: bool) -> dict:
@@ -1971,6 +2432,7 @@ def load_index_status() -> dict:
         "job_id",
         "generation",
         "embed_model",
+        "mode",
         "total",
         "processed",
         "generated",
@@ -1979,6 +2441,7 @@ def load_index_status() -> dict:
         "checkpointed",
         "elapsed_seconds",
         "rate_per_second",
+        "rate_basis",
         "eta_seconds",
         "error_code",
         "cancel_requested",
@@ -2005,6 +2468,7 @@ def save_index_status(status: dict) -> bool:
             "job_id",
             "generation",
             "embed_model",
+            "mode",
             "total",
             "processed",
             "generated",
@@ -2013,6 +2477,7 @@ def save_index_status(status: dict) -> bool:
             "checkpointed",
             "elapsed_seconds",
             "rate_per_second",
+            "rate_basis",
             "eta_seconds",
             "error_code",
             "cancel_requested",
@@ -2039,12 +2504,35 @@ def save_index_status(status: dict) -> bool:
         return _atomic_write_json(EMBED_STATUS_PATH, safe)
 
 
+def _generated_rate_record(status: dict, embed_model: str | None) -> dict:
+    """同一モデルの実Embedding生成速度（generated基準）だけを取り出す。
+
+    旧形式（processed基準、rate_basisなし）や別モデルの速度は見積もりへ流用しない。
+    """
+    rate = status.get("rate_per_second") if isinstance(status, dict) else None
+    if (
+        isinstance(status, dict)
+        and status.get("rate_basis") == "generated"
+        and embed_model
+        and _canonical_embed_model(status.get("embed_model"))
+        == _canonical_embed_model(embed_model)
+        and isinstance(rate, (int, float))
+        and not isinstance(rate, bool)
+        and math.isfinite(rate)
+        and rate > 0
+    ):
+        return {"rate_per_second": float(rate), "rate_basis": "generated"}
+    return {"rate_per_second": None, "rate_basis": None}
+
+
 def get_embed_index_status(
     embed_model: str | None = None,
     chunks: list[dict] | None = None,
     *,
     cache: dict | None = None,
     validate_entries: bool = True,
+    source_manifest: dict[str, dict] | None = None,
+    model_identity: dict[str, str] | None = None,
 ) -> dict:
     """Return ready/stale/building state without starting an index build.
 
@@ -2064,14 +2552,24 @@ def get_embed_index_status(
         # status は UI から繰り返し呼ばれる read 経路であり、毎回の
         # 482 ファイル走査（26 MB の読み込みと sha256）が p95 を支配する。
         source_chunks, chunk_memo_key = load_source_chunks_cached(SKILL_SOURCE_DIR)
+    resolved_manifest, source_complete = _source_manifest_for_chunks(
+        source_chunks, source_manifest
+    )
     generation = compute_embed_generation_cached(model, source_chunks, chunk_memo_key)
     resolved_cache = cache if cache is not None else load_embed_cache()
+    if model_identity is None:
+        model_identity = get_embed_model_identity(model)
     entries = (
         resolved_cache.get("entries") if isinstance(resolved_cache.get("entries"), dict) else {}
     )
-    cache_ready = _cache_header_matches(resolved_cache, model, generation) and set(entries) == {
-        chunk.get("chunk_id") for chunk in source_chunks
-    }
+    cache_ready = (
+        source_complete
+        and _cache_header_matches(resolved_cache, model, generation)
+        and _cache_ready_compatibility_matches(resolved_cache, model, model_identity)
+        and resolved_cache.get("files") == resolved_manifest
+        and set(entries)
+        == {chunk.get("chunk_id") for chunk in source_chunks}
+    )
     entries_valid = (
         all(
             _valid_embedding_entry(entries.get(chunk.get("chunk_id")), chunk.get("chunk_id"))
@@ -2082,6 +2580,7 @@ def get_embed_index_status(
     )
     if cache_ready and entries_valid:
         return {
+            **_generated_rate_record(persisted, model),
             "state": "ready",
             "embed_model": _canonical_embed_model(model),
             "generation": generation,
@@ -2107,6 +2606,7 @@ def get_embed_index_status(
         }
     state = "stale" if EMBED_CACHE_PATH.exists() else "missing"
     return {
+        **_generated_rate_record(persisted, model),
         "state": state,
         "embed_model": _canonical_embed_model(model),
         "generation": generation,
@@ -2119,22 +2619,232 @@ def get_embed_index_status(
     }
 
 
+def _validate_embed_index_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in EMBED_INDEX_MODES:
+        raise ValueError(f"invalid index mode: {mode}")
+    return normalized
+
+
+def plan_embed_index_update(
+    embed_model: str,
+    chunks: list[dict] | None = None,
+    *,
+    source_manifest: dict[str, dict] | None = None,
+    mode: str = "incremental",
+    model_identity: dict[str, str] | None = None,
+) -> dict:
+    """副作用なしに差分件数・再計算件数・見積もりを返す。
+
+    Embedding生成、job開始、cache/checkpoint/statusの書き換えは行わない。
+    再利用判定は build と同じ ``_select_reusable_embeddings`` を使う。
+    """
+    mode = _validate_embed_index_mode(mode)
+    if chunks is None:
+        source_chunks, resolved_manifest = build_source_snapshot(SKILL_SOURCE_DIR)
+    else:
+        source_chunks = chunks
+        resolved_manifest, _complete = _source_manifest_for_chunks(
+            source_chunks, source_manifest
+        )
+    if model_identity is None:
+        model_identity = get_embed_model_identity(embed_model)
+    generation = compute_embed_generation(embed_model, source_chunks)
+    # read専用memoを共有し、確認のたびに大規模cacheを再parseしない（内容は変更しない）。
+    cache = load_embed_cache()
+    old_files = _cache_files(cache)
+    current_paths = set(resolved_manifest)
+    old_paths = set(old_files)
+    added = len(current_paths - old_paths)
+    deleted = len(old_paths - current_paths)
+    changed = sum(
+        1
+        for path in current_paths & old_paths
+        if old_files[path].get("file_sha256") != resolved_manifest[path].get("file_sha256")
+    )
+    unchanged = len(current_paths & old_paths) - changed
+    checkpoint_entries = _peek_checkpoint_entries(
+        embed_model, generation, mode=mode, model_identity=model_identity
+    )
+    selection = _select_reusable_embeddings(
+        cache,
+        embed_model,
+        model_identity,
+        mode,
+        source_chunks,
+        resolved_manifest,
+        checkpoint_entries,
+    )
+    reused = selection.from_cache
+    checkpoint_reused = selection.from_checkpoint
+    generated = len(source_chunks) - reused - checkpoint_reused
+    rate_record = _generated_rate_record(load_index_status(), embed_model)
+    rate = rate_record["rate_per_second"]
+    if generated == 0:
+        estimate = None
+        estimate_status = "no_embedding"
+    elif rate:
+        estimate = round(generated / rate, 3)
+        estimate_status = "estimated"
+    else:
+        estimate = None
+        estimate_status = "no_rate"
+    digest_available = bool(
+        isinstance(model_identity, dict) and str(model_identity.get("digest", "")).strip()
+    )
+    if mode == "full":
+        reason_code = "full_requested"
+    elif selection.cache_compatible:
+        reason_code = None
+    elif not cache.get("entries") and not old_files:
+        reason_code = "cache_missing"
+    elif not digest_available:
+        reason_code = "model_digest_unavailable"
+    else:
+        reason_code = "cache_incompatible"
+    return {
+        "mode": mode,
+        "generation": generation,
+        "added_files": added,
+        "changed_files": changed,
+        "deleted_files": deleted,
+        "unchanged_files": unchanged,
+        "total_chunks": len(source_chunks),
+        "generated_chunks": generated,
+        "reused_chunks": reused,
+        "checkpoint_chunks": checkpoint_reused,
+        "rate_per_second": rate,
+        "rate_basis": rate_record["rate_basis"],
+        "estimated_seconds": estimate,
+        "estimate_status": estimate_status,
+        "estimate_basis": "generated_chunks / generated_rate" if estimate is not None else None,
+        "compatibility": "compatible" if selection.cache_compatible else "rebuild",
+        "model_digest_available": digest_available,
+        "reason": reason_code,
+    }
+
+
+@dataclass
+class _ReuseSelection:
+    """cache/checkpoint から再利用するEmbeddingの選別結果。"""
+
+    entries: dict[str, dict]
+    from_cache: int
+    from_checkpoint: int
+    cache_compatible: bool
+    expected_dimension: int | None
+
+
+def _select_reusable_embeddings(
+    cache: dict,
+    embed_model: str,
+    model_identity: dict[str, str] | None,
+    mode: str,
+    source_chunks: list[dict],
+    source_manifest: dict[str, dict],
+    checkpoint_entries: dict[str, dict],
+) -> _ReuseSelection:
+    """再利用できるEmbeddingを選ぶ。本文・引用情報は常に現在のchunkを正とする。
+
+    完成cacheはファイル単位の all-or-nothing で扱う。path・file hash・chunk ID列が
+    一致し、そのファイルの全entryが健全（本文hash・有限値・次元）な場合だけ
+    再利用し、1件でも欠落・不正ならファイル全体を再計算する。checkpoint は
+    同じ generation/mode/互換契約の job が生成したものだけが渡される。
+    """
+    cache_entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
+    cache_compatible = mode == "incremental" and _cache_compatibility_matches(
+        cache, embed_model, model_identity
+    )
+    expected_dimension = _cache_embedding_dimension(cache) if cache_compatible else None
+    if cache_compatible and cache_entries and expected_dimension is None:
+        # 次元を一意に決められないcacheは、どのentryも安全に再利用できない。
+        cache_compatible = False
+    old_files = _cache_files(cache) if cache_compatible else {}
+
+    chunks_by_path: dict[str, list[dict]] = {}
+    for chunk in source_chunks:
+        chunks_by_path.setdefault(
+            normalize_source_path(str(chunk.get("path", ""))), []
+        ).append(chunk)
+
+    selected: dict[str, dict] = {}
+    from_cache = 0
+    for path, file_chunks in chunks_by_path.items():
+        old = old_files.get(path)
+        current = source_manifest.get(path)
+        if (
+            not isinstance(old, dict)
+            or not isinstance(current, dict)
+            or old.get("file_sha256") != current.get("file_sha256")
+            or list(old.get("chunk_ids") or []) != list(current.get("chunk_ids") or [])
+        ):
+            continue
+        if not all(
+            _entry_matches_chunk(
+                cache_entries.get(chunk.get("chunk_id")),
+                chunk,
+                expected_dimension=expected_dimension,
+            )
+            for chunk in file_chunks
+        ):
+            continue
+        for chunk in file_chunks:
+            selected[chunk["chunk_id"]] = {
+                **_strip_cache_metadata(chunk),
+                "embedding": cache_entries[chunk["chunk_id"]]["embedding"],
+            }
+        from_cache += len(file_chunks)
+
+    from_checkpoint = 0
+    for chunk in source_chunks:
+        chunk_id = chunk["chunk_id"]
+        if chunk_id in selected:
+            continue
+        candidate = checkpoint_entries.get(chunk_id)
+        if not _entry_matches_chunk(candidate, chunk, expected_dimension=expected_dimension):
+            continue
+        if expected_dimension is None:
+            expected_dimension = len(candidate["embedding"])
+        selected[chunk_id] = {
+            **_strip_cache_metadata(chunk),
+            "embedding": candidate["embedding"],
+        }
+        from_checkpoint += 1
+    return _ReuseSelection(
+        entries=selected,
+        from_cache=from_cache,
+        from_checkpoint=from_checkpoint,
+        cache_compatible=cache_compatible,
+        expected_dimension=expected_dimension,
+    )
+
+
 def build_or_update_embed_index(
     embed_model: str,
     chunks: list[dict] | None = None,
     *,
+    source_manifest: dict[str, dict] | None = None,
+    source_root: Path | None = None,
+    mode: str = "incremental",
+    model_identity: dict[str, str] | None = None,
     emit_progress=None,
     cancel_check=None,
 ) -> dict:
-    """skill-source 配下をチャンク走査し、変更分のみembeddingを再計算してキャッシュ返却。
-
-    キャッシュ生成時の embed_model と現在のモデルが異なる場合は、ベクトル次元の
-    不整合（例: nomic 768次元 → bge-m3 1024次元）を防ぐため全エントリを破棄して
-    再構築する。version 2 以前のファイル単位キャッシュも再構築する。
-    """
-    source_chunks = (
-        chunks if chunks is not None else build_source_chunks(SKILL_SOURCE_DIR)
+    """資料単位で差分更新し、検証済み候補だけをcacheへ原子的に昇格する。"""
+    mode = _validate_embed_index_mode(mode)
+    supplied_chunks = chunks is not None
+    resolved_source_root = source_root if source_root is not None else (
+        SKILL_SOURCE_DIR if not supplied_chunks else None
     )
+    if chunks is None:
+        source_chunks, resolved_manifest = build_source_snapshot(resolved_source_root)
+    else:
+        source_chunks = chunks
+        resolved_manifest, _complete = _source_manifest_for_chunks(
+            source_chunks, source_manifest
+        )
+    if model_identity is None and (not supplied_chunks or source_root is not None):
+        model_identity = get_embed_model_identity(embed_model)
     total = len(source_chunks)
     generation = compute_embed_generation(embed_model, source_chunks)
 
@@ -2142,83 +2852,114 @@ def build_or_update_embed_index(
         if cancel_check:
             cancel_check()
 
+    def check_source_still_current() -> None:
+        if resolved_source_root is None:
+            return
+        current_chunks, current_manifest = build_source_snapshot(resolved_source_root)
+        if (
+            current_manifest != resolved_manifest
+            or _chunk_snapshot_signature(current_chunks) != _chunk_snapshot_signature(source_chunks)
+        ):
+            raise EmbedBuildError(
+                "SOURCE_CHANGED_DURING_BUILD",
+                "source snapshot changed before cache promotion",
+            )
+
+    def check_model_still_current() -> None:
+        if model_identity is None:
+            return
+        current_identity = get_embed_model_identity(embed_model)
+        if (
+            not isinstance(current_identity, dict)
+            or current_identity.get("digest") != model_identity.get("digest")
+            or _canonical_model_reference(str(current_identity.get("name", "")))
+            != _canonical_model_reference(str(model_identity.get("name", "")))
+        ):
+            raise EmbedBuildError(
+                "MODEL_CHANGED_DURING_BUILD",
+                "embedding model identity changed before cache promotion",
+            )
+
     with _embed_writer_lock() as lock_acquired:
         if not lock_acquired:
             existing = _load_embed_cache_impl(use_memo=False)
-            if EMBED_CACHE_PATH.exists() and _cache_header_matches(
-                existing, embed_model, generation
+            if (
+                EMBED_CACHE_PATH.exists()
+                and _cache_header_matches(existing, embed_model, generation)
+                and _cache_ready_compatibility_matches(existing, embed_model, model_identity)
+                and existing.get("files") == resolved_manifest
+                and set(existing.get("entries", {}))
+                == {chunk.get("chunk_id") for chunk in source_chunks}
             ):
                 _emit_embed_progress(
                     emit_progress,
                     phase="progress",
-                    processed=0,
+                    processed=total,
                     total=total,
                     generated=0,
-                    reused=0,
+                    reused=total,
                     failed=0,
                     checkpointed=0,
+                    embedding_seconds=0.0,
                 )
                 return existing
             raise EmbedIndexBusyError("Embeddingインデックスを更新中です")
 
         check_cancel()
         cache = _load_embed_cache_impl(use_memo=False)
-        cached_model = cache.get("embed_model")
-        cached_version = cache.get("version")
-        cache_header_matches = _cache_header_matches(cache, embed_model, generation)
-        if not cache_header_matches:
-            if cached_model is not None:
-                print(
-                    "[INFO] Embeddingキャッシュの再構築が必要です "
-                    f"(version {cached_version} → {EMBED_CACHE_VERSION}, "
-                    f"model '{cached_model}' → '{embed_model}')。",
-                    file=sys.stderr,
-                )
-            cache = _empty_embed_cache()
-            cache["embed_model"] = embed_model
-        else:
-            cache["embed_model"] = embed_model
-        cache["generation"] = generation
-
-        state, checkpoint_entries = _load_checkpoint(embed_model, generation)
-        final_entries = (
-            cache.get("entries", {}) if isinstance(cache.get("entries"), dict) else {}
+        state, checkpoint_entries = _load_checkpoint(
+            embed_model,
+            generation,
+            mode=mode,
+            model_identity=model_identity,
         )
-        current_ids = {chunk["chunk_id"] for chunk in source_chunks}
-        reusable: dict[str, dict] = {}
-        valid_checkpoint_count = 0
-        for chunk in source_chunks:
-            chunk_id = chunk["chunk_id"]
-            candidates = [checkpoint_entries.get(chunk_id), final_entries.get(chunk_id)]
-            for candidate in candidates:
-                if (
-                    _valid_embedding_entry(candidate, chunk_id)
-                    and candidate.get("file_sha256") == chunk.get("file_sha256")
-                    and candidate.get("text_sha256") == chunk.get("text_sha256")
-                ):
-                    reusable[chunk_id] = _strip_cache_metadata(candidate)
-                    if candidate is checkpoint_entries.get(chunk_id):
-                        valid_checkpoint_count += 1
-                    break
+        selection = _select_reusable_embeddings(
+            cache,
+            embed_model,
+            model_identity,
+            mode,
+            source_chunks,
+            resolved_manifest,
+            checkpoint_entries,
+        )
+        if mode == "incremental" and not selection.cache_compatible and cache.get("entries"):
+            print(
+                "[INFO] Embeddingキャッシュの互換性を確認できないため、全件再構築します"
+                + ("（モデルdigestを取得できません）。" if model_identity is None else "。"),
+                file=sys.stderr,
+            )
+        # 旧cacheは読み取り専用の再利用元としてだけ使い、候補の組み立て後は参照を捨てる。
+        cache = None
+        checkpoint_entries = None
+        expected_dimension = selection.expected_dimension
+        reusable = selection.entries
+        valid_checkpoint_count = selection.from_checkpoint
 
         entries: dict[str, dict] = dict(reusable)
         processed = len(reusable)
         generated = 0
         failed = 0
         checkpointed = valid_checkpoint_count
+        embedding_seconds = 0.0
         last_progress_processed = processed
         last_progress_time = time.monotonic()
         pending_batch: list[dict] = []
 
+        def progress_values() -> dict:
+            return {
+                "processed": processed,
+                "total": total,
+                "generated": generated,
+                "reused": len(reusable),
+                "failed": failed,
+                "checkpointed": checkpointed,
+                "embedding_seconds": round(embedding_seconds, 3),
+            }
+
         _emit_embed_progress(
             emit_progress,
             phase="resumed" if valid_checkpoint_count else "start",
-            processed=processed,
-            total=total,
-            generated=generated,
-            reused=processed,
-            failed=failed,
-            checkpointed=checkpointed,
+            **progress_values(),
         )
 
         def emit_progress_if_due(force: bool = False) -> None:
@@ -2228,16 +2969,7 @@ def build_or_update_embed_index(
                 processed - last_progress_processed >= EMBED_PROGRESS_INTERVAL
                 or now - last_progress_time >= EMBED_PROGRESS_SECONDS
             ):
-                _emit_embed_progress(
-                    emit_progress,
-                    phase="progress",
-                    processed=processed,
-                    total=total,
-                    generated=generated,
-                    reused=len(reusable),
-                    failed=failed,
-                    checkpointed=checkpointed,
-                )
+                _emit_embed_progress(emit_progress, phase="progress", **progress_values())
                 last_progress_processed = processed
                 last_progress_time = now
 
@@ -2249,50 +2981,48 @@ def build_or_update_embed_index(
                 return
             batch = list(pending_batch)
             if not _persist_checkpoint_batch(state, batch):
-                print(
-                    "[WARN] Embedding checkpointの保存に失敗しました。",
-                    file=sys.stderr,
-                )
+                print("[WARN] Embedding checkpointの保存に失敗しました。", file=sys.stderr)
                 return
             checkpointed += len(batch)
             pending_batch = pending_batch[len(batch) :]
-            _emit_embed_progress(
-                emit_progress,
-                phase="checkpoint",
-                processed=processed,
-                total=total,
-                generated=generated,
-                reused=len(reusable),
-                failed=failed,
-                checkpointed=checkpointed,
-            )
+            _emit_embed_progress(emit_progress, phase="checkpoint", **progress_values())
 
         try:
             pending_chunks: list[dict] = []
-            # Legacy monkeypatches in downstream tests retain the old single
-            # item seam.  Normal runtime always takes the array API path.
             effective_batch_size = (
                 1 if _get_embedding is not _ORIGINAL_GET_EMBEDDING else EMBED_BATCH_SIZE
             )
 
             def process_batch(batch_chunks: list[dict]) -> None:
-                nonlocal processed, generated, failed
+                nonlocal processed, generated, failed, expected_dimension, embedding_seconds
                 if not batch_chunks:
                     return
                 check_cancel()
-                vectors = _get_index_embedding_batch(
-                    [chunk["text"] for chunk in batch_chunks], embed_model
-                )
+                batch_started = time.monotonic()
+                try:
+                    vectors = _get_index_embedding_batch(
+                        [chunk["text"] for chunk in batch_chunks], embed_model
+                    )
+                finally:
+                    # 見積もり用の速度は、走査・cache読込/保存を除いた生成時間で測る。
+                    embedding_seconds += time.monotonic() - batch_started
                 check_cancel()
                 for chunk, embedding in zip(batch_chunks, vectors):
                     chunk_id = chunk["chunk_id"]
                     processed += 1
-                    if embedding is not None and _valid_embedding_entry(
-                        {**_strip_cache_metadata(chunk), "embedding": embedding}, chunk_id
-                    ):
-                        entry = {**_strip_cache_metadata(chunk), "embedding": embedding}
-                        entries[chunk_id] = entry
-                        pending_batch.append(entry)
+                    candidate = (
+                        {**_strip_cache_metadata(chunk), "embedding": embedding}
+                        if embedding is not None
+                        else None
+                    )
+                    valid = _valid_embedding_entry(candidate, chunk_id) if candidate else False
+                    if valid and expected_dimension is not None:
+                        valid = len(candidate["embedding"]) == expected_dimension
+                    if valid:
+                        if expected_dimension is None:
+                            expected_dimension = len(candidate["embedding"])
+                        entries[chunk_id] = candidate
+                        pending_batch.append(candidate)
                         generated += 1
                     else:
                         entries.pop(chunk_id, None)
@@ -2308,81 +3038,70 @@ def build_or_update_embed_index(
                     process_batch(pending_chunks)
                     pending_chunks = []
             process_batch(pending_chunks)
-
-            # 正常完了時も端数batchをdurableにしてから最終cacheを確定する。
             flush_pending(force=True)
             if failed:
                 raise EmbedBuildError(
                     "EMBED_BATCH_FAILED",
                     f"{failed} embedding item(s) failed; final cache was not promoted",
                 )
-            for rel in list(entries.keys()):
-                if rel not in current_ids:
-                    del entries[rel]
-            cache["entries"] = entries
-            cache["version"] = EMBED_CACHE_VERSION
-            cache["embed_model"] = embed_model
-            cache["generation"] = generation
-            cache["chunking"] = {
-                "max_chars": CHUNK_MAX_CHARS,
-                "overlap_chars": CHUNK_OVERLAP_CHARS,
-            }
-            if not save_embed_cache(cache):
+            check_model_still_current()
+            candidate_cache = _empty_embed_cache()
+            candidate_cache.update(
+                {
+                    "embed_model": embed_model,
+                    "generation": generation,
+                    "compatibility": _new_embed_compatibility(
+                        embed_model,
+                        model_identity,
+                        # entryが0件（全削除・全空ファイル）の候補は次元を宣言しない。
+                        expected_dimension if entries else None,
+                    ),
+                    "files": resolved_manifest,
+                    "entries": entries,
+                }
+            )
+            _validate_embed_cache_candidate(
+                candidate_cache,
+                embed_model,
+                model_identity,
+                generation,
+                source_chunks,
+                resolved_manifest,
+            )
+            promoted: dict = {}
+
+            def verify_written_candidate(tmp_path: Path) -> None:
+                # 同一directoryの一時ファイルを再読込して検証し、昇格直前に資料の
+                # 実hashとモデル識別を再確認する。失敗時は置換せず旧cacheを残す。
+                written = _load_embed_cache_file(tmp_path)
+                _validate_embed_cache_candidate(
+                    written,
+                    embed_model,
+                    model_identity,
+                    generation,
+                    source_chunks,
+                    resolved_manifest,
+                )
+                check_source_still_current()
+                check_model_still_current()
+                check_cancel()
+                promoted["cache"] = written
+
+            if not _atomic_write_json(
+                EMBED_CACHE_PATH, candidate_cache, before_replace=verify_written_candidate
+            ):
                 raise EmbedCachePersistenceError(
                     "最終Embedding cacheの保存に失敗しました。checkpointを保持します。"
                 )
-            verified = _load_embed_cache_impl(use_memo=False)
-            if (
-                _canonical_embed_model(verified.get("embed_model"))
-                != _canonical_embed_model(embed_model)
-                or verified.get("version") != EMBED_CACHE_VERSION
-                or verified.get("generation") != generation
-                or verified.get("chunking")
-                != {
-                    "max_chars": CHUNK_MAX_CHARS,
-                    "overlap_chars": CHUNK_OVERLAP_CHARS,
-                }
-                or set(verified.get("entries", {})) != set(entries)
-                or any(
-                    not _valid_embedding_entry(verified["entries"].get(chunk_id), chunk_id)
-                    or verified["entries"][chunk_id].get("file_sha256")
-                    != entries[chunk_id].get("file_sha256")
-                    or verified["entries"][chunk_id].get("text_sha256")
-                    != entries[chunk_id].get("text_sha256")
-                    for chunk_id in entries
-                )
-            ):
-                raise EmbedCachePersistenceError(
-                    "最終Embedding cacheの検証に失敗しました。checkpointを保持します。"
-                )
+            _invalidate_embed_cache_memo()
             _remove_checkpoint_files(include_state=True)
-            _emit_embed_progress(
-                emit_progress,
-                phase="completed",
-                processed=processed,
-                total=total,
-                generated=generated,
-                reused=len(reusable),
-                failed=failed,
-                checkpointed=checkpointed,
-            )
-            return cache
+            _emit_embed_progress(emit_progress, phase="completed", **progress_values())
+            return promoted["cache"]
         except BaseException:
-            # Ctrl+C、Web cancel、timeout、予期しない例外のいずれでも、
-            # 直前の成功entryを可能な範囲で確定してから元の例外を再送出する。
             try:
                 flush_pending(force=True)
             finally:
-                _emit_embed_progress(
-                    emit_progress,
-                    phase="interrupted",
-                    processed=processed,
-                    total=total,
-                    generated=generated,
-                    reused=len(reusable),
-                    failed=failed,
-                    checkpointed=checkpointed,
-                )
+                _emit_embed_progress(emit_progress, phase="interrupted", **progress_values())
             raise
 
 

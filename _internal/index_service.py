@@ -22,20 +22,40 @@ from search import (
     EmbedBuildError,
     EmbeddingBatchError,
     EmbedIndexBusyError,
+    SourceSnapshotError,
     build_or_update_embed_index,
-    build_source_chunks,
+    build_source_chunks,  # noqa: F401 - retained as a monkeypatch seam for legacy callers/tests
+    build_source_snapshot,
     compute_embed_generation,
     detect_embed_model,
+    get_embed_model_identity,
     get_embed_index_status,
     load_index_status,
+    plan_embed_index_update,
     save_index_status,
+    SKILL_SOURCE_DIR,
     IndexStatusConflictError,
+    _generated_rate_record,
+    _validate_embed_index_mode,
     _embed_writer_lock,
 )
 
 
 class IndexCancelled(RuntimeError):
     """The owner requested cancellation before the next batch."""
+
+
+class IndexGenerationChangedError(RuntimeError):
+    """The source changed after the confirmation/preview snapshot."""
+
+
+class IndexModeConflictError(IndexGenerationChangedError):
+    """The requested mode differs from the active or saved job."""
+
+
+# 少量の生成ではモデル起動待ちが速度を支配し、次回見積もりを大きく歪める。
+# この件数未満のjobでは、既存の同一モデル実績を上書きしない（実績が無ければ採用する）。
+RATE_MIN_GENERATED_SAMPLE = 32
 
 
 class IndexCoordinator:
@@ -61,17 +81,19 @@ class IndexCoordinator:
                 for key in (
                     "state",
                     "job_id",
-                    "generation",
-                    "embed_model",
-                    "total",
+                "generation",
+                "embed_model",
+                "mode",
+                "total",
                     "processed",
                     "generated",
                     "reused",
                     "failed",
                     "checkpointed",
                     "elapsed_seconds",
-                    "rate_per_second",
-                    "eta_seconds",
+                "rate_per_second",
+                "rate_basis",
+                "eta_seconds",
                     "error_code",
                     "cancel_requested",
                     "updated_at",
@@ -142,6 +164,24 @@ class IndexCoordinator:
             snapshot = {**snapshot, **persisted}
         return snapshot
 
+    def plan(self, *, mode: str = "incremental") -> dict:
+        """Return a side-effect-free update preview for the current source."""
+        effective_mode = _validate_embed_index_mode(mode)
+        model = detect_embed_model()
+        if not model:
+            raise EmbedBuildError(
+                "EMBED_MODEL_NOT_CONFIGURED", "embedding model is not configured"
+            )
+        chunks, manifest = build_source_snapshot()
+        identity = get_embed_model_identity(model)
+        return plan_embed_index_update(
+            model,
+            chunks,
+            source_manifest=manifest,
+            mode=effective_mode,
+            model_identity=identity,
+        )
+
     def _cancel_check(self, job_id: str, started: float) -> None:
         if self._cancel.is_set():
             raise IndexCancelled("cancelled")
@@ -157,9 +197,59 @@ class IndexCoordinator:
                 "INDEX_DEADLINE_EXCEEDED", "index build exceeded its fail-safe deadline"
             )
 
-    def _run_worker(self, job_id: str) -> None:
+    @staticmethod
+    def _progress_rate_fields(
+        progress: dict, total: int, started: float, previous_rate: dict
+    ) -> dict:
+        """実Embedding生成時間だけから速度・残り時間を出す。
+
+        再利用・checkpoint件数、資料走査、cache読込/保存の時間は速度へ混ぜない。
+        生成件数が少ない間は、同一モデルの既存実績（あれば）を維持する。
+        """
+        elapsed = max(0.001, time.monotonic() - started)
+        processed = int(progress.get("processed", 0))
+        generated = int(progress.get("generated", 0))
+        try:
+            embedding_seconds = float(progress.get("embedding_seconds") or 0.0)
+        except (TypeError, ValueError):
+            embedding_seconds = 0.0
+        rate = previous_rate.get("rate_per_second")
+        basis = previous_rate.get("rate_basis")
+        if generated > 0 and embedding_seconds > 0 and (
+            rate is None or generated >= RATE_MIN_GENERATED_SAMPLE
+        ):
+            rate = generated / embedding_seconds
+            basis = "generated"
+        eta = (
+            max(0.0, (total - processed) / rate)
+            if rate and processed < total
+            else None
+        )
+        return {
+            "elapsed_seconds": round(elapsed, 3),
+            "rate_per_second": round(rate, 3) if rate else None,
+            "rate_basis": basis if rate else None,
+            "eta_seconds": round(eta, 3) if eta is not None else None,
+        }
+
+    @staticmethod
+    def _job_result_fields(progress: dict) -> dict:
+        return {
+            key: progress[key]
+            for key in ("processed", "generated", "reused", "failed", "checkpointed")
+            if key in progress
+        }
+
+    def _run_worker(
+        self,
+        job_id: str,
+        mode: str = "incremental",
+        prepared: tuple | None = None,
+        previous_rate: dict | None = None,
+    ) -> None:
         started = time.monotonic()
         try:
+            mode = _validate_embed_index_mode(mode)
             model = detect_embed_model()
             if not model:
                 self._persist(
@@ -170,8 +260,15 @@ class IndexCoordinator:
                     }
                 )
                 return
-            chunks = build_source_chunks()
-            generation = compute_embed_generation(model, chunks)
+            if prepared is None:
+                chunks, manifest = build_source_snapshot()
+                identity = get_embed_model_identity(model)
+                generation = compute_embed_generation(model, chunks)
+            else:
+                chunks, manifest, identity, generation = prepared
+            if previous_rate is None:
+                previous_rate = _generated_rate_record(load_index_status(), model)
+            last_progress: dict = {}
             self._persist(
                 {
                     "state": "building",
@@ -180,25 +277,21 @@ class IndexCoordinator:
                     "_allow_generation_change": True,
                     "generation": generation,
                     "embed_model": model,
+                    "mode": mode,
                     "total": len(chunks),
                     "processed": 0,
                     "generated": 0,
                     "reused": 0,
                     "failed": 0,
                     "checkpointed": 0,
+                    **previous_rate,
                     "cancel_requested": False,
                 }
             )
 
             def emit(progress: dict) -> None:
-                elapsed = max(0.001, time.monotonic() - started)
-                processed = int(progress.get("processed", 0))
-                rate = processed / elapsed if processed else 0.0
-                eta = (
-                    max(0.0, (len(chunks) - processed) / rate)
-                    if rate > 0 and processed < len(chunks)
-                    else None
-                )
+                last_progress.clear()
+                last_progress.update(progress)
                 self._persist(
                     {
                         **progress,
@@ -211,9 +304,10 @@ class IndexCoordinator:
                         "job_id": job_id,
                         "generation": generation,
                         "embed_model": model,
-                        "elapsed_seconds": round(elapsed, 3),
-                        "rate_per_second": round(rate, 3),
-                        "eta_seconds": round(eta, 3) if eta is not None else None,
+                        "mode": mode,
+                        **self._progress_rate_fields(
+                            progress, len(chunks), started, previous_rate
+                        ),
                         "cancel_requested": self._cancel.is_set(),
                     }
                 )
@@ -221,17 +315,33 @@ class IndexCoordinator:
             build_or_update_embed_index(
                 model,
                 chunks,
+                source_manifest=manifest,
+                source_root=SKILL_SOURCE_DIR,
+                mode=mode,
+                model_identity=identity,
                 emit_progress=emit,
                 cancel_check=lambda: self._cancel_check(job_id, started),
             )
-            final = get_embed_index_status(model, chunks)
+            final = get_embed_index_status(
+                model,
+                chunks,
+                source_manifest=manifest,
+                model_identity=identity,
+            )
             self._persist(
                 {
                     **final,
+                    # ready判定値ではなく、このjobの生成/再利用件数と速度実績を残す。
+                    **self._job_result_fields(last_progress),
+                    **self._progress_rate_fields(
+                        last_progress, len(chunks), started, previous_rate
+                    ),
+                    "eta_seconds": None,
                     "state": "ready",
                     "job_id": job_id,
                     "generation": generation,
                     "embed_model": model,
+                    "mode": mode,
                     "cancel_requested": False,
                 }
             )
@@ -242,6 +352,15 @@ class IndexCoordinator:
                     "state": "cancelled",
                     "job_id": job_id,
                     "cancel_requested": True,
+                }
+            )
+        except SourceSnapshotError as exc:
+            self._persist(
+                {
+                    **load_index_status(),
+                    "state": "failed",
+                    "job_id": job_id,
+                    "error_code": exc.code,
                 }
             )
         except (EmbedBuildError, EmbeddingBatchError, EmbedIndexBusyError) as exc:
@@ -266,14 +385,30 @@ class IndexCoordinator:
             with self._lock:
                 self._worker = None
 
-    def start(self, *, resume: bool = False) -> dict:
+    def start(
+        self,
+        *,
+        resume: bool = False,
+        mode: str | None = None,
+        expected_generation: str | None = None,
+    ) -> dict:
         """Start or join the current job; duplicate starts never create workers."""
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("INDEX_SHUTDOWN")
+            if mode is not None:
+                # 不正modeは既存jobとの比較より先に入力エラーとして拒否する。
+                mode = _validate_embed_index_mode(mode)
             persisted = load_index_status()
+            persisted_mode = str(persisted.get("mode") or "incremental")
             if self._worker is not None and self._worker.is_alive():
+                if mode is not None and mode != persisted_mode:
+                    raise IndexModeConflictError("active index job mode differs")
                 return self.status()
+            if resume and mode is not None and mode != persisted_mode:
+                raise IndexModeConflictError("resume mode differs from saved job")
+            effective_mode = persisted_mode if resume else (mode or "incremental")
+            effective_mode = _validate_embed_index_mode(effective_mode)
             if persisted.get("state") in {"building", "cancelling"}:
                 if not resume:
                     # A normal duplicate start joins the durable job identity.
@@ -287,6 +422,17 @@ class IndexCoordinator:
             model = detect_embed_model()
             if not model:
                 return self._persist({"state": "failed", "error_code": "EMBED_MODEL_NOT_CONFIGURED"})
+            chunks, manifest = build_source_snapshot()
+            identity = get_embed_model_identity(model)
+            generation = compute_embed_generation(model, chunks)
+            if expected_generation and expected_generation != generation:
+                raise IndexGenerationChangedError(
+                    "source changed after index preview; confirm again"
+                )
+            if resume and persisted.get("generation") and persisted.get("generation") != generation:
+                raise IndexGenerationChangedError(
+                    "source changed since the saved index job; confirm again"
+                )
             job_id = (
                 str(persisted.get("job_id"))
                 if persisted.get("state") in {"building", "cancelling"}
@@ -296,6 +442,7 @@ class IndexCoordinator:
             self._job_id = job_id
             self._cancel.clear()
             self._events.clear()
+            previous_rate = _generated_rate_record(persisted, model)
             self._persist(
                 {
                     "state": "building",
@@ -303,29 +450,48 @@ class IndexCoordinator:
                     "_allow_restart": True,
                     "_allow_generation_change": True,
                     "embed_model": model,
+                    "mode": effective_mode,
+                    "generation": generation,
                     "processed": 0,
                     "generated": 0,
                     "reused": 0,
                     "failed": 0,
                     "checkpointed": 0,
+                    **previous_rate,
                     "cancel_requested": False,
                 }
             )
             self._worker = threading.Thread(
                 target=self._run_worker,
-                args=(job_id,),
+                args=(
+                    job_id,
+                    effective_mode,
+                    (chunks, manifest, identity, generation),
+                    previous_rate,
+                ),
                 daemon=True,
                 name="offline-ai-index-worker",
             )
             self._worker.start()
             return self.status()
 
-    def run_blocking(self, *, resume: bool = False, emit=None) -> int:
+    def run_blocking(self, *, resume: bool = False, mode: str | None = None, emit=None) -> int:
         """Build in the CLI process while using the same durable contract."""
         with self._lock:
             if self._shutdown:
                 return 2
             persisted = load_index_status()
+            persisted_mode = str(persisted.get("mode") or "incremental")
+            if resume:
+                effective_mode = persisted_mode if mode is None else mode
+                if mode is not None and mode != persisted_mode:
+                    return 2
+            else:
+                effective_mode = mode or "incremental"
+            try:
+                effective_mode = _validate_embed_index_mode(effective_mode)
+            except ValueError:
+                return 2
             if persisted.get("state") in {"building", "cancelling"}:
                 if not resume:
                     return 1
@@ -345,19 +511,32 @@ class IndexCoordinator:
             if not model:
                 self._persist({"state": "failed", "job_id": job_id, "error_code": "EMBED_MODEL_NOT_CONFIGURED"})
                 return 2
-            chunks = build_source_chunks()
+            chunks, manifest = build_source_snapshot()
+            identity = get_embed_model_identity(model)
             generation = compute_embed_generation(model, chunks)
-            self._persist({"state": "building", "job_id": job_id, "_allow_restart": True, "_allow_generation_change": True, "generation": generation, "embed_model": model, "total": len(chunks), "processed": 0, "generated": 0, "reused": 0, "failed": 0, "checkpointed": 0, "cancel_requested": False})
+            previous_rate = _generated_rate_record(persisted, model)
+            last_progress: dict = {}
+            self._persist({"state": "building", "job_id": job_id, "_allow_restart": True, "_allow_generation_change": True, "generation": generation, "embed_model": model, "mode": effective_mode, "total": len(chunks), "processed": 0, "generated": 0, "reused": 0, "failed": 0, "checkpointed": 0, **previous_rate, "cancel_requested": False})
             started = time.monotonic()
 
             def progress(event: dict) -> None:
-                status = {**event, "state": "building", "job_id": job_id, "generation": generation, "embed_model": model}
+                last_progress.clear()
+                last_progress.update(event)
+                status = {
+                    **event,
+                    "state": "building",
+                    "job_id": job_id,
+                    "generation": generation,
+                    "embed_model": model,
+                    "mode": effective_mode,
+                    **self._progress_rate_fields(event, len(chunks), started, previous_rate),
+                }
                 self._persist(status)
                 if emit:
                     emit(status)
 
-            build_or_update_embed_index(model, chunks, emit_progress=progress, cancel_check=lambda: self._cancel_check(job_id, started))
-            self._persist({**get_embed_index_status(model, chunks), "state": "ready", "job_id": job_id, "generation": generation, "embed_model": model, "cancel_requested": False})
+            build_or_update_embed_index(model, chunks, source_manifest=manifest, source_root=SKILL_SOURCE_DIR, mode=effective_mode, model_identity=identity, emit_progress=progress, cancel_check=lambda: self._cancel_check(job_id, started))
+            self._persist({**get_embed_index_status(model, chunks, source_manifest=manifest, model_identity=identity), **self._job_result_fields(last_progress), **self._progress_rate_fields(last_progress, len(chunks), started, previous_rate), "eta_seconds": None, "state": "ready", "job_id": job_id, "generation": generation, "embed_model": model, "mode": effective_mode, "cancel_requested": False})
             return 0
         except KeyboardInterrupt:
             self._cancel.set()
@@ -373,6 +552,9 @@ class IndexCoordinator:
         except IndexCancelled:
             self._persist({**load_index_status(), "state": "cancelled", "job_id": job_id, "cancel_requested": True})
             return 130
+        except SourceSnapshotError as exc:
+            self._persist({**load_index_status(), "state": "failed", "job_id": job_id, "error_code": exc.code})
+            return 1
         except (EmbedBuildError, EmbeddingBatchError, EmbedIndexBusyError) as exc:
             self._persist({**load_index_status(), "state": "failed", "job_id": job_id, "error_code": getattr(exc, "code", "INDEX_BUSY")})
             return 1
@@ -511,6 +693,11 @@ class IndexCoordinator:
             except OSError:
                 return "EMBED_CACHE_TMP_REMOVE_FAILED", cache
         return None, cache
+
+    def is_running(self) -> bool:
+        """このプロセスのworkerが索引を構築中か（ページ閉鎖時の自動停止を保留する判定用）。"""
+        with self._lock:
+            return self._worker is not None and self._worker.is_alive()
 
     def shutdown(self) -> None:
         with self._lock:

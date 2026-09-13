@@ -197,6 +197,7 @@ def test_embed_cache_memo_can_be_disabled(tmp_path, monkeypatch):
 def test_get_embed_index_status_with_cache_does_not_call_load_embed_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(search, "EMBED_STATUS_PATH", tmp_path / "status.json")
     chunks = [{"chunk_id": "a.md#0001"}]
+    identity = {"name": "m:latest", "digest": "fixture-digest"}
     cache = {
         "version": search.EMBED_CACHE_VERSION,
         "embed_model": "m",
@@ -214,7 +215,10 @@ def test_get_embed_index_status_with_cache_does_not_call_load_embed_cache(tmp_pa
                 "embedding": [1.0, 0.0],
             }
         },
+        "compatibility": search._new_embed_compatibility("m", identity, 2),
+        "files": search._source_manifest_from_chunks(chunks),
     }
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda *_args, **_kwargs: identity)
 
     def fail_load(*_args, **_kwargs):
         pytest.fail("cache指定時は load_embed_cache を呼んではならない")
@@ -229,6 +233,7 @@ def test_get_embed_index_status_validate_entries_false_skips_full_scan(tmp_path,
     """validate_entries=False は key集合一致のみで ready 判定し、不正entryを検出しない。"""
     monkeypatch.setattr(search, "EMBED_STATUS_PATH", tmp_path / "status.json")
     chunks = [{"chunk_id": "a.md#0001"}]
+    identity = {"name": "m:latest", "digest": "fixture-digest"}
     generation = search.compute_embed_generation("m", chunks)
     cache = {
         "version": search.EMBED_CACHE_VERSION,
@@ -240,7 +245,10 @@ def test_get_embed_index_status_validate_entries_false_skips_full_scan(tmp_path,
         },
         # embeddingが空 = 本来は不正entry
         "entries": {"a.md#0001": {"chunk_id": "a.md#0001", "embedding": []}},
+        "compatibility": search._new_embed_compatibility("m", identity, None),
+        "files": search._source_manifest_from_chunks(chunks),
     }
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda *_args, **_kwargs: identity)
 
     lenient = search.get_embed_index_status("m", chunks, cache=cache, validate_entries=False)
     strict = search.get_embed_index_status("m", chunks, cache=cache, validate_entries=True)

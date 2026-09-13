@@ -437,6 +437,14 @@ def test_build_index_keeps_cache_on_same_model(tmp_path, monkeypatch):
     cache_path = tmp_path / "embed_cache.json"
     monkeypatch.setattr(search, "SKILL_SOURCE_DIR", src)
     monkeypatch.setattr(search, "EMBED_CACHE_PATH", cache_path)
+    monkeypatch.setattr(
+        search,
+        "get_embed_model_identity",
+        lambda model: {
+            "name": search._canonical_model_reference(model),
+            "digest": "fixture-digest",
+        },
+    )
 
     calls = {"n": 0}
 
@@ -536,6 +544,116 @@ def _embed_test_chunks(count: int) -> list[dict]:
         }
         for index in range(1, count + 1)
     ]
+
+
+def _fixture_model_identity(model: str = "bge-m3") -> dict:
+    return {
+        "name": search._canonical_model_reference(model),
+        "digest": "fixture-digest",
+    }
+
+
+def test_incremental_plan_counts_file_delta_and_reuse(tmp_path, monkeypatch):
+    """差分previewはファイル単位で数え、未変更chunkだけ再利用する。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_text("本文A", encoding="utf-8")
+    (src / "b.md").write_text("本文B", encoding="utf-8")
+    (src / "deleted.md").write_text("削除対象", encoding="utf-8")
+    cache_path, _, _ = _isolate_embed_runtime_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(search, "SKILL_SOURCE_DIR", src)
+    identity = _fixture_model_identity()
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda model: dict(identity))
+    monkeypatch.setattr(search, "_get_embedding", lambda text, model: [1.0, 0.0])
+    search.build_or_update_embed_index("bge-m3", model_identity=identity)
+
+    (src / "a.md").write_text("本文Aを変更", encoding="utf-8")
+    (src / "deleted.md").unlink()
+    (src / "added.md").write_text("追加本文", encoding="utf-8")
+    plan = search.plan_embed_index_update(
+        "bge-m3", mode="incremental", model_identity=identity
+    )
+
+    assert plan["added_files"] == 1
+    assert plan["changed_files"] == 1
+    assert plan["deleted_files"] == 1
+    assert plan["unchanged_files"] == 1
+    assert plan["generated_chunks"] == 2
+    assert plan["reused_chunks"] == 1
+    assert plan["compatibility"] == "compatible"
+    assert cache_path.exists()
+
+
+def test_incremental_build_reuses_only_unchanged_files(tmp_path, monkeypatch):
+    """incremental buildは変更・追加ファイルだけをEmbeddingへ渡す。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_text("本文A", encoding="utf-8")
+    (src / "b.md").write_text("本文B", encoding="utf-8")
+    _isolate_embed_runtime_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(search, "SKILL_SOURCE_DIR", src)
+    identity = _fixture_model_identity()
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda model: dict(identity))
+    calls = []
+    monkeypatch.setattr(search, "_get_embedding", lambda text, model: calls.append(text) or [1.0, 0.0])
+    search.build_or_update_embed_index("bge-m3", model_identity=identity)
+    calls.clear()
+
+    (src / "a.md").write_text("本文Aを変更", encoding="utf-8")
+    search.build_or_update_embed_index(
+        "bge-m3", mode="incremental", model_identity=identity
+    )
+
+    assert calls == ["本文Aを変更"]
+
+
+def test_full_build_ignores_completed_cache(tmp_path, monkeypatch):
+    """full modeは現在の全chunkを再計算する。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_text("本文A", encoding="utf-8")
+    (src / "b.md").write_text("本文B", encoding="utf-8")
+    _isolate_embed_runtime_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(search, "SKILL_SOURCE_DIR", src)
+    identity = _fixture_model_identity()
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda model: dict(identity))
+    calls = {"n": 0}
+
+    def embed(text, model):
+        calls["n"] += 1
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(search, "_get_embedding", embed)
+    search.build_or_update_embed_index("bge-m3", model_identity=identity)
+    calls["n"] = 0
+    search.build_or_update_embed_index(
+        "bge-m3", mode="full", model_identity=identity
+    )
+
+    assert calls["n"] == 2
+
+
+def test_model_identity_change_before_promotion_keeps_previous_cache(tmp_path, monkeypatch):
+    """昇格直前のモデルdigest変化では候補を採用せず旧cacheを残す。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    source = src / "a.md"
+    source.write_text("本文A", encoding="utf-8")
+    cache_path, _, _ = _isolate_embed_runtime_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(search, "SKILL_SOURCE_DIR", src)
+    initial_identity = _fixture_model_identity()
+    current_identity = {**initial_identity}
+    monkeypatch.setattr(search, "get_embed_model_identity", lambda model: dict(current_identity))
+    monkeypatch.setattr(search, "_get_embedding", lambda text, model: [1.0, 0.0])
+    search.build_or_update_embed_index("bge-m3", model_identity=initial_identity)
+    before = cache_path.read_bytes()
+
+    source.write_text("本文Aを変更", encoding="utf-8")
+    current_identity["digest"] = "different-digest"
+    with pytest.raises(search.EmbedBuildError, match="model identity"):
+        search.build_or_update_embed_index("bge-m3", model_identity=initial_identity)
+
+    assert cache_path.read_bytes() == before
 
 
 def test_build_index_emits_progress_and_resumes_checkpoint(tmp_path, monkeypatch):
@@ -717,6 +835,7 @@ def test_progress_events_expose_counters_only(tmp_path, monkeypatch):
         "reused",
         "failed",
         "checkpointed",
+        "embedding_seconds",
     }
     for event in events:
         assert set(event) == allowed
@@ -829,10 +948,10 @@ def test_final_cache_save_failure_keeps_checkpoint(tmp_path, monkeypatch):
     cache_path, checkpoint_path, _ = _isolate_embed_runtime_paths(tmp_path, monkeypatch)
     real_write = search._atomic_write_json
 
-    def fail_final_cache(path, payload):
+    def fail_final_cache(path, payload, **kwargs):
         if path == cache_path:
             return False
-        return real_write(path, payload)
+        return real_write(path, payload, **kwargs)
 
     monkeypatch.setattr(search, "_atomic_write_json", fail_final_cache)
     monkeypatch.setattr(search, "_get_embedding", lambda text, model: [1.0, 0.0])
@@ -848,8 +967,17 @@ def test_second_writer_reuses_existing_cache_without_new_embeddings(tmp_path, mo
     """lock競合時は既存の有効cacheを読取専用で使い、同じbatchへ書かない。"""
     _, checkpoint_path, _ = _isolate_embed_runtime_paths(tmp_path, monkeypatch)
     chunks = _embed_test_chunks(2)
+    identity = {
+        "name": search._canonical_model_reference("bge-m3"),
+        "digest": "fixture-digest",
+    }
+    monkeypatch.setattr(
+        search,
+        "get_embed_model_identity",
+        lambda model: dict(identity),
+    )
     monkeypatch.setattr(search, "_get_embedding", lambda text, model: [1.0, 0.0])
-    search.build_or_update_embed_index("bge-m3", chunks)
+    search.build_or_update_embed_index("bge-m3", chunks, model_identity=identity)
 
     monkeypatch.setattr(
         search,
@@ -858,7 +986,9 @@ def test_second_writer_reuses_existing_cache_without_new_embeddings(tmp_path, mo
     )
     assert search._EMBED_PROCESS_LOCK.acquire(blocking=False)
     try:
-        result = search.build_or_update_embed_index("bge-m3", chunks)
+        result = search.build_or_update_embed_index(
+            "bge-m3", chunks, model_identity=identity
+        )
     finally:
         search._EMBED_PROCESS_LOCK.release()
 

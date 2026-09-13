@@ -32,6 +32,8 @@ body {
 .header .status-dot.degraded { background: #f59e0b; }
 .header .status-dot.unavailable { background: #ef4444; }
 .header .status-text { font-size: 13px; opacity: 0.9; }
+.header .page-close-hint { display: block; font-size: 12px; opacity: 0.8; margin-top: 2px; }
+.header .page-close-hint.server-gone { color: #fecaca; opacity: 1; font-weight: 600; }
 
 .container {
     max-width: 900px;
@@ -265,6 +267,7 @@ body {
     <div>
         <span class="status-dot unavailable" id="statusDot"></span>
         <span class="status-text" id="statusText">接続確認中...</span>
+        <span class="page-close-hint" id="pageCloseHint" role="status" hidden></span>
     </div>
 </div>
 
@@ -276,6 +279,7 @@ body {
             <div class="index-progress" id="indexStatus">状態確認中...</div>
             <div class="index-controls">
                 <button class="btn btn-primary" id="indexStartBtn" type="button">インデックスを準備</button>
+                <button class="btn btn-secondary" id="indexFullBtn" type="button">全件再構築</button>
                 <button class="btn btn-danger" id="indexCancelBtn" type="button" hidden>停止</button>
             </div>
         </section>
@@ -347,6 +351,7 @@ const state = {
     activeSearchId: 0,
     finishSearch: null,
     indexAbort: null,
+    indexStarting: false,
     healthOk: false,
     features: { search: false, retrieval: false },
     rawSearchText: "",
@@ -556,9 +561,18 @@ const api = {
         }
     },
 
-    async startIndex(resume = false) {
+    async indexPlan(mode = "incremental") {
+        const res = await fetch(`/api/index/plan?mode=${encodeURIComponent(mode)}`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        return data;
+    },
+
+    async startIndex({ resume = false, mode = "incremental", expectedGeneration = null } = {}) {
         const path = resume ? "/api/index/resume" : "/api/index/start";
-        const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        const body = { mode };
+        if (expectedGeneration) body.expected_generation = expectedGeneration;
+        const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
         return data;
@@ -658,6 +672,61 @@ const api = {
 
 };
 
+// --- pagePresence ---
+// web.bat（非表示起動）では、開いているページが無くなるとサーバーが停止する。
+// 生存通知は背景タブで間引かれてもサーバー側の失効時間（5分）内に届く間隔にし、
+// 閉じる時は sendBeacon で即時に通知する（再読み込みはサーバー側の猶予で吸収）。
+const pagePresence = {
+    intervalMs: 15000,
+    pageId: "",
+    timer: null,
+    failures: 0,
+
+    newPageId() {
+        if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    },
+
+    start() {
+        this.pageId = this.newPageId();
+        window.addEventListener("pagehide", () => this.close());
+        window.addEventListener("pageshow", (event) => { if (event.persisted) this.beat(); });
+        // 非表示へ切り替わった時も通知し、背景タブのtimer間引きで誤って失効させない。
+        document.addEventListener("visibilitychange", () => this.beat());
+        this.timer = setInterval(() => this.beat(), this.intervalMs);
+        return this.beat();
+    },
+
+    async beat() {
+        try {
+            const res = await fetch("/api/page/heartbeat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                // 表示中のページは短時間で失効させ、pagehideが届かない閉じ方でも早く停止する。
+                body: JSON.stringify({ page_id: this.pageId, visible: document.visibilityState === "visible" }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            this.failures = 0;
+            ui.renderPageCloseHint({ enabled: Boolean(data.enabled), serverGone: false });
+        } catch {
+            this.failures += 1;
+            // 一時的な失敗で表示を揺らさず、2回続いたら停止の可能性を知らせる。
+            if (this.failures >= 2) ui.renderPageCloseHint({ enabled: false, serverGone: true });
+        }
+    },
+
+    close() {
+        const body = JSON.stringify({ page_id: this.pageId });
+        try {
+            if (navigator.sendBeacon && navigator.sendBeacon("/api/page/close", new Blob([body], { type: "application/json" }))) return;
+        } catch {}
+        fetch("/api/page/close", { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+    },
+};
+
 // --- ui ---
 const ui = {
     els: {},
@@ -668,6 +737,7 @@ const ui = {
             statusText: document.getElementById("statusText"),
             indexStatus: document.getElementById("indexStatus"),
             indexStartBtn: document.getElementById("indexStartBtn"),
+            indexFullBtn: document.getElementById("indexFullBtn"),
             indexCancelBtn: document.getElementById("indexCancelBtn"),
             searchInput: document.getElementById("searchInput"),
             searchModeSelect: document.getElementById("searchModeSelect"),
@@ -695,15 +765,32 @@ const ui = {
             saveMarkdownBtn: document.getElementById("saveMarkdownBtn"),
             saveMarkdownHint: document.getElementById("saveMarkdownHint"),
             searchResult: document.getElementById("searchResult"),
+            pageCloseHint: document.getElementById("pageCloseHint"),
         };
 
         this.bindEvents();
         this.updateSearchModeUI();
+        pagePresence.start();
         this.pollHealth();
+    },
+
+    renderPageCloseHint({ enabled, serverGone }) {
+        const hint = this.els.pageCloseHint;
+        if (!hint) return;
+        hint.classList.toggle("server-gone", serverGone);
+        if (serverGone) {
+            hint.textContent = "サーバーに接続できません。停止した場合は web.bat を起動し直してください。";
+        } else if (enabled) {
+            hint.textContent = "このページをすべて閉じると、サーバーは自動で停止します（索引の構築中は完了後）。";
+        } else {
+            hint.textContent = "";
+        }
+        hint.hidden = !hint.textContent;
     },
 
     bindEvents() {
         this.els.indexStartBtn.addEventListener("click", () => this.startIndex());
+        this.els.indexFullBtn.addEventListener("click", () => this.startIndex("full"));
         this.els.indexCancelBtn.addEventListener("click", () => this.cancelIndex());
         // Search
         this.els.searchBtn.addEventListener("click", () => this.startSearch());
@@ -777,7 +864,11 @@ const ui = {
         const total = Number(index.total || 0);
         const percent = total ? (processed / total * 100).toFixed(1) : (stateName === "ready" ? "100.0" : "0.0");
         const parts = [`状態: ${stateName}`, `${processed} / ${total} (${percent}%)`];
-        if (index.rate_per_second) parts.push(`速度 ${index.rate_per_second}/秒`);
+        if (index.mode) parts.push(index.mode === "full" ? "全件再構築" : "差分更新");
+        if (index.generated !== undefined || index.reused !== undefined) {
+            parts.push(`生成 ${Number(index.generated || 0)}・再利用 ${Number(index.reused || 0)}`);
+        }
+        if (index.rate_per_second) parts.push(`生成速度 ${index.rate_per_second}/秒`);
         if (index.eta_seconds !== null && index.eta_seconds !== undefined) parts.push(`概算残り ${index.eta_seconds}秒`);
         if (index.error_code) parts.push(`code=${index.error_code}`);
         if (stateName === "missing" || stateName === "stale" || stateName === "cancelled" || stateName === "failed") {
@@ -785,14 +876,58 @@ const ui = {
         }
         this.els.indexStatus.textContent = parts.filter(Boolean).join(" / ");
         this.els.indexStartBtn.hidden = stateName === "building" || stateName === "cancelling" || stateName === "ready";
+        this.els.indexFullBtn.hidden = stateName === "building" || stateName === "cancelling";
         this.els.indexCancelBtn.hidden = !(stateName === "building" || stateName === "cancelling");
         this.els.indexStartBtn.textContent = stateName === "cancelled" || stateName === "failed" ? "インデックスを再開" : "インデックスを準備";
     },
 
-    async startIndex() {
+    indexPlanMessage(plan) {
+        const modeLabel = plan.mode === "full" ? "全件再構築" : "差分更新";
+        const lines = [
+            `${modeLabel}: 追加${plan.added_files}件・変更${plan.changed_files}件・削除${plan.deleted_files}件・未変更${plan.unchanged_files}件。`,
+            `再計算${plan.generated_chunks}チャンク・再利用${plan.reused_chunks}チャンク` +
+                (plan.checkpoint_chunks ? `・途中保存から再開${plan.checkpoint_chunks}チャンク。` : "。"),
+        ];
+        const reasons = {
+            full_requested: "全件再構築が指定されたため、既存のEmbeddingは再利用しません。",
+            cache_missing: "完成済みのインデックスがないため、全件を計算します。",
+            model_digest_unavailable: "Embeddingモデルの識別情報（digest）を取得できないため、安全のため全件を計算します。Ollamaの起動状態を確認してください。",
+            cache_incompatible: "モデル・形式・分割方式が既存インデックスと異なるため、全件を計算します。",
+        };
+        if (plan.reason && reasons[plan.reason]) lines.push(reasons[plan.reason]);
+        if (plan.estimate_status === "no_embedding") {
+            lines.push("Embeddingの生成はありません。資料の走査と保存に時間がかかる場合があります。");
+        } else if (plan.estimated_seconds === null || plan.estimated_seconds === undefined) {
+            lines.push("同じモデルの生成実績がないため、所要時間は見積もりできません。");
+        } else {
+            const minutes = Math.max(1, Math.ceil(plan.estimated_seconds / 60));
+            const hours = Math.floor(minutes / 60);
+            lines.push(`Embedding生成は約${hours}時間${minutes % 60}分の予定です（資料の走査・保存時間は別途かかります）。`);
+        }
+        lines.push("実際の時間は資料量やPC負荷で変わります。", "更新しますか？");
+        return lines.join("\n");
+    },
+
+    async startIndex(requestedMode = "incremental") {
+        if (state.indexStarting) return;
+        state.indexStarting = true;
+        this.els.indexStartBtn.disabled = true;
+        this.els.indexFullBtn.disabled = true;
         try {
             const current = await api.indexStatus();
-            const data = await api.startIndex(current.state === "cancelled" || current.state === "failed");
+            if (current.state === "building" || current.state === "cancelling") {
+                this.renderIndex(current);
+                return;
+            }
+            const interrupted = current.state === "cancelled" || current.state === "failed";
+            const savedMode = current.mode || "incremental";
+            // 通常ボタンは中断jobを保存済みmodeで再開する。全件再構築ボタンは、
+            // 中断jobがfullの場合だけ再開し、それ以外は新しいfull jobを始める。
+            const resume = interrupted && (requestedMode !== "full" || savedMode === "full");
+            const mode = resume ? savedMode : requestedMode;
+            const plan = await api.indexPlan(mode);
+            if (!window.confirm(this.indexPlanMessage(plan))) return;
+            const data = await api.startIndex({ resume, mode, expectedGeneration: plan.generation });
             this.renderIndex(data);
             if (data.job_id) {
                 if (state.indexAbort) state.indexAbort.abort();
@@ -803,6 +938,10 @@ const ui = {
             }
         } catch (error) {
             this.els.indexStatus.textContent = error.message || "index start failed";
+        } finally {
+            state.indexStarting = false;
+            this.els.indexStartBtn.disabled = false;
+            this.els.indexFullBtn.disabled = false;
         }
     },
 

@@ -53,7 +53,7 @@ offline-ai/
 
 ## 3. 検索フロー
 
-Embedding indexは検索要求から分離される。`index.bat build`またはWebのindex APIだけがwriterを開始し、検索はcache状態を読むだけである。
+Embedding indexは検索要求から分離される。`index.bat build`またはWebのindex APIだけがwriterを開始し、検索はcache状態を読むだけである。通常のbuildはfile manifestを比較するincremental modeで、同一file hashかつ健全な全entryだけを再利用する。`--full`は完成cacheを再利用しない明示的復旧操作である。
 
 ```text
 search.bat / GET /api/search
@@ -102,12 +102,22 @@ search.bat / GET /api/search
 - `GET /api/search`（SSE）
 - `GET /api/evidence/view?evidence_id=...`（検索時に登録した根拠行窓）
 - `GET /api/index/status`
+- `GET /api/index/plan?mode=incremental|full`（副作用のない差分解析）
 - `POST /api/index/start` / `resume` / `cancel`
 - `GET /api/index/events?job_id=...`（SSE）
+- `POST /api/page/heartbeat` / `close`（開いているページの在席通知）
 
 未知routeは共通404へ委ねる。Web層はbootstrap token、HttpOnly cookie、Origin/Host検査、CSP、接続数制限、`JobTable`、`CancellationToken`、slow-client対策を維持する。
 
-Health contractにはindex statusと検索単位timeout契約（`searchTimeoutDefault`/`Min`/`Max`、300〜600秒）を含める。index SSEの切断はjobをcancelせず、statusとbounded event bufferから再接続する。
+`web.bat`の非表示起動（`web_launcher.py`）は`--exit-when-page-closed`を付けて起動し、開いているページが無くなったらサーバーを停止する。コンソール起動と直接起動は付けないため従来どおりCtrl+Cで停止する。ページは15秒ごとに`page_id`と表示状態を`/api/page/heartbeat`へ送り、`pagehide`で`sendBeacon`により`/api/page/close`を送る。サーバーの`PagePresenceMonitor`は最後のページが閉じてから15秒の猶予（再読み込み吸収）を置いて停止し、closeが届かなかったページは最後の通知が表示中なら45秒、非表示なら300秒（背景タブのtimer間引き対策）で失効させる。watchdogは2秒間隔で判定し、tick間隔が30秒を超えた場合はスリープ明けとして在席時刻を寄せる。ページが一度も接続しない場合は600秒で停止する。このプロセスのworkerが索引を構築中、または検索jobが実行中の間は停止を保留する。在席通知もCookie認証・Origin/Host検査の対象で、`page_id`は8〜64文字の英数字・`-`・`_`に限る。
+
+Health contractにはindex statusと検索単位timeout契約（`searchTimeoutDefault`/`Min`/`Max`、300〜600秒）、ページ閉鎖時停止の有効状態（`pageCloseStop`）を含める。index SSEの切断はjobをcancelせず、statusとbounded event bufferから再接続する。
+
+`/api/index/plan`は追加・変更・削除・未変更file数、生成/完成cache再利用/checkpoint再開のchunk数、mode、対象generation、全件計算になる理由（`full_requested`/`cache_missing`/`model_digest_unavailable`/`cache_incompatible`）、生成chunkだけを分母にした過去速度ベースの見積もりを返す。事前解析はbuildと同じ再利用選別関数を使い、cache・checkpoint・statusを書き換えない。速度は同一モデルのjobでEmbedding API呼出しに要した時間だけから算出し（`rate_basis: "generated"`）、走査・cache読込・JSON保存時間、再利用件数、旧processed基準の速度は混ぜない。32件未満しか生成しなかったjobはモデル起動待ちの影響が大きいため既存実績を上書きしない。生成0件（削除のみを含む）は0秒と断定せず、走査・保存時間がかかる旨を表示する。開始要求は任意の`expected_generation`を受け、確認後に資料が変わっていればjobを開始しない（`index_source_changed`）。start/resumeのmodeはstatusへ保存し、resumeは保存済みmodeを継承し、異なるmode指定は`index_mode_conflict`で拒否する。
+
+cache互換性と資料鮮度は別判定である。互換性にはcache schema、モデルdigest、parser/chunk契約、ベクトル次元を含め、digestを取得できない場合は既存entryを再利用しない（毎回全件計算になり、事前解析は`model_digest_unavailable`を返す）。digest不明で構築したcacheは、現在もdigest不明の同名モデルに限ってreadyとし、digestが取得できるようになったらstaleとして再構築を求める。資料の最新generationが変わっても互換性が満たされれば未変更fileだけを候補へ引き継ぐ。再利用はfile単位のall-or-nothingで、path・file SHA-256・chunk ID列が一致し、そのfileの全entryが本文hash・有限値・次元の検査に合格した場合だけvectorを引き継ぐ（本文・見出し・行位置は現行parserの結果を正とする）。1件でも欠落・不正なら当該file全体を再計算する。追加・変更fileは全chunkを再計算し、削除fileのentryは候補から除外する。候補はmanifest、entry集合、本文hash、引用位置、有限値・次元を保存前に検証し、同一directoryの一時ファイルへ書き込んで再読込検証したうえで、昇格直前に資料の実hash・モデルdigest・cancelを再確認し、すべて成功した場合だけ原子的に置換する。停止・失敗・disk full・置換失敗では直前のcacheを変更せず一時ファイルを削除し、checkpointは保持する。staleならkeyword検索へ退避する。
+
+資料の走査は、index writer（build/plan）では読取り・解析に失敗したfileが1件でもあれば`SOURCE_SNAPSHOT_FAILED`で更新を保留し、削除や空ファイルとして扱わない。検索read経路では読めないfileを飛ばして検索を継続するが、そのsnapshotは不完全としてreadyと判定しない。UTF-8として不正なbyteは検索・index共通でU+FFFDへ置換する。status/検索のsource memo keyは`(相対path, mtime, size, SHA-256)`で、同size・同mtimeの内容変更も検知する。2026-09-13に開発PC上の合成資料（482 file・26 MB、OS file cache warm）で測定したkey算出は中央値約72 ms（stat only約37 ms）であり、毎要求の全hashを維持する。cold cacheや低速diskでは増える可能性があり、実機では未測定である。
 
 `/api/search`は任意の`timeout_seconds`クエリパラメータ（300〜600の整数、省略時はサーバー既定）を受理し、`CancellationToken`が確定した総秒数を保持する。SSE購読開始時に`{"type":"budget","timeoutSeconds":N,"remainingSeconds":R}`を送出し、Web UIはこれを起点にサーバーdeadline基準の残り時間を表示する。表示は案内であり、timeout判定は常にサーバー側の`CancellationToken`が行う。
 

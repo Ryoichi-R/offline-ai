@@ -35,6 +35,16 @@ def test_markdown_ui_uses_content_dependent_fence_and_does_not_save_view_ids():
     assert "document.body.appendChild(anchor)" in html
 
 
+def test_index_ui_exposes_incremental_preview_and_explicit_full_rebuild():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'id="indexFullBtn"' in html
+    assert 'fetch(`/api/index/plan?mode=${encodeURIComponent(mode)}`)' in html
+    assert "expected_generation" in html
+    assert "再計算${plan.generated_chunks}チャンク・再利用${plan.reused_chunks}チャンク" in html
+    assert "全件再構築" in html
+
+
 @pytest.mark.parametrize("transition", ["new-view", "close", "new-search"])
 @pytest.mark.parametrize("stale_error", [False, True])
 def test_late_view_response_cannot_replace_current_view_or_focus(transition, stale_error):

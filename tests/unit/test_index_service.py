@@ -95,6 +95,8 @@ def test_resume_restarts_stale_durable_job_after_process_restart(monkeypatch):
         lambda _model, **_kwargs: dict(persisted),
     )
     monkeypatch.setattr(index_service, "detect_embed_model", lambda: "bge-m3")
+    monkeypatch.setattr(index_service, "build_source_snapshot", lambda: ([], {}))
+    monkeypatch.setattr(index_service, "compute_embed_generation", lambda *_args: "g")
     monkeypatch.setattr(index_service, "save_index_status", lambda value: True)
 
     @contextmanager
@@ -106,7 +108,7 @@ def test_resume_restarts_stale_durable_job_after_process_restart(monkeypatch):
     monkeypatch.setattr(
         index_service.IndexCoordinator,
         "_run_worker",
-        lambda _self, job_id: started.append(job_id),
+        lambda _self, job_id, *args, **kwargs: started.append(job_id),
     )
 
     coordinator = index_service.IndexCoordinator()
@@ -116,6 +118,36 @@ def test_resume_restarts_stale_durable_job_after_process_restart(monkeypatch):
 
     assert result["job_id"] == "stale-job"
     assert started == ["stale-job"]
+
+
+def test_start_rejects_generation_changed_after_preview(monkeypatch):
+    persisted = {"state": "ready", "generation": "old-generation"}
+    monkeypatch.setattr(index_service, "load_index_status", lambda: dict(persisted))
+    monkeypatch.setattr(index_service, "detect_embed_model", lambda: "bge-m3")
+    monkeypatch.setattr(index_service, "build_source_snapshot", lambda: ([], {}))
+    monkeypatch.setattr(
+        index_service,
+        "get_embed_model_identity",
+        lambda model: {"name": "bge-m3:latest", "digest": "fixture-digest"},
+    )
+    monkeypatch.setattr(index_service, "compute_embed_generation", lambda *_args: "new-generation")
+
+    coordinator = index_service.IndexCoordinator()
+    with pytest.raises(index_service.IndexGenerationChangedError):
+        coordinator.start(expected_generation="old-generation")
+
+
+def test_resume_rejects_mode_changed_from_saved_job(monkeypatch):
+    persisted = {
+        "state": "paused",
+        "job_id": "saved-job",
+        "mode": "incremental",
+        "generation": "g",
+    }
+    monkeypatch.setattr(index_service, "load_index_status", lambda: dict(persisted))
+    coordinator = index_service.IndexCoordinator()
+    with pytest.raises(index_service.IndexGenerationChangedError):
+        coordinator.start(resume=True, mode="full")
 
 
 @pytest.mark.parametrize(

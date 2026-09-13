@@ -433,6 +433,111 @@ except Exception:
 # エラーコード辞書
 # ---------------------------------------------------------------------------
 
+class PagePresenceMonitor:
+    """開いているWebページが無くなったらサーバー停止を判断する（web.bat非表示起動用）。
+
+    ページは定期的に heartbeat を送り、閉じる時は ``close`` を送る（sendBeacon）。
+    - 再読み込みは close → 新ページの heartbeat になるため、``close_grace_seconds``
+      だけ待ってから停止する。別タブが開いていれば停止しない。
+    - close を送れずに消えたページ（ブラウザ異常終了、組み込みブラウザ等で pagehide が
+      発火しない閉じ方）は、最後の通知が「表示中」なら ``visible_stale_seconds``、
+      「非表示」なら ``stale_seconds`` で失効する。背景タブのtimerは最大1分間隔まで
+      間引かれるため、非表示側は十分長くする（表示中のタブは間引かれない）。
+    - PCのスリープ等でtick間隔が大きく空いた場合は、ページの再送を待つため
+      最終確認時刻を現在へ寄せる（スリープ明けに即停止しない）。
+    - 一度もページが接続しない場合（ブラウザ起動失敗等）は ``initial_seconds`` で停止する。
+    - ``busy``（索引構築・検索実行中）の間は停止を保留する。
+    """
+
+    PAGE_ID_MAX_LENGTH = 64
+    MAX_PAGES = 32
+
+    def __init__(
+        self,
+        *,
+        stale_seconds: float = 300.0,
+        visible_stale_seconds: float = 45.0,
+        close_grace_seconds: float = 15.0,
+        initial_seconds: float = 600.0,
+        sleep_gap_seconds: float = 30.0,
+        clock=time.monotonic,
+    ):
+        self._stale_seconds = stale_seconds
+        self._visible_stale_seconds = visible_stale_seconds
+        self._close_grace_seconds = close_grace_seconds
+        self._initial_seconds = initial_seconds
+        self._sleep_gap_seconds = sleep_gap_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._pages: dict[str, tuple[float, bool]] = {}  # page_id -> (最終通知, 表示中)
+        self._ever_seen = False
+        self._started = clock()
+        self._last_tick = self._started
+        self._empty_since: float | None = None
+
+    @classmethod
+    def valid_page_id(cls, page_id: object) -> bool:
+        return (
+            isinstance(page_id, str)
+            and 8 <= len(page_id) <= cls.PAGE_ID_MAX_LENGTH
+            and all(ch.isascii() and (ch.isalnum() or ch in "-_") for ch in page_id)
+        )
+
+    def heartbeat(self, page_id: str, *, visible: bool = False) -> None:
+        if not self.valid_page_id(page_id):
+            raise ValueError("invalid page id")
+        with self._lock:
+            now = self._clock()
+            if page_id not in self._pages and len(self._pages) >= self.MAX_PAGES:
+                oldest = min(self._pages, key=lambda key: self._pages[key][0])
+                del self._pages[oldest]
+            self._pages[page_id] = (now, bool(visible))
+            self._ever_seen = True
+            self._empty_since = None
+
+    def close(self, page_id: str) -> None:
+        if not self.valid_page_id(page_id):
+            raise ValueError("invalid page id")
+        with self._lock:
+            if self._pages.pop(page_id, None) is not None and not self._pages:
+                self._empty_since = self._clock()
+
+    def open_page_count(self) -> int:
+        with self._lock:
+            return len(self._pages)
+
+    def should_shutdown(self, *, busy: bool = False) -> bool:
+        with self._lock:
+            now = self._clock()
+            if now - self._last_tick > self._sleep_gap_seconds:
+                # スリープ明け: 経過時間でページを失効させず、再送の機会を与える。
+                for page_id, (_seen, visible) in self._pages.items():
+                    self._pages[page_id] = (now, visible)
+                if self._empty_since is not None:
+                    self._empty_since = now
+                if not self._ever_seen:
+                    self._started = now
+            self._last_tick = now
+            expired = [
+                page_id
+                for page_id, (seen, visible) in self._pages.items()
+                if now - seen
+                > (self._visible_stale_seconds if visible else self._stale_seconds)
+            ]
+            for page_id in expired:
+                del self._pages[page_id]
+            if self._pages:
+                self._empty_since = None
+                return False
+            if busy:
+                return False
+            if not self._ever_seen:
+                return now - self._started >= self._initial_seconds
+            if self._empty_since is None:
+                self._empty_since = now
+            return now - self._empty_since >= self._close_grace_seconds
+
+
 ERROR_CODES = {
     "invalid_query": 400,
     "invalid_timeout": 400,
@@ -441,6 +546,10 @@ ERROR_CODES = {
     "unauthorized": 403,
     "request_conflict": 409,
     "source_changed": 409,
+    "index_source_changed": 409,
+    "index_source_unreadable": 409,
+    "index_mode_conflict": 409,
+    "index_not_configured": 409,
     "evidence_too_large": 413,
     "evidence_not_found": 404,
     "evidence_unavailable": 500,

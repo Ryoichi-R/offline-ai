@@ -62,6 +62,7 @@ try:
         ERROR_CODES,
         GENERATION_STALL_TIMEOUT,
         JobTable,
+        PagePresenceMonitor,
         RequestConflictError,
         _BroadcastQueue,
         check_health,
@@ -72,7 +73,12 @@ try:
         VALID_SEARCH_MODES,
         view_evidence,
     )
-    from index_service import IndexCoordinator
+    from index_service import (
+        IndexCoordinator,
+        IndexGenerationChangedError,
+        IndexModeConflictError,
+    )
+    from search import EmbedBuildError, SourceSnapshotError
 except ValueError as exc:
     if __name__ == "__main__":
         print(f"[設定エラー] {exc}", file=sys.stderr)
@@ -300,7 +306,8 @@ class LimitedThreadingServer(ThreadingHTTPServer):
                  max_connections=10, session_token="",
                  search_timeout=DEFAULT_SEARCH_TIMEOUT,
                  bind_port=8080,
-                 evidence_registry=None):
+                 evidence_registry=None,
+                 page_presence=None):
         self._conn_sem = threading.Semaphore(max_connections)
         self.job_table = JobTable(max_concurrent=2)
         self.session_token = session_token
@@ -313,6 +320,8 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self._shutdown_once = threading.Event()
         self.index_coordinator = IndexCoordinator()
         self.evidence_registry = evidence_registry or create_evidence_registry()
+        # web.bat（非表示起動）だけが設定する。None ならページを閉じても停止しない。
+        self.page_presence = page_presence
         super().__init__(server_address, RequestHandlerClass)
 
     def process_request(self, request, client_address):
@@ -771,6 +780,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif path == "/api/index/status":
             self._handle_index_status()
+        elif path == "/api/index/plan":
+            self._handle_index_plan(parsed)
         elif path == "/api/index/events":
             self._handle_index_events(parsed)
         elif path == "/api/search":
@@ -795,6 +806,10 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_index_start(resume=True)
         elif path == "/api/index/cancel":
             self._handle_index_cancel()
+        elif path == "/api/page/heartbeat":
+            self._handle_page_presence(closing=False)
+        elif path == "/api/page/close":
+            self._handle_page_presence(closing=True)
         else:
             self.send_error(404)
 
@@ -813,7 +828,38 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         result["searchTimeoutDefault"] = self.server.search_timeout
         result["searchTimeoutMin"] = SEARCH_TIMEOUT_MIN
         result["searchTimeoutMax"] = SEARCH_TIMEOUT_MAX
+        result["pageCloseStop"] = self.server.page_presence is not None
         self._send_json(result)
+
+    # --- /api/page/* ---
+
+    def _handle_page_presence(self, *, closing: bool):
+        """開いているページの在席通知。web.bat起動時はページが無くなると停止する。"""
+        if not self._check_auth():
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        try:
+            payload = self._read_json_body(max_bytes=512)
+        except (ValueError, UnicodeDecodeError):
+            self._send_error_json("invalid_query", "page payload is invalid")
+            return
+        page_id = payload.get("page_id")
+        if not PagePresenceMonitor.valid_page_id(page_id):
+            self._send_error_json("invalid_query", "page id is invalid")
+            return
+        visible = payload.get("visible", False)
+        if not isinstance(visible, bool):
+            self._send_error_json("invalid_query", "page visibility is invalid")
+            return
+        monitor = self.server.page_presence
+        if monitor is None:
+            self._send_json({"enabled": False})
+            return
+        if closing:
+            monitor.close(page_id)
+        else:
+            monitor.heartbeat(page_id, visible=visible)
+        self._send_json({"enabled": True, "openPages": monitor.open_page_count()})
 
     # --- /api/index/* ---
 
@@ -822,6 +868,29 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._send_error_json("unauthorized", "認証が必要です")
             return
         self._send_json(self.server.index_coordinator.status())
+
+    def _handle_index_plan(self, parsed):
+        if not self._check_auth():
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        values = parse_qs(parsed.query, keep_blank_values=True).get("mode", [])
+        if not values:
+            mode = "incremental"
+        elif len(values) != 1:
+            self._send_error_json("invalid_mode", "インデックス更新モードが不正です")
+            return
+        else:
+            mode = values[0]
+        try:
+            self._send_json(self.server.index_coordinator.plan(mode=mode))
+        except ValueError:
+            self._send_error_json("invalid_mode", "インデックス更新モードが不正です")
+        except SourceSnapshotError as exc:
+            self._send_error_json("index_source_unreadable", exc.code)
+        except EmbedBuildError as exc:
+            self._send_error_json("index_not_configured", exc.code)
+        except RuntimeError as exc:
+            self._send_error_json("server_busy", str(exc))
 
     def _handle_index_events(self, parsed):
         if not self._check_auth():
@@ -844,7 +913,29 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._send_error_json("unauthorized", "認証が必要です")
             return
         try:
-            self._send_json(self.server.index_coordinator.start(resume=resume), status=202)
+            payload = self._read_json_body()
+            mode = payload.get("mode")
+            if mode is not None and not isinstance(mode, str):
+                raise ValueError("invalid index mode")
+            expected_generation = payload.get("expected_generation")
+            if expected_generation is not None and not isinstance(expected_generation, str):
+                raise ValueError("invalid expected generation")
+            self._send_json(
+                self.server.index_coordinator.start(
+                    resume=resume,
+                    mode=mode,
+                    expected_generation=expected_generation,
+                ),
+                status=202,
+            )
+        except ValueError:
+            self._send_error_json("invalid_mode", "インデックス更新要求が不正です")
+        except IndexModeConflictError as exc:
+            self._send_error_json("index_mode_conflict", str(exc))
+        except IndexGenerationChangedError as exc:
+            self._send_error_json("index_source_changed", str(exc))
+        except SourceSnapshotError as exc:
+            self._send_error_json("index_source_unreadable", exc.code)
         except RuntimeError as exc:
             self._send_error_json("server_busy", str(exc))
 
@@ -1012,6 +1103,18 @@ def mask_token(token: str) -> str:
     return token[:4] + "****" + token[-4:]
 
 
+def run_page_presence_watchdog(server, monitor, stop_event, on_idle, *, interval=2.0) -> None:
+    """開いているページが無くなったら ``on_idle`` を1回呼ぶ。
+
+    索引構築中・検索実行中は停止を保留し、終わってから判定する。
+    """
+    while not stop_event.wait(interval):
+        busy = server.index_coordinator.is_running() or server.job_table.running_count > 0
+        if monitor.should_shutdown(busy=busy):
+            on_idle()
+            return
+
+
 def main():
     parser = argparse.ArgumentParser(description="offline-ai Web UI Server")
     parser.add_argument("--port", type=int, default=None,
@@ -1022,6 +1125,8 @@ def main():
                         help="起動時にトークン全文を表示")
     parser.add_argument("--log-file", type=str, default=None,
                         help="ログファイルパス")
+    parser.add_argument("--exit-when-page-closed", action="store_true",
+                        help="開いているWebページが無くなったらサーバーを停止する（web.bat非表示起動用）")
     args = parser.parse_args()
 
     # ログ設定
@@ -1060,6 +1165,7 @@ def main():
         session_token=session_token,
         search_timeout=search_timeout,
         bind_port=port,
+        page_presence=PagePresenceMonitor() if args.exit_when_page_closed else None,
     )
     # 前回プロセスが所有者不在のまま残した building/cancelling を実測へ戻す（F-9）。
     server.index_coordinator.reconcile_orphaned_state()
@@ -1109,11 +1215,26 @@ def main():
     except (OSError, AttributeError):
         pass  # SIGBREAK は Windows 専用
 
+    watchdog_stop = threading.Event()
+    if server.page_presence is not None:
+        def stop_after_pages_closed():
+            log_structured("shutdown", phase="page_closed",
+                           open_pages=server.page_presence.open_page_count())
+            shutdown_handler(None, None)
+
+        threading.Thread(
+            target=run_page_presence_watchdog,
+            args=(server, server.page_presence, watchdog_stop, stop_after_pages_closed),
+            daemon=True,
+            name="offline-ai-page-presence",
+        ).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         shutdown_handler(None, None)
     finally:
+        watchdog_stop.set()
         server.shutdown_jobs_once()
         server.server_close()
 

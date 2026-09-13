@@ -25,6 +25,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- Start Web UI server ---
+if defined OFFLINE_AI_WEB_CONSOLE goto :check_ollama
+for %%i in ("%PY%") do set "PYW=%%~dpipythonw.exe"
+if not exist "%PYW%" (
+    echo [ERROR] pythonw.exe not found next to Python. Repair the Python installation.
+    pause
+    exit /b 1
+)
+start "" "%PYW%" "%~dp0_internal\web_launcher.py" %*
+exit /b %ERRORLEVEL%
+
+:check_ollama
 REM --- Check Ollama is running ---
 curl -s http://localhost:11434/api/tags >nul 2>&1
 if not errorlevel 1 goto :ollama_ready
@@ -62,16 +74,6 @@ endlocal & set "PY=%PY%"
 echo Ollama: ready
 echo.
 
-REM --- Start Web UI server ---
-if defined OFFLINE_AI_WEB_CONSOLE goto :console_server
-for %%i in ("%PY%") do set "PYW=%%~dpipythonw.exe"
-if not exist "%PYW%" (
-    echo [ERROR] pythonw.exe not found next to Python. Repair the Python installation.
-    pause
-    exit /b 1
-)
-start "" "%PYW%" "%~dp0_internal\web_launcher.py" %*
-exit /b %ERRORLEVEL%
 
 :console_server
 echo Starting offline-ai Web UI...
