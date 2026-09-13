@@ -82,6 +82,16 @@ search.bat / GET /api/search
 - retrieval候補は、質問との4文字以上の具体的な連続一致、または0.55以上のEmbedding類似度を根拠支持として要求する。質問条件が同一文中で明示的に否定される場合は候補制限前に矛盾を検出し、`sufficient`を禁止して回答層へ矛盾信号を渡す。
 - 回答promptは地域・対象・期間・役職・区分などの限定条件を個別照合し、条件が欠ける・対象が異なる・対象外である場合に、関連語や似た資料の数値を流用せず「該当情報なし」とする。評価ハーネスの`--measure-answer-layer`は回答本文を保存せず、この契約のphrase・禁止fact・transport errorだけをprobeする。
 
+### 3.2 親子展開（見出しだけの親候補から配下本文への展開）
+
+`source_structure.py`は`search.py`のチャンク分割（`_line_chunks`）とは独立した派生構造である。同一資料snapshotのbytesからATX見出しツリー（レベル、原文見出し、見出し行、親、節の終端、配下本文範囲）を構築し、ディスクへは保存しない。フェンス（バッククォート/チルダ）内は見出しと誤認せず、レベル飛びは直近の上位見出しを親とし、閉じ`#`列は除去する。Setext見出し・インデントコード・表・frontmatterは見出しとして解釈しない。
+
+- 展開資格は、候補の`start_line`が親見出し行に一致し、かつ親見出し行の次行から最初の子見出しの直前までが空行だけの場合に限る（`find_expandable_parent`）。子を持たない空節は展開しない。
+- `search.py`は親候補の配下範囲に含まれる既存チャンクを原文順に収集し、行範囲が連続するものを1つの実在範囲へまとめて展開item化する（`expand_parent_candidates` / `_expand_single_parent`）。各itemは`group_id`（資料hash・path・親見出し行から決定的に生成）、`expanded_from`（親のchunk_id）、`group_order`を持ち、離れた複数の子節を1つの広いstart/endに偽装しない。子のEmbeddingスコアによる並べ替えは未実装で、常に原文順（chunk開始行の昇順）で選ぶ。予算超過時は先頭から収まる分だけを採用し`group_partial`を立てる。
+- `finalize_ranked_matches`は「支持判定 → 制限前矛盾検出 → file別上限 → 相対スコア足切り → 親子展開（`OFFLINE_AI_PARENT_CHILD_EXPANSION`環境変数、既定OFF） → confidence算出」の順で処理する。展開itemは直接ヒットと範囲が重なる場合に除外され（直接ヒット優先）、`_calculate_confidence`は`group_id`単位で独立根拠を数える（子の増加を独立根拠の増加として数えない）。完全展開されたgroupが1件でもあり、`must_find_terms`を全充足し矛盾がなければ、confidence 0.55以上で`sufficient`を許容する追加経路を持つ（`_has_complete_structural_evidence`）。
+- `run_retrieval_pipeline`は展開前の候補（`ranked_candidates`）と展開後の採用根拠（`evidence_items`）を分離する。次試行のmergeと`_retry_queries`には展開前候補だけを渡し、展開後の根拠を検索候補へ書き戻さない。件数上限適用（`RETRIEVAL_PROMPT_MATCH_LIMIT`、Webは8件）は`_limit_items_preserving_groups`で同一groupを分断せず全採用/全除外のどちらかにする。
+- 既定OFF。有効化は`OFFLINE_AI_PARENT_CHILD_EXPANSION=true`。上限は`OFFLINE_AI_EXPANSION_MAX_PARENTS`（既定2）、`OFFLINE_AI_EXPANSION_MAX_RANGES_PER_PARENT`（既定4）、`OFFLINE_AI_EXPANSION_MAX_TOTAL_RANGES`（既定4）、`OFFLINE_AI_EXPANSION_BUDGET_RATIO`（既定0.5、実効根拠予算に対する展開文字量の上限比率）で調整する。
+
 ## 4. metadata sidecar
 
 `document_schema.py`は`<file>.md.metadata.json`のschemaとreader/writer helperを提供する。

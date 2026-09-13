@@ -290,7 +290,25 @@ def _retrieval_candidate_limit() -> int:
     return max(1, search.RETRIEVAL_CANDIDATE_LIMIT)
 
 
-def run_keyword_route(question: Question, chunks: list[dict]) -> RouteOutcome:
+def _expansion_kwargs(chunks: list[dict], corpus_dir: Path | None) -> dict:
+    """親子展開が有効なときだけ finalize_ranked_matches へ渡す追加引数を組み立てる。
+
+    評価は製品 skill-source を一切読まないため、``source_root`` は必ず固定
+    corpus_dir を指す（既定 None のまま渡すと製品ディレクトリへ誤って
+    アクセスし得るため、展開有効時は corpus_dir 必須とする）。
+    """
+    if not search._parent_child_expansion_enabled() or corpus_dir is None:
+        return {}
+    return {
+        "source_chunks": chunks,
+        "source_root": corpus_dir,
+        "char_budget": search.PROMPT_EVIDENCE_CHAR_LIMIT,
+    }
+
+
+def run_keyword_route(
+    question: Question, chunks: list[dict], *, corpus_dir: Path | None = None
+) -> RouteOutcome:
     """keyword のみの決定的 route。Ollama を必要としない。"""
     started = time.perf_counter()
     candidate_limit = _retrieval_candidate_limit()
@@ -300,11 +318,15 @@ def run_keyword_route(question: Question, chunks: list[dict]) -> RouteOutcome:
         chunks=chunks,
     )
     merged = search.merge_and_filter_matches([], keyword_matches, candidate_limit=candidate_limit)
-    matches, confidence, evidence_status = search.finalize_ranked_matches(question.query, merged)
+    matches, confidence, evidence_status = search.finalize_ranked_matches(
+        question.query, merged, **_expansion_kwargs(chunks, corpus_dir)
+    )
     return RouteOutcome(
         route=ROUTE_KEYWORD,
         status=STATUS_COMPLETED,
-        matches=matches[: search.RETRIEVAL_PROMPT_MATCH_LIMIT],
+        matches=search._limit_items_preserving_groups(
+            matches, search.RETRIEVAL_PROMPT_MATCH_LIMIT
+        ),
         confidence=confidence,
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
@@ -344,6 +366,7 @@ def run_hybrid_route(
     *,
     embed_model: str | None,
     embed_cache: dict | None,
+    corpus_dir: Path | None = None,
 ) -> RouteOutcome:
     """keyword + Embedding + RRF の route。Embedding model が要る。"""
     if not embed_model or not embed_cache:
@@ -367,11 +390,15 @@ def run_hybrid_route(
     )
     merged = search.merge_results(keyword_matches, embed_matches, max_results=candidate_limit * 2)
     merged = search.filter_by_rrf_score(merged, search.SEARCH_MIN_RRF_SCORE)
-    matches, confidence, evidence_status = search.finalize_ranked_matches(question.query, merged)
+    matches, confidence, evidence_status = search.finalize_ranked_matches(
+        question.query, merged, **_expansion_kwargs(chunks, corpus_dir)
+    )
     return RouteOutcome(
         route=ROUTE_HYBRID,
         status=STATUS_COMPLETED,
-        matches=matches[: search.RETRIEVAL_PROMPT_MATCH_LIMIT],
+        matches=search._limit_items_preserving_groups(
+            matches, search.RETRIEVAL_PROMPT_MATCH_LIMIT
+        ),
         confidence=confidence,
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
@@ -385,6 +412,7 @@ def _isolated_agentic_inputs(
     *,
     embed_model: str | None,
     embed_cache: dict | None,
+    corpus_dir: Path | None = None,
 ):
     """評価 corpus と isolated cache を既存 pipeline へ一時注入する。
 
@@ -392,10 +420,15 @@ def _isolated_agentic_inputs(
     ``.model_embed`` を検出する。評価時は固定 corpus と CLI 指定 model を
     使う必要があるため、pipeline の本体を複製せず入力境界だけを差し替える。
     全差し替えは route の終了時に必ず復元し、製品 cache へ書き込ませない。
+
+    親子展開は資料の実bytesを読み直すため（``SKILL_SOURCE_DIR`` 固定 path）、
+    ``corpus_dir`` 指定時は ``search.SKILL_SOURCE_DIR`` 自体も一時的に
+    差し替え、製品 skill-source への誤アクセスを防ぐ。
     """
     original_build_source_chunks = search.build_source_chunks
     original_detect_embed_model = search.detect_embed_model
     original_build_or_update_embed_index = search.build_or_update_embed_index
+    original_skill_source_dir = search.SKILL_SOURCE_DIR
 
     def build_eval_source_chunks(_source_dir: Path) -> list[dict]:
         return chunks
@@ -417,12 +450,18 @@ def _isolated_agentic_inputs(
     search.build_source_chunks = build_eval_source_chunks
     search.detect_embed_model = detect_eval_embed_model
     search.build_or_update_embed_index = build_eval_embed_index
+    if corpus_dir is not None:
+        search.SKILL_SOURCE_DIR = corpus_dir
+        search._invalidate_structure_memo()
     try:
         yield
     finally:
         search.build_source_chunks = original_build_source_chunks
         search.detect_embed_model = original_detect_embed_model
         search.build_or_update_embed_index = original_build_or_update_embed_index
+        if corpus_dir is not None:
+            search.SKILL_SOURCE_DIR = original_skill_source_dir
+            search._invalidate_structure_memo()
 
 
 def run_agentic_lite_route(
@@ -432,6 +471,7 @@ def run_agentic_lite_route(
     chunks: list[dict] | None = None,
     embed_model: str | None = None,
     embed_cache: dict | None = None,
+    corpus_dir: Path | None = None,
 ) -> RouteOutcome:
     """既存 `run_retrieval_pipeline` 相当の bounded 再検索 route。
 
@@ -456,6 +496,7 @@ def run_agentic_lite_route(
             chunks,
             embed_model=embed_model,
             embed_cache=embed_cache,
+            corpus_dir=corpus_dir,
         ):
             result = search.run_retrieval_pipeline(question.query, model=chat_model)
     except Exception as exc:  # noqa: BLE001 - route単位で失敗を封じ込め receipt へ記録する
@@ -867,12 +908,19 @@ def run_route(
     embed_model: str | None = None,
     embed_cache: dict | None = None,
     chat_model: str | None = None,
+    corpus_dir: Path | None = None,
 ) -> RouteOutcome:
     """route 名から適切な実行関数へ振り分ける。"""
     if route == ROUTE_KEYWORD:
-        return run_keyword_route(question, chunks)
+        return run_keyword_route(question, chunks, corpus_dir=corpus_dir)
     if route == ROUTE_HYBRID:
-        return run_hybrid_route(question, chunks, embed_model=embed_model, embed_cache=embed_cache)
+        return run_hybrid_route(
+            question,
+            chunks,
+            embed_model=embed_model,
+            embed_cache=embed_cache,
+            corpus_dir=corpus_dir,
+        )
     if route == ROUTE_AGENTIC_LITE:
         return run_agentic_lite_route(
             question,
@@ -880,6 +928,7 @@ def run_route(
             chunks=chunks,
             embed_model=embed_model,
             embed_cache=embed_cache,
+            corpus_dir=corpus_dir,
         )
     raise SpecError(f"未知の route: {route}")
 
@@ -923,6 +972,7 @@ def run_evaluation(
                         embed_model=embed_model,
                         embed_cache=embed_cache,
                         chat_model=chat_model,
+                        corpus_dir=spec.corpus_dir,
                     ),
                 )
                 for question in spec.questions

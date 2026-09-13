@@ -75,6 +75,7 @@ except ValueError as exc:
     raise
 from document_schema import load_metadata_sidecar, metadata_for_line_range
 from rerank import rerank_candidates
+import source_structure as _source_structure
 
 # --- 定数 ---
 COLLECT_SCRIPT = SCRIPT_DIR / "scripts" / "collect_skill_source.ps1"
@@ -1205,6 +1206,7 @@ def _invalidate_source_chunk_memo() -> None:
     _SOURCE_CHUNK_MEMO_VALUE = None
     _EMBED_GENERATION_MEMO_KEY = None
     _EMBED_GENERATION_MEMO_VALUE = None
+    _invalidate_structure_memo()
 
 
 def _source_chunk_memo_key(source_root: Path | None = None) -> tuple | None:
@@ -3660,6 +3662,47 @@ def coverage_terms(query: str, must_find_terms: list[str] | None = None) -> list
     return list(dict.fromkeys(terms))
 
 
+def _match_group_key(match: dict) -> str:
+    """独立根拠としての同一性キー。親子展開の同一groupは1件として数える。"""
+    group_id = match.get("group_id")
+    if group_id:
+        return f"group:{group_id}"
+    chunk_id = match.get("chunk_id")
+    if chunk_id:
+        return f"chunk:{chunk_id}"
+    return (
+        f"path:{normalize_source_path(match.get('path', ''))}:"
+        f"{match.get('start_line')}:{match.get('end_line')}"
+    )
+
+
+def _collapse_to_independent_groups(matches: list[dict]) -> list[dict]:
+    """confidence算出用に、同一groupのitemを1件の独立根拠へ集約する。
+
+    子の増加を独立した根拠の増加として数えないため。group内の代表は最初の
+    itemとし、rrf_score/embedding_score/keyword_scoreは含めない（親のスコアを
+    子の実測スコアとして流用しない）。group以外（直接ヒット）のitemは
+    そのまま1件として扱う。
+    """
+    collapsed: list[dict] = []
+    seen_groups: set[str] = set()
+    for match in matches:
+        group_id = match.get("group_id")
+        if not group_id:
+            collapsed.append(match)
+            continue
+        if group_id in seen_groups:
+            continue
+        seen_groups.add(group_id)
+        representative = {
+            key: value
+            for key, value in match.items()
+            if key not in {"rrf_score", "embedding_score", "keyword_score"}
+        }
+        collapsed.append(representative)
+    return collapsed
+
+
 def _calculate_confidence(
     query: str, matches: list[dict], must_find_terms: list[str] | None = None
 ) -> tuple[float, str]:
@@ -3672,9 +3715,12 @@ def _calculate_confidence(
     coverage = 0.0
     if terms:
         coverage = sum(1 for term in terms if term in text) / len(terms)
-    non_empty = sum(1 for m in matches if m.get("snippet")) / max(len(matches), 1)
-    top_score = float(matches[0].get("rrf_score", matches[0].get("score", 0)) or 0)
-    file_count = len({normalize_source_path(m.get("path", "")) for m in matches})
+    independent = _collapse_to_independent_groups(matches)
+    non_empty = sum(1 for m in independent if m.get("snippet")) / max(
+        len(independent), 1
+    )
+    top_score = float(independent[0].get("rrf_score", independent[0].get("score", 0)) or 0)
+    file_count = len({normalize_source_path(m.get("path", "")) for m in independent})
     confidence = min(
         1.0,
         (coverage * 0.45)
@@ -3686,10 +3732,12 @@ def _calculate_confidence(
     # 十分な根拠として区別できない。keyword一致のみの根拠でsufficientを宣言すると、
     # promptの根拠不足警告が外れ、該当情報なしを維持できなくなる。sufficientは
     # Embedding由来の根拠を伴う場合に限り、それ以外はpartial止まりとする。
+    # 展開item自体（source="expanded"）は親のEmbeddingスコアを流用しないため
+    # ここには数えない（_has_complete_structural_evidence が別経路で扱う）。
     has_semantic_evidence = any(
-        "embedding" in str(m.get("source", "")) for m in matches
+        "embedding" in str(m.get("source", "")) for m in independent
     )
-    if len(matches) >= 2 and confidence >= 0.55 and has_semantic_evidence:
+    if len(independent) >= 2 and confidence >= 0.55 and has_semantic_evidence:
         return round(confidence, 3), "sufficient"
     if confidence >= 0.28:
         return round(confidence, 3), "partial"
@@ -3820,6 +3868,382 @@ def merge_and_filter_matches(
     return filter_by_rrf_score(merged, min_rrf_score)
 
 
+# ---------------------------------------------------------------------------
+# 親子展開（見出しだけの親チャンクから配下本文への展開）
+#
+# 検索チャンク（_line_chunks）自体は変更しない。既存の embedding_search 等が
+# 返す「見出しだけの親candidate」に対し、同一資料snapshotから見出しツリーを
+# 解析し、配下の子見出しの本文範囲を実在する行範囲として展開する。
+#
+# P1a: 原文順のみで展開する純粋関数群。finalize_ranked_matches /
+# run_retrieval_pipeline へはまだ統合しない（P1bで統合し、既定OFF設定を通す）。
+# ---------------------------------------------------------------------------
+
+EXPANSION_MAX_PARENTS_PER_QUERY = env_int(
+    "OFFLINE_AI_EXPANSION_MAX_PARENTS", 2, min_value=1
+)
+EXPANSION_MAX_RANGES_PER_PARENT = env_int(
+    "OFFLINE_AI_EXPANSION_MAX_RANGES_PER_PARENT", 4, min_value=1
+)
+EXPANSION_MAX_TOTAL_RANGES = env_int(
+    "OFFLINE_AI_EXPANSION_MAX_TOTAL_RANGES", 4, min_value=1
+)
+EXPANSION_BUDGET_RATIO = env_float(
+    "OFFLINE_AI_EXPANSION_BUDGET_RATIO", 0.5, min_value=0.0, max_value=1.0
+)
+
+
+def _parent_child_expansion_enabled() -> bool:
+    return _env_bool("OFFLINE_AI_PARENT_CHILD_EXPANSION", False)
+
+
+# ファイル単位の見出しツリー memo。source chunk memo と同じ世代キー
+# （_source_chunk_memo_key の戻り値）でライフサイクルを揃える。ディスクへは
+# 保存しない。要求ごとの展開選択結果（どの子を採用したか）はここへ入れない。
+_STRUCTURE_FILE_MEMO_KEY: tuple | None = None
+_STRUCTURE_FILE_MEMO_VALUE: dict[str, tuple[list[str], list, str] | None] = {}
+
+
+def _invalidate_structure_memo() -> None:
+    global _STRUCTURE_FILE_MEMO_KEY, _STRUCTURE_FILE_MEMO_VALUE
+    _STRUCTURE_FILE_MEMO_KEY = None
+    _STRUCTURE_FILE_MEMO_VALUE = {}
+
+
+def _read_structure_for_file(
+    rel_path: str, source_root: Path | None
+) -> tuple[list[str], list, str] | None:
+    """指定ファイルを読み込み見出しツリーを構築する。読めなければ None。
+
+    ``_chunk_source_bytes`` と同じ decode 規則（utf-8, errors="replace"）を
+    使い、同一 bytes から生成した派生情報であることを保つ。
+    """
+    root = source_root or SKILL_SOURCE_DIR
+    path = root / rel_path
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    nodes = _source_structure.parse_heading_tree(text)
+    file_sha256 = hashlib.sha256(data).hexdigest()
+    return lines, nodes, file_sha256
+
+
+def _get_structure_for_file(
+    rel_path: str, source_root: Path | None, memo_key: tuple | None
+) -> tuple[list[str], list, str] | None:
+    """構造ツリーを要求内 memo 付きで取得する。memo 無効時は毎回読み込む。"""
+    global _STRUCTURE_FILE_MEMO_KEY, _STRUCTURE_FILE_MEMO_VALUE
+    if not SOURCE_CHUNK_MEMO_ENABLED or memo_key is None:
+        return _read_structure_for_file(rel_path, source_root)
+    if memo_key != _STRUCTURE_FILE_MEMO_KEY:
+        _STRUCTURE_FILE_MEMO_KEY = memo_key
+        _STRUCTURE_FILE_MEMO_VALUE = {}
+    if rel_path in _STRUCTURE_FILE_MEMO_VALUE:
+        return _STRUCTURE_FILE_MEMO_VALUE[rel_path]
+    result = _read_structure_for_file(rel_path, source_root)
+    _STRUCTURE_FILE_MEMO_VALUE[rel_path] = result
+    return result
+
+
+def _child_chunks_in_range(
+    source_chunks: list[dict], path: str, start_line: int, end_line: int
+) -> list[dict]:
+    """配下範囲内にある既存チャンクを原文順（start_line昇順）で返す。"""
+    candidates = [
+        chunk
+        for chunk in source_chunks
+        if normalize_source_path(chunk.get("path", "")) == path
+        and isinstance(chunk.get("start_line"), int)
+        and isinstance(chunk.get("end_line"), int)
+        and chunk["start_line"] >= start_line
+        and chunk["end_line"] <= end_line
+    ]
+    candidates.sort(key=lambda chunk: chunk["start_line"])
+    return candidates
+
+
+def _merge_contiguous_line_ranges(
+    line_ranges: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """行範囲が連続する（隣接・重複する）チャンクを1つの範囲へまとめる。"""
+    merged: list[tuple[int, int]] = []
+    for start, end in line_ranges:
+        if merged and start <= merged[-1][1] + 1:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def _range_text_from_lines(lines: list[str], start_line: int, end_line: int) -> str:
+    """行範囲から本文を再構成する。チャンクの overlap 由来の重複を避けるため、
+    チャンクの ``text`` フィールドではなく原資料の行から都度組み立てる。"""
+    start_idx = max(0, start_line - 1)
+    end_idx = min(len(lines), end_line)
+    return "\n".join(lines[start_idx:end_idx])
+
+
+def _expansion_group_id(file_sha256: str, path: str, parent_heading_line: int) -> str:
+    """資料hash・path・親見出し行から決定的に group_id を生成する。"""
+    payload = f"{file_sha256}:{path}:{parent_heading_line}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _expand_single_parent(
+    parent_match: dict,
+    source_chunks: list[dict],
+    *,
+    source_root: Path | None,
+    memo_key: tuple | None,
+    max_ranges: int,
+    char_budget: int | None,
+) -> tuple[list[dict], bool, str]:
+    """1件の親candidateを展開する。戻り値は ``(展開item群, partialか, 理由)``。
+
+    展開item は ``group_id`` / ``expanded_from`` / ``group_order`` を持つ、
+    通常の match と同じ形の dict。P1a は既存クエリベクトルを使わず、常に
+    原文順（chunk 開始行の昇順）で選ぶ。
+    """
+    path = normalize_source_path(parent_match.get("path", ""))
+    start_line = parent_match.get("start_line")
+    if not path or not isinstance(start_line, int):
+        return [], False, "parent_missing_location"
+
+    structure = _get_structure_for_file(path, source_root, memo_key)
+    if structure is None:
+        return [], False, "structure_unavailable"
+    lines, nodes, file_sha256 = structure
+
+    expected_sha = str(
+        parent_match.get("source_sha256") or parent_match.get("file_sha256") or ""
+    )
+    if expected_sha and expected_sha.lower() != file_sha256.lower():
+        return [], False, "source_changed"
+
+    parent_node = _source_structure.find_expandable_parent(
+        nodes, lines, start_line=start_line
+    )
+    if parent_node is None:
+        return [], False, "not_expandable"
+
+    expand_start, expand_end = _source_structure.expand_range(nodes, parent_node)
+    child_chunks = _child_chunks_in_range(source_chunks, path, expand_start, expand_end)
+    if not child_chunks:
+        return [], False, "no_child_chunks"
+
+    line_ranges = [(chunk["start_line"], chunk["end_line"]) for chunk in child_chunks]
+    merged_ranges = _merge_contiguous_line_ranges(line_ranges)
+
+    group_id = _expansion_group_id(file_sha256, path, parent_node.heading_line)
+    parent_chunk_id = str(parent_match.get("chunk_id") or "")
+    modified_at = parent_match.get("modifiedAt", "")
+
+    items: list[dict] = []
+    used_chars = 0
+    partial = len(merged_ranges) > max_ranges
+    for order, (start, end) in enumerate(merged_ranges[:max_ranges], start=1):
+        text = _range_text_from_lines(lines, start, end)
+        if char_budget is not None:
+            remaining = char_budget - used_chars
+            if remaining <= 0:
+                partial = True
+                break
+            if len(text) > remaining:
+                text = text[:remaining]
+                partial = True
+        used_chars += len(text)
+        items.append(
+            {
+                "path": path,
+                "chunk_id": f"{group_id}#r{order:02d}",
+                "heading": parent_node.heading_text,
+                "start_line": start,
+                "end_line": end,
+                "snippet": text,
+                "modifiedAt": modified_at,
+                "source_sha256": file_sha256,
+                "source": "expanded",
+                "group_id": group_id,
+                "expanded_from": parent_chunk_id,
+                "group_order": order,
+            }
+        )
+    reason = "" if items else "budget_exhausted"
+    for item in items:
+        item["group_partial"] = partial
+    return items, partial, reason
+
+
+def expand_parent_candidates(
+    matches: list[dict],
+    source_chunks: list[dict],
+    *,
+    source_root: Path | None = None,
+    memo_key: tuple | None = None,
+    max_parents: int | None = None,
+    max_ranges_per_parent: int | None = None,
+    max_total_ranges: int | None = None,
+    char_budget: int | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """支持判定・件数制限後の候補から、展開資格のある親candidateを展開する。
+
+    戻り値は ``(expanded_items, expansion_meta)``。呼び出し順位の高い候補から
+    ``max_parents`` 件まで、各展開元は ``max_ranges_per_parent`` 範囲まで、
+    全体で ``max_total_ranges`` 範囲までを上限とする。直接ヒットとの重複排除
+    は行わない（呼び出し側の責務）。P1a は原文順のみを扱う。
+    """
+    max_parents = (
+        EXPANSION_MAX_PARENTS_PER_QUERY if max_parents is None else max_parents
+    )
+    max_ranges_per_parent = (
+        EXPANSION_MAX_RANGES_PER_PARENT
+        if max_ranges_per_parent is None
+        else max_ranges_per_parent
+    )
+    max_total_ranges = (
+        EXPANSION_MAX_TOTAL_RANGES if max_total_ranges is None else max_total_ranges
+    )
+    per_parent_budget = None
+    if char_budget is not None and max_parents > 0:
+        per_parent_budget = max(0, char_budget // max_parents)
+
+    expanded_items: list[dict] = []
+    expansion_meta: list[dict] = []
+    parent_count = 0
+    total_ranges = 0
+    for match in matches:
+        if parent_count >= max_parents or total_ranges >= max_total_ranges:
+            break
+        remaining_ranges = min(max_ranges_per_parent, max_total_ranges - total_ranges)
+        if remaining_ranges <= 0:
+            break
+        items, partial, reason = _expand_single_parent(
+            match,
+            source_chunks,
+            source_root=source_root,
+            memo_key=memo_key,
+            max_ranges=remaining_ranges,
+            char_budget=per_parent_budget,
+        )
+        if not items:
+            if reason and reason != "not_expandable":
+                expansion_meta.append(
+                    {
+                        "path": normalize_source_path(match.get("path", "")),
+                        "start_line": match.get("start_line"),
+                        "expanded": False,
+                        "reason": reason,
+                    }
+                )
+            continue
+        parent_count += 1
+        total_ranges += len(items)
+        expanded_items.extend(items)
+        expansion_meta.append(
+            {
+                "path": normalize_source_path(match.get("path", "")),
+                "start_line": match.get("start_line"),
+                "expanded": True,
+                "partial": partial,
+                "range_count": len(items),
+                "group_id": items[0]["group_id"],
+            }
+        )
+    return expanded_items, expansion_meta
+
+
+def _limit_items_preserving_groups(items: list[dict], limit: int) -> list[dict]:
+    """件数上限を適用する。同一 group の item は分断せず全採用/全除外を揃える。
+
+    離れた複数の子節を一つの広い start/end に偽装しないという契約上、
+    group（親子展開の1親候補分の範囲群）を件数上限の途中で切ると引用が
+    矛盾する。順位順に評価し、残枠に収まる item・group だけを採用する。
+    """
+    if limit <= 0:
+        return []
+    result: list[dict] = []
+    used = 0
+    decided_groups: set[str] = set()
+    for item in items:
+        if used >= limit:
+            break
+        group_id = item.get("group_id")
+        if not group_id:
+            result.append(item)
+            used += 1
+            continue
+        if group_id in decided_groups:
+            continue
+        group_items = [m for m in items if m.get("group_id") == group_id]
+        decided_groups.add(group_id)
+        if used + len(group_items) <= limit:
+            result.extend(group_items)
+            used += len(group_items)
+    return result
+
+
+def _dedupe_expansion_against_direct_hits(
+    expanded_items: list[dict], direct_matches: list[dict]
+) -> list[dict]:
+    """直接ヒットと展開範囲が重なる場合は直接ヒットを優先し、展開itemを除外する。
+
+    重複の削減で独立根拠数を増やさない（直接ヒットは既に direct_matches に
+    含まれているため、重なる展開itemを足しても件数は増えない）。
+    """
+    kept = []
+    for item in expanded_items:
+        path = item.get("path")
+        start, end = item.get("start_line"), item.get("end_line")
+        if not isinstance(start, int) or not isinstance(end, int):
+            kept.append(item)
+            continue
+        overlaps_direct = any(
+            normalize_source_path(m.get("path", "")) == path
+            and isinstance(m.get("start_line"), int)
+            and isinstance(m.get("end_line"), int)
+            and m["start_line"] <= end
+            and start <= m["end_line"]
+            for m in direct_matches
+        )
+        if overlaps_direct:
+            continue
+        kept.append(item)
+    return kept
+
+
+def _has_complete_structural_evidence(
+    matches: list[dict], must_find_terms: list[str] | None
+) -> bool:
+    """完全展開されたgroupが1件でもあり、必須語が全て充足されているか判定する。
+
+    親の語彙一致と完全展開だけでは自動合格にしない: must_find_terms が
+    指定されている場合は、その group の採用本文で全て充足する必要がある。
+    """
+    terms = [str(t).strip().lower() for t in (must_find_terms or []) if str(t).strip()]
+    seen_groups: set[str] = set()
+    for match in matches:
+        if match.get("source") != "expanded":
+            continue
+        group_id = match.get("group_id")
+        if not group_id or group_id in seen_groups or match.get("group_partial"):
+            continue
+        seen_groups.add(group_id)
+        if not terms:
+            return True
+        group_text = " ".join(
+            (m.get("snippet", "") or "")
+            for m in matches
+            if m.get("group_id") == group_id
+        ).lower()
+        if all(term in group_text for term in terms):
+            return True
+    return False
+
+
 def finalize_ranked_matches(
     query: str,
     matches: list[dict],
@@ -3827,10 +4251,19 @@ def finalize_ranked_matches(
     must_find_terms: list[str] | None = None,
     max_per_file: int = MAX_CHUNKS_PER_FILE,
     relative_score_floor: float = 0.3,
+    source_chunks: list[dict] | None = None,
+    source_root: Path | None = None,
+    memo_key: tuple | None = None,
+    char_budget: int | None = None,
 ) -> tuple[list[dict], float, str]:
-    """file別上限・相対スコア足切り・confidence算出までの決定的な後段。
+    """file別上限・相対スコア足切り・親子展開・confidence算出までの決定的な後段。
 
     rerank後の順位付き候補を受け取り、`(matches, confidence, evidence_status)` を返す。
+    処理順序: 支持判定 → 制限前矛盾検出 → file別上限 → 相対スコア足切り →
+    親子展開（既定OFF・source_chunks指定時のみ）→ confidence算出。
+
+    ``source_chunks`` を渡さない（既定）場合は展開ステップを一切実行せず、
+    既存呼び出し元との挙動を完全に保つ。
     """
     supported = filter_by_relevance_support(query, matches)
     constraint_conflict = _has_explicit_constraint_conflict(query, supported)
@@ -3843,7 +4276,35 @@ def finalize_ranked_matches(
                 for m in limited
                 if m.get("rrf_score", 0) >= top_score * relative_score_floor
             ]
+
+    expansion_enabled = _parent_child_expansion_enabled() and source_chunks is not None
+    if expansion_enabled:
+        expansion_budget = (
+            int(char_budget * EXPANSION_BUDGET_RATIO) if char_budget else None
+        )
+        expanded_items, _meta = expand_parent_candidates(
+            limited,
+            source_chunks,
+            source_root=source_root,
+            memo_key=memo_key,
+            char_budget=expansion_budget,
+        )
+        expanded_items = _dedupe_expansion_against_direct_hits(expanded_items, limited)
+        if expanded_items:
+            limited = limited + expanded_items
+            constraint_conflict = constraint_conflict or _has_explicit_constraint_conflict(
+                query, expanded_items
+            )
+
     confidence, status = _calculate_confidence(query, limited, must_find_terms)
+    if (
+        status != "sufficient"
+        and expansion_enabled
+        and not constraint_conflict
+        and confidence >= 0.55
+        and _has_complete_structural_evidence(limited, must_find_terms)
+    ):
+        status = "sufficient"
     if status == "sufficient" and constraint_conflict:
         status = "partial"
     if constraint_conflict and limited:
@@ -3905,6 +4366,11 @@ def run_retrieval_pipeline(
     source_chunks = (
         build_source_chunks(SKILL_SOURCE_DIR) if _chunk_retrieval_enabled() else None
     )
+    expansion_enabled = _parent_child_expansion_enabled() and source_chunks is not None
+    # 親子展開の構造 memo キー。既定 OFF では計算しない（追加のファイル走査を避ける）。
+    source_memo_key = (
+        _source_chunk_memo_key(SKILL_SOURCE_DIR) if expansion_enabled else None
+    )
     embed_cache = None
     embed_index = None
     route = "keyword"
@@ -3961,6 +4427,7 @@ def run_retrieval_pipeline(
             )
     attempts: list[RetrievalAttempt] = []
     combined: list[dict] = []
+    evidence_items: list[dict] = []
     final_confidence = 0.0
     final_status = "insufficient"
     max_attempts = 1 if search_only else max(1, min(MAX_RETRIEVAL_ATTEMPTS, 2))
@@ -4033,16 +4500,25 @@ def run_retrieval_pipeline(
                 config=RERANK_CONFIG,
                 cancel_check=check_cancel,
             )
-        combined, final_confidence, final_status = finalize_ranked_matches(
+        # ranked_candidates（展開前）は combined に保持し、次試行の merge と
+        # _retry_queries へはこちらだけを渡す。展開後の採用根拠は
+        # evidence_items として毎試行 combined の同一snapshotから作り直し、
+        # 再展開で件数やIDが増殖しない決定的処理にする（展開後の根拠を
+        # 検索候補へ書き戻すと再統合を招くため）。
+        evidence_items, final_confidence, final_status = finalize_ranked_matches(
             query,
             combined,
             must_find_terms=plan.get("must_find_terms", []),
+            source_chunks=source_chunks if expansion_enabled else None,
+            source_root=SKILL_SOURCE_DIR,
+            memo_key=source_memo_key,
+            char_budget=PROMPT_EVIDENCE_CHAR_LIMIT,
         )
         attempts.append(
             RetrievalAttempt(
                 query=" / ".join(queries),
                 keywords=keywords,
-                match_count=len(combined),
+                match_count=len(evidence_items),
                 confidence=final_confidence,
                 evidence_status=final_status,
                 reason=plan.get("fallback", ""),
@@ -4060,8 +4536,11 @@ def run_retrieval_pipeline(
     attempt_dicts = [attempt.__dict__ for attempt in attempts]
     if search_only:
         # 回答用 prompt 予算・prompt builder を通さず、SSE防御上限と
-        # 既存の件数設定だけを適用する（既定5、最大8）。
-        matches = combined[: min(RETRIEVAL_PROMPT_MATCH_LIMIT, 8)]
+        # 既存の件数設定だけを適用する（既定5、最大8）。同一 group の item は
+        # 分断せず、全採用/全除外のどちらかにする。
+        matches = _limit_items_preserving_groups(
+            evidence_items, min(RETRIEVAL_PROMPT_MATCH_LIMIT, 8)
+        )
         return RetrievalResult(
             query=query,
             attempts=attempts,
@@ -4089,9 +4568,20 @@ def run_retrieval_pipeline(
         else 0
     )
     evidence_char_limit = compute_evidence_char_limit(shell_chars)
-    matches = _fit_prompt_budget(
-        combined[:RETRIEVAL_PROMPT_MATCH_LIMIT], evidence_char_limit
-    )
+    matches = _limit_items_preserving_groups(evidence_items, RETRIEVAL_PROMPT_MATCH_LIMIT)
+    matches = _fit_prompt_budget(matches, evidence_char_limit)
+    if len(matches) < len(evidence_items):
+        # 最終出力時の追加切詰め。制限前に検出済みの矛盾は維持したまま、
+        # 実際に採用した本文だけで信頼度・sufficient判定を再照合する。
+        had_conflict = bool(evidence_items and evidence_items[0].get("constraint_conflict"))
+        final_confidence, final_status = _calculate_confidence(
+            query, matches, plan.get("must_find_terms", [])
+        )
+        if had_conflict:
+            if final_status == "sufficient":
+                final_status = "partial"
+            if matches:
+                matches[0] = {**matches[0], "constraint_conflict": True}
     user_prompt = build_user_prompt(
         query,
         matches,

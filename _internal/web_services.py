@@ -76,6 +76,12 @@ def build_evidence_event(
             "snippet": str(match.get("snippet") or "")[:500],
             "sourceSha256": source_sha256,
         }
+        group_id = match.get("group_id")
+        if group_id:
+            item["groupId"] = str(group_id)
+            item["expandedFrom"] = str(match.get("expanded_from") or "")
+            item["groupOrder"] = match.get("group_order")
+            item["groupPartial"] = bool(match.get("group_partial"))
         if evidence_registry is not None:
             evidence_id = evidence_registry.register(
                 session_id=session_id,

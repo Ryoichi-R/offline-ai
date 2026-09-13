@@ -73,6 +73,7 @@ python tests/eval/run_eval.py --routes all --repeat 3  # 非決定性の確認
 | `guides/onboarding-handbook.md.metadata.json` | sidecar。根拠として返ってはならない                      |
 | `notes/support-meeting-notes.txt`             | sidecar なしのプレーンテキスト                           |
 | `data/office-equipment-inventory.csv`         | CSV の表。拠点列を無視すると誤答する                     |
+| `guides/incident-response-procedure.md`       | 親子展開シナリオ。見出しだけの親チャンクがヒットしても配下本文がkeyword候補に入らない節（Q11）と、質問語彙が本文と直接重なり単独ヒットする対照節（Q12/Q13）を両方含む |
 
 ## 評価仕様
 
@@ -93,6 +94,12 @@ receipt には次を含めない。
 - 絶対 path、ユーザー名
 
 corpus は fixture なので file 単位の SHA-256 は記録する。これにより receipt を corpus と製品 digest（`search.py` の SHA-256、`VERSION`、retrieval 設定値）へ束縛できる。
+
+## 親子展開（`OFFLINE_AI_PARENT_CHILD_EXPANSION`）
+
+既定OFF。`OFFLINE_AI_PARENT_CHILD_EXPANSION=true`で有効化すると、`keyword`/`hybrid`/`agentic-lite`いずれのrouteも`finalize_ranked_matches`へcorpusのchunksと`corpus_dir`（`source_root`）を渡し、見出しだけの親candidateから配下本文への展開を行う。評価は製品`skill-source`を一切読まない契約を保つため、展開有効時は必ず固定`corpus_dir`を`source_root`として渡す（`_expansion_kwargs`）。`agentic-lite`routeでは、展開が資料の実bytesを読み直す都合上、`search.SKILL_SOURCE_DIR`自体を一時的に`corpus_dir`へ差し替える（`_isolated_agentic_inputs`）。
+
+Q11（親のみ検索に当たり、配下本文はkeyword候補にすら入らない）はOFF時に`evidence_line_overlap = 0`（既知の取得漏れの再現）、ON時に`1.0`（展開による解消）を示す。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
 
 ## ハーネス自体の検証
 

@@ -178,6 +178,57 @@
             "required_facts": [],
             "forbidden_facts": ["3,500円", "3,000円", "2,500円"],
             "notes": "国内出張旅費規程は存在するが海外は明示的に対象外。関連文書があるため根拠自体は取得される。retrieval 層の要件は sufficient と宣言しないことに限られ、「該当情報なし」の確定判定は生成プロンプト契約側で行う（回答生成なしでは NOT_MEASURED）。"
+        },
+        {
+            "id": "Q11",
+            "category": "parent-child-expansion",
+            "query": "初動対応で最初に取るべき行動を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "1.1 検知時の確認事項",
+                    "line_start": 7,
+                    "line_end": 15
+                }
+            ],
+            "required_facts": ["影響範囲", "発生時刻", "類似障害"],
+            "forbidden_facts": [],
+            "notes": "見出しだけの親チャンク（第1章 初動対応）だけが検索に当たり、配下の具体的な確認事項本文（1.1）はkeyword候補にすら入らない親子展開の再現ケース。親子展開OFFでは line overlap = 0（既知の取得漏れ）、ONでは親経由の展開で1.1本文が根拠へ残ることを確認する。"
+        },
+        {
+            "id": "Q12",
+            "category": "parent-child-expansion",
+            "query": "エスカレーションが必要になる影響利用者数の基準は何人ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "1.2 エスカレーション基準",
+                    "line_start": 17,
+                    "line_end": 19
+                }
+            ],
+            "required_facts": ["100名"],
+            "forbidden_facts": [],
+            "notes": "同一親（第1章 初動対応）配下の別の子節だが、質問語彙が本文と直接重なるためkeywordで単独ヒットする対照ケース。親子展開ON/OFFの両方でline overlapが1.0を維持し、展開が既存の直接ヒット経路を壊さないことを確認する。"
+        },
+        {
+            "id": "Q13",
+            "category": "parent-child-expansion",
+            "query": "障害の事後報告書はいつまでに提出する必要がありますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "3.1 報告書の提出期限",
+                    "line_start": 33,
+                    "line_end": 35
+                }
+            ],
+            "required_facts": ["3営業日"],
+            "forbidden_facts": [],
+            "notes": "別の親（第3章 事後報告）配下の子節で、質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケース。第1章・第2章配下の似た構造（初動対応・復旧対応）と混同せず、展開ON/OFFの両方でline overlapが1.0を維持することを確認する。"
         }
     ]
 }
