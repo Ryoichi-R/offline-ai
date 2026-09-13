@@ -1,0 +1,219 @@
+{
+    "schemaVersion": 2,
+    "createdFor": "offline-ai",
+    "notes": [
+        "This manifest defines download-only package inputs. It does not guarantee redistribution rights.",
+        "Python is pinned to 3.11.9 to match the existing installer scripts in this repository.",
+        "Ollama model download uses registry.ollama.ai layout, which is not the documented local /api/pull contract.",
+        "Required installers are version-pinned and checked by SHA-256, product version, and Authenticode signer. Empty expectedSha256 values are permitted only for manual optional components.",
+        "Selected manual optional components are copied from offline-package/optional-components and recorded in the generated package checksums."
+    ],
+    "hashReview": {
+        "reviewedAt": "2026-07-12",
+        "pythonWindowsInstaller": "Python 3.11.9 x64 is pinned to the verified artifact hash, product version, and Python Software Foundation Authenticode signer.",
+        "ollamaWindowsInstaller": "Ollama is pinned to the v0.31.1 GitHub release artifact and verified by hash, product version, and Ollama Inc. Authenticode signer.",
+        "pythonSource": "https://www.python.org/downloads/release/python-3119/",
+        "ollamaSource": "https://ollama.com/download/windows"
+    },
+    "appPayloadEstimate": {
+    "totalBytes": 638406,
+        "largestFileBytes": 143021,
+        "largestFile": "_internal/search.py",
+        "fileCount": 36,
+    "reviewedAt": "2026-09-13",
+        "method": "distribution-policy runtime/both inventory"
+    },
+    "modelAdoptionGate": {
+        "status": "manual-acceptance-pending",
+        "staticRegistryEvidence": "verified",
+        "pinnedOllamaVersion": "0.31.1",
+        "runtimeCompatibility": "pending",
+        "japaneseRagAcceptance": "pending",
+        "cpuPartialFullGpuMeasurements": "pending",
+        "receipt": "result/offline-ai-model-adoption/adoption-receipt-20260812.md"
+    },
+    "tools": [
+        {
+            "id": "ollama-windows",
+            "required": true,
+            "fileName": "OllamaSetup.exe",
+            "source": "https://ollama.com/download/windows",
+            "downloadUrl": "https://github.com/ollama/ollama/releases/download/v0.31.1/OllamaSetup.exe",
+            "expectedSha256": "b93ac1c6eab658f949bf5f675b40bf997b6684f88b5c230160fb131717430718",
+            "expectedProductVersion": "0.31.1",
+            "expectedSignerSubjectContains": "O=Ollama Inc.",
+            "hashSource": "approved-authenticode-verified-artifact"
+        },
+        {
+            "id": "python-3.11.9-windows-x64",
+            "required": true,
+            "fileName": "python-3.11.9-amd64.exe",
+            "source": "https://www.python.org/downloads/release/python-3119/",
+            "downloadUrl": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+            "expectedSha256": "5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde",
+            "expectedProductVersion": "3.11.9150.0",
+            "expectedSignerSubjectContains": "O=Python Software Foundation",
+            "hashSource": "approved-authenticode-verified-artifact"
+        },
+        {
+            "id": "powershell-7-windows-x64",
+            "required": false,
+            "fileName": "PowerShell-7-win-x64.msi",
+            "source": "https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows",
+            "downloadUrl": "",
+            "expectedSha256": "",
+            "manualOnly": true,
+            "notes": "Optional. Place a PowerShell-*-win-x64.msi under offline-package/installers when needed."
+        }
+    ],
+    "legacyMigrationModels": [
+        "qwen2.5:3b",
+        "qwen2.5:7b",
+        "qwen2.5:14b",
+        "qwen3.5:35b-a3b"
+    ],
+    "models": [
+        {
+            "name": "qwen3.5:4b",
+            "role": "chat",
+            "selectable": true,
+            "registry": "https://registry.ollama.ai",
+            "repository": "library/qwen3.5",
+            "tag": "4b",
+            "expectedManifestDigest": "sha256:2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd",
+            "expectedConfigDigest": "sha256:de9fed2251b37295b763727a59ca35cf5cfe5c7379bc3e2104b2ce3c145aa887",
+            "expectedLicenseLayerDigest": "sha256:7339fa418c9ad3e8e12e74ad0fd26a9cc4be8703f9c110728a992b193be85cb2",
+            "parameterSize": "4.7B",
+            "quantization": "Q4_K_M",
+            "minimumOllamaVersion": "0.17.1",
+            "adoptionReceipt": "result/offline-ai-model-adoption/adoption-receipt-20260812.md",
+            "recommendation": {
+                "tier": "compact",
+                "minimumRamGiB": 8,
+                "fullGpuVramGiB": 6,
+                "partialGpuVramGiB": 4,
+                "estimatedDownloadBytes": 3389983735,
+                "estimatedLargestBlobBytes": 3389971840,
+                "contextTokensAssumed": 8192,
+                "catalogReviewedAt": "2026-08-12",
+                "evidence": [
+                    "https://ollama.com/library/qwen3.5:4b",
+                    "https://registry.ollama.ai/v2/library/qwen3.5/manifests/4b"
+                ],
+                "notices": [
+                    "8K context・単一利用を前提にした保守的な見積もりです。"
+                ]
+            }
+        },
+        {
+            "name": "gpt-oss:20b",
+            "role": "chat",
+            "selectable": true,
+            "registry": "https://registry.ollama.ai",
+            "repository": "library/gpt-oss",
+            "tag": "20b",
+            "expectedManifestDigest": "sha256:17052f91a42e97930aa6e28a6c6c06a983e6a58dbb00434885a0cf5313e376f7",
+            "expectedConfigDigest": "sha256:776beb3adb235076157cfea408b8ea2a2d25eae99d7f5da997f607f6b69fa0fa",
+            "expectedLicenseLayerDigest": "sha256:f60356777647e927149cbd4c0ec1314a90caba9400ad205ddc4ce47ed001c2d6",
+            "parameterSize": "20.9B",
+            "quantization": "MXFP4",
+            "minimumOllamaVersion": "0.31.2",
+            "adoptionReceipt": "result/offline-ai/model-evaluation-gptoss-20260911.md",
+            "recommendation": {
+                "tier": "balanced",
+                "minimumRamGiB": 32,
+                "fullGpuVramGiB": 16,
+                "partialGpuVramGiB": 12,
+                "estimatedDownloadBytes": 13793441244,
+                "estimatedLargestBlobBytes": 13793422144,
+                "contextTokensAssumed": 8192,
+                "catalogReviewedAt": "2026-09-11",
+                "evidence": [
+                    "https://ollama.com/library/gpt-oss:20b",
+                    "https://registry.ollama.ai/v2/library/gpt-oss/manifests/20b"
+                ],
+                "notices": [
+                    "8K context・単一利用を前提にした保守的な見積もりです。",
+                    "RTX 4080の現用PCでは同時GPU常駐と検索を確認済み。2026-09-13に実利用での安全余裕を受入。CPU offload時の性能は未測定で、現用PC限定で必須評価から除外。他環境の性能保証は含まない。"
+                ]
+            }
+        },
+        {
+            "name": "qwen3.5:27b",
+            "role": "chat",
+            "selectable": true,
+            "registry": "https://registry.ollama.ai",
+            "repository": "library/qwen3.5",
+            "tag": "27b",
+            "expectedManifestDigest": "sha256:7653528ba5cba4dd8e19da24aaddc7f4d0b5ecd93571c0825dfd4137958ec06e",
+            "expectedConfigDigest": "sha256:ba0915cbf15878a68d300f640d3d575f5805cac42dd8f83746eb31a0e8afec22",
+            "expectedLicenseLayerDigest": "sha256:7339fa418c9ad3e8e12e74ad0fd26a9cc4be8703f9c110728a992b193be85cb2",
+            "parameterSize": "27.8B",
+            "quantization": "Q4_K_M",
+            "minimumOllamaVersion": "0.17.1",
+            "adoptionReceipt": "result/offline-ai-model-adoption/adoption-receipt-20260812.md",
+            "recommendation": {
+                "tier": "quality",
+                "minimumRamGiB": 32,
+                "fullGpuVramGiB": 24,
+                "partialGpuVramGiB": 12,
+                "estimatedDownloadBytes": 17420432728,
+                "estimatedLargestBlobBytes": 17420420832,
+                "contextTokensAssumed": 8192,
+                "catalogReviewedAt": "2026-08-12",
+                "evidence": [
+                    "https://ollama.com/library/qwen3.5:27b",
+                    "https://registry.ollama.ai/v2/library/qwen3.5/manifests/27b"
+                ],
+                "notices": [
+                    "8K context・単一利用を前提にした保守的な見積もりです。"
+                ]
+            }
+        },
+        {
+            "name": "bge-m3",
+            "role": "embedding",
+            "selectable": false,
+            "required": true,
+            "registry": "https://registry.ollama.ai",
+            "repository": "library/bge-m3",
+            "tag": "latest",
+            "expectedManifestDigest": "sha256:7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab",
+            "expectedConfigDigest": "sha256:0c4c9c2a325fb1cdafec606e6809cb745f1cb26a6d919994400d27372303e276",
+            "expectedLicenseLayerDigest": "sha256:a406579cd136771c705c521db86ca7d60a6f3de7c9b5460e6193a2df27861bde",
+            "parameterSize": "566.70M",
+            "quantization": "F16",
+            "adoptionReceipt": "result/offline-ai-model-adoption/adoption-receipt-20260812.md",
+            "recommendation": {
+                "estimatedDownloadBytes": 1157672605,
+                "estimatedLargestBlobBytes": 1157671200,
+                "contextTokensAssumed": 8192,
+                "catalogReviewedAt": "2026-08-12",
+                "evidence": [
+                    "https://ollama.com/library/bge-m3",
+                    "https://registry.ollama.ai/v2/library/bge-m3/manifests/latest"
+                ]
+            }
+        },
+        {
+            "id": "local-reranker",
+            "name": "local-reranker-placeholder",
+            "role": "optional",
+            "selectable": false,
+            "registry": "",
+            "repository": "",
+            "tag": "",
+            "required": false,
+            "includeFlag": "IncludeReranker",
+            "componentKind": "reranker-model",
+            "provider": "local-reranker-compatible",
+            "stagingDirectory": "reranker",
+            "packageRelativePath": "optional-components/reranker",
+            "requiredFiles": [],
+            "activation": "transport-only",
+            "licenseReviewRequired": true,
+            "manualOnly": true,
+            "notes": "Optional transport only. The loopback HTTP adapter is implemented, but runtime/model auto-start and standard redistribution are NO-GO until artifact hashes, licenses, offline behavior, and CPU performance are approved."
+        }
+    ]
+}

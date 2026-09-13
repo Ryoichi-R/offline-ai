@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "productVersion": "0.1.0",
+  "supportUrl": "https://github.com/Ryoichi-R/offline-ai/issues",
+  "licenseSha256": "1e6bdaf8258611ca61d87897a7b3439e390478db46b76b30709c2659c3402c74",
+  "approvedBy": "Ryoichi-Rice",
+  "approvedAt": "2026-09-13T00:00:00+09:00",
+  "licenseApproved": true,
+  "redistributionApproved": true,
+  "notes": "Owner selected MIT / Ryoichi-Rice and contributors on 2026-09-13 JST. Public repository: https://github.com/Ryoichi-R/offline-ai (public). Source-only public release: Python, Ollama, and model artifacts are not bundled in this repository, so third-party redistribution review is out of scope for this artifact. A prebuilt bundle that ships those components requires a separate redistribution review."
+}

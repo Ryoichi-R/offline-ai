@@ -1,0 +1,45 @@
+name: バグ報告
+description: offline-ai の不具合を報告する
+labels: ['bug']
+body:
+    - type: markdown
+      attributes:
+          value: |
+              **重要**: API key、credential、利用者文書、検索語、環境変数全体は添付しないでください。
+              これらの情報が問題の再現に不要な場合は記載しないでください。
+    - type: textarea
+      id: error-message
+      attributes:
+          label: エラーメッセージ
+          description: 表示されたエラーメッセージをそのまま貼り付けてください。
+      validations:
+          required: true
+    - type: input
+      id: windows-version
+      attributes:
+          label: Windows版
+          placeholder: 例 Windows 11 23H2
+      validations:
+          required: true
+    - type: textarea
+      id: hardware
+      attributes:
+          label: CPU / GPU / RAM
+          placeholder: |
+              CPU: 例 Ryzen 7 7700
+              GPU: 例 RTX 4070 / なし
+              RAM: 例 32GB
+      validations:
+          required: true
+    - type: input
+      id: product-version
+      attributes:
+          label: manifest.json の productVersion
+      validations:
+          required: true
+    - type: textarea
+      id: reproduction
+      attributes:
+          label: 再現手順
+      validations:
+          required: false

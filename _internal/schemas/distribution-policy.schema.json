@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "offline-ai/distribution-policy.schema.json",
+  "title": "offline-ai distribution policy",
+  "description": "全fileへ配布分類(both/public-source/runtime/excluded/release-only)を付与するdefault-deny契約。未分類のfileはcandidate生成・package生成の両方でfail-closedとする。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "entries"],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pattern", "distribution", "reason", "boundary_row"],
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "minLength": 1,
+            "description": "offline-ai root相対のpath pattern。区切りは'/'。'*'は1segment内の任意文字列、'**'はsegment境界を跨ぐ任意文字列に一致する。"
+          },
+          "distribution": {
+            "enum": ["both", "public-source", "runtime", "excluded", "release-only"]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "boundary_row": {
+            "type": "string",
+            "minLength": 1,
+            "description": "_internal/ARCHITECTURE.mdの成果物境界表に対応する行ID（public-source-artifact / runtime-app-payload / user-built-transport / generated-excluded）。"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

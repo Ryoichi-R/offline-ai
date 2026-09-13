@@ -1,0 +1,183 @@
+{
+    "schema_version": "1.0",
+    "corpus_dir": "corpus",
+    "notes": "offline-ai マスタープラン Phase 2 の固定評価仕様。corpus は合成された非機密 fixture であり、利用者資料を一切含まない。",
+    "acceptance": {
+        "min_retrieval_hit_rate": 0.9,
+        "min_evidence_coverage": 0.8,
+        "min_evidence_precision": 0.5,
+        "min_evidence_line_overlap": 0.8,
+        "max_forbidden_source_hits": 0,
+        "min_abstain_accuracy": 1.0
+    },
+    "questions": [
+        {
+            "id": "Q01",
+            "category": "regulation-table",
+            "query": "国内出張で一般社員の日当は1日あたりいくらですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第2条 日当",
+                    "line_start": 9,
+                    "line_end": 20
+                }
+            ],
+            "required_facts": ["2,500円"],
+            "forbidden_facts": ["3,500円", "3,000円"],
+            "notes": "表からの行選択。役職区分を取り違えると誤答になる。"
+        },
+        {
+            "id": "Q02",
+            "category": "regulation-table",
+            "query": "東京23区に宿泊する場合の宿泊費上限はいくらですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第3条 宿泊費",
+                    "line_start": 21,
+                    "line_end": 31
+                }
+            ],
+            "required_facts": ["14,000円"],
+            "forbidden_facts": ["11,000円"],
+            "notes": "同一文書内の別の表を参照する必要がある。第2条の表を根拠にすると誤答。"
+        },
+        {
+            "id": "Q03",
+            "category": "long-document",
+            "query": "入社初日に持参する書類と物品を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "1.1 持ち物",
+                    "line_start": 7,
+                    "line_end": 15
+                }
+            ],
+            "forbidden_sources": [
+                "guides/onboarding-handbook.md.metadata.json"
+            ],
+            "required_facts": ["本人確認書類", "年金手帳", "印鑑"],
+            "forbidden_facts": ["住民票"],
+            "notes": "長文中の1節を特定する。metadata sidecar 自体が根拠として返る場合は defect とする。"
+        },
+        {
+            "id": "Q04",
+            "category": "synonym",
+            "query": "備品の貸出手続きはどうすればよいですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第1条 貸与の申請",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["貸与申請書", "所属長"],
+            "forbidden_facts": [],
+            "notes": "質問語「貸出」に対し、文書側の表記は「貸与」。表層一致では届かない類似語ケース。"
+        },
+        {
+            "id": "Q05",
+            "category": "multi-document",
+            "query": "ノートPCの貸与期間と、期間満了後の返却期限を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第2条 貸与期間",
+                    "line_start": 9,
+                    "line_end": 14
+                },
+                {
+                    "path": "regulations/equipment-return-rules.md",
+                    "heading": "第1条 返却期限",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["12か月", "5営業日"],
+            "forbidden_facts": [],
+            "notes": "2文書の突き合わせ。片方だけでは coverage 0.5 にしかならない。"
+        },
+        {
+            "id": "Q06",
+            "category": "csv-table",
+            "query": "本社に設置されているモニタ24インチの数量は何台ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "data/office-equipment-inventory.csv",
+                    "heading": "",
+                    "line_start": 1,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": ["55"],
+            "forbidden_facts": ["14"],
+            "notes": "CSV の行選択。拠点列を無視すると大阪支社の値を拾って誤答する。"
+        },
+        {
+            "id": "Q07",
+            "category": "sidecar-metadata",
+            "query": "試用期間中の評価は何回、いつ行いますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "3.2 試用期間の評価",
+                    "line_start": 40,
+                    "line_end": 43
+                }
+            ],
+            "forbidden_sources": [
+                "guides/onboarding-handbook.md.metadata.json"
+            ],
+            "required_facts": ["2回", "1か月目", "3か月目"],
+            "forbidden_facts": [],
+            "notes": "sidecar がある文書。根拠へ page / parser などの metadata が付与されることを併せて確認する。"
+        },
+        {
+            "id": "Q08",
+            "category": "plain-text-no-sidecar",
+            "query": "パスワードリセットの本人確認について決まったことは何ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "notes/support-meeting-notes.txt",
+                    "heading": "",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["所属長"],
+            "forbidden_facts": [],
+            "notes": "sidecar なしのプレーンテキスト。metadata が無くても検索できることを確認する。"
+        },
+        {
+            "id": "Q09",
+            "category": "no-answer",
+            "query": "育児休業給付金の給付率は何パーセントですか",
+            "answerable": false,
+            "abstain_layer": "retrieval",
+            "required_facts": [],
+            "forbidden_facts": ["50", "67"],
+            "notes": "corpus に一切記載がない。retrieval 層で evidence_status = insufficient を返せることが要件。"
+        },
+        {
+            "id": "Q10",
+            "category": "no-answer-near-miss",
+            "query": "海外出張の日当はいくらですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": ["3,500円", "3,000円", "2,500円"],
+            "notes": "国内出張旅費規程は存在するが海外は明示的に対象外。関連文書があるため根拠自体は取得される。retrieval 層の要件は sufficient と宣言しないことに限られ、「該当情報なし」の確定判定は生成プロンプト契約側で行う（回答生成なしでは NOT_MEASURED）。"
+        }
+    ]
+}

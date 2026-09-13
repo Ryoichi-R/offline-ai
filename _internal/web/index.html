@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>offline-ai</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
+
+body {
+    font-family: 'Meiryo', 'メイリオ', sans-serif;
+    background: #f5f7fa;
+    color: #333;
+    line-height: 1.6;
+}
+
+.header {
+    background: #1a56db;
+    color: #fff;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+}
+.header .status-dot.ok { background: #22c55e; }
+.header .status-dot.degraded { background: #f59e0b; }
+.header .status-dot.unavailable { background: #ef4444; }
+.header .status-text { font-size: 13px; opacity: 0.9; }
+
+.container {
+    max-width: 900px;
+    margin: 24px auto;
+    padding: 0 16px;
+}
+
+/* --- Search --- */
+.search-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+.search-input {
+    width: 100%;
+    min-height: 160px;
+    resize: vertical;
+    padding: 10px 14px;
+    font-size: 16px;
+    line-height: 1.8;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+}
+.search-input:focus { border-color: #1a56db; }
+.search-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.search-hint { font-size: 13px; color: #475569; }
+.search-label { font-weight: 600; }
+
+.reasoning-select {
+    padding: 10px 12px;
+    font-size: 14px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-family: inherit;
+    background: #fff;
+    cursor: pointer;
+}
+.mode-select {
+    padding: 10px 12px;
+    font-size: 14px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-family: inherit;
+    background: #fff;
+    cursor: pointer;
+}
+.mode-hint { color: #475569; font-size: 13px; }
+
+.timeout-input {
+    width: 84px;
+    padding: 10px 8px;
+    font-size: 14px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-family: inherit;
+}
+.timeout-input:disabled { background: #f3f4f6; cursor: not-allowed; }
+
+.btn {
+    padding: 10px 20px;
+    font-size: 15px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 500;
+    transition: background 0.15s;
+}
+.btn-primary {
+    background: #1a56db;
+    color: #fff;
+}
+.btn-primary:hover { background: #1e40af; }
+.btn-primary:disabled {
+    background: #93c5fd;
+    cursor: not-allowed;
+}
+.btn-danger {
+    background: #ef4444;
+    color: #fff;
+}
+.btn-danger:hover { background: #dc2626; }
+.btn-secondary {
+    background: #e5e7eb;
+    color: #333;
+}
+.btn-secondary:hover { background: #d1d5db; }
+
+.result-area {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 20px;
+    min-height: 200px;
+    word-wrap: break-word;
+    font-size: 14px;
+    line-height: 1.8;
+    max-height: 700px;
+    overflow-y: auto;
+}
+.result-area.raw { white-space: pre-wrap; }
+
+/* --- Markdown rendered styles --- */
+.result-area h1 { font-size: 1.4em; font-weight: 700; margin: 0.8em 0 0.4em; padding-bottom: 0.3em; border-bottom: 1px solid #e5e7eb; }
+.result-area h2 { font-size: 1.25em; font-weight: 700; margin: 0.7em 0 0.3em; padding-bottom: 0.2em; border-bottom: 1px solid #f0f0f0; }
+.result-area h3 { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.2em; }
+.result-area h4, .result-area h5, .result-area h6 { font-size: 1em; font-weight: 600; margin: 0.5em 0 0.2em; }
+.result-area p { margin: 0.4em 0; }
+.result-area ul, .result-area ol { margin: 0.4em 0; padding-left: 1.6em; }
+.result-area li { margin: 0.15em 0; }
+.result-area code {
+    background: #f3f4f6; padding: 2px 5px; border-radius: 3px;
+    font-family: 'Consolas', 'Monaco', monospace; font-size: 0.9em;
+}
+.result-area pre {
+    background: #1e293b; color: #e2e8f0; padding: 14px; border-radius: 6px;
+    overflow-x: auto; margin: 0.6em 0; line-height: 1.5;
+}
+.result-area pre code { background: none; padding: 0; color: inherit; }
+.result-area table { border-collapse: collapse; width: 100%; margin: 0.6em 0; }
+.result-area th, .result-area td { border: 1px solid #d1d5db; padding: 8px 12px; text-align: left; }
+.result-area th { background: #f9fafb; font-weight: 600; }
+.result-area tr:nth-child(even) { background: #f9fafb; }
+.result-area blockquote { border-left: 4px solid #1a56db; margin: 0.6em 0; padding: 0.4em 1em; color: #555; background: #f8fafc; }
+.result-area hr { border: none; border-top: 1px solid #e5e7eb; margin: 1em 0; }
+.result-area strong { font-weight: 700; }
+.result-area em { font-style: italic; }
+
+.status-msg {
+    color: #6b7280;
+    font-style: italic;
+    margin-bottom: 8px;
+}
+.budget-msg {
+    color: #475569;
+    font-size: 0.85em;
+    margin-bottom: 8px;
+}
+.index-panel {
+    margin: 18px 0;
+    padding: 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+.index-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.index-progress { margin-top: 8px; white-space: pre-wrap; color: #334155; }
+
+.evidence-panel {
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid #dbe4f0;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+.evidence-panel summary { cursor: pointer; font-weight: 600; }
+.evidence-list { margin: 10px 0 0; padding-left: 1.4em; }
+.evidence-list li { margin: 8px 0; }
+.evidence-meta { color: #475569; font-size: 0.88em; }
+.evidence-snippet { margin-top: 4px; white-space: pre-wrap; color: #334155; font-size: 0.88em; }
+.evidence-warnings { margin-top: 8px; color: #9a3412; white-space: pre-wrap; }
+.evidence-viewer {
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid #93c5fd;
+    border-radius: 8px;
+    background: #eff6ff;
+}
+.evidence-viewer-header { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.evidence-viewer-title { font-weight: 600; overflow-wrap: anywhere; }
+.evidence-viewer-lines {
+    margin-top: 10px;
+    padding: 10px 10px 10px 3.8em;
+    max-height: 420px;
+    overflow: auto;
+    background: #fff;
+    border: 1px solid #dbe4f0;
+    font-family: 'Consolas', 'Monaco', monospace;
+    white-space: pre-wrap;
+}
+.evidence-viewer-lines li { padding-left: 6px; }
+.evidence-viewer-lines li.highlighted { background: #fef08a; }
+.evidence-viewer-line-number { color: #64748b; user-select: none; margin-right: 12px; }
+.evidence-viewer-note { margin-top: 8px; color: #475569; }
+.result-actions { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+.save-hint { color: #475569; font-size: 13px; }
+
+.thinking-panel {
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid #e2d8c3;
+    border-radius: 8px;
+    background: #fdfaf3;
+}
+.thinking-panel summary { cursor: pointer; font-weight: 600; color: #92662a; }
+.thinking-text {
+    margin-top: 8px;
+    white-space: pre-wrap;
+    color: #6b5a3d;
+    font-size: 0.88em;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+.warning-msg {
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+}
+
+.error-msg {
+    color: #ef4444;
+    background: #fef2f2;
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+}
+
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>offline-ai</h1>
+    <div>
+        <span class="status-dot unavailable" id="statusDot"></span>
+        <span class="status-text" id="statusText">接続確認中...</span>
+    </div>
+</div>
+
+<div class="container">
+    <!-- Search Panel -->
+<div id="panel-search">
+        <section class="index-panel" aria-labelledby="indexTitle">
+            <strong id="indexTitle">Embeddingインデックス</strong>
+            <div class="index-progress" id="indexStatus">状態確認中...</div>
+            <div class="index-controls">
+                <button class="btn btn-primary" id="indexStartBtn" type="button">インデックスを準備</button>
+                <button class="btn btn-danger" id="indexCancelBtn" type="button" hidden>停止</button>
+            </div>
+        </section>
+        <div class="search-form">
+            <label class="search-label" for="searchInput">質問・検索内容</label>
+            <textarea class="search-input" id="searchInput" rows="6"
+                      placeholder="質問や調べたい内容を入力..." maxlength="1000"
+                      aria-describedby="searchInputHint"></textarea>
+            <p class="search-hint" id="searchInputHint">Enterで改行、Ctrl＋Enter（Macは⌘＋Enter）で検索。右下をドラッグすると高さを調整できます。最大1,000文字。</p>
+            <div class="search-controls">
+            <select class="mode-select" id="searchModeSelect" aria-label="検索モード">
+                <option value="answer" selected>回答を作る</option>
+                <option value="search">資料を探す</option>
+            </select>
+            <select class="reasoning-select" id="reasoningSelect">
+                <option value="">推論: 非表示</option>
+                <option value="low" selected>推論: 低</option>
+                <option value="medium">推論: 中</option>
+                <option value="high">推論: 高</option>
+            </select>
+            <input type="number" class="timeout-input" id="searchTimeoutInput"
+                   min="300" max="600" step="30" value="300"
+                   title="検索タイムアウト（秒）" aria-label="検索タイムアウト（秒）">
+            <button class="btn btn-primary" id="searchBtn">検索</button>
+            <button class="btn btn-danger" id="cancelSearchBtn" hidden>中止</button>
+            </div>
+            <p class="mode-hint" id="searchModeHint">回答を生成し、根拠を表示します。</p>
+        </div>
+        <div id="searchStatus" class="status-msg" hidden></div>
+        <div id="searchBudget" class="budget-msg" hidden></div>
+        <details id="searchThinking" class="thinking-panel" hidden open>
+            <summary id="searchThinkingSummary">思考中…</summary>
+            <div id="searchThinkingText" class="thinking-text"></div>
+        </details>
+        <details id="searchEvidence" class="evidence-panel" hidden>
+            <summary id="searchEvidenceSummary">根拠</summary>
+            <div id="searchEvidenceWarnings" class="evidence-warnings"></div>
+            <ol id="searchEvidenceList" class="evidence-list"></ol>
+        </details>
+        <section id="evidenceViewer" class="evidence-viewer" hidden aria-labelledby="evidenceViewerTitle">
+            <div class="evidence-viewer-header">
+                <strong id="evidenceViewerTitle" class="evidence-viewer-title">根拠箇所</strong>
+                <button class="btn btn-secondary" id="evidenceViewerCloseBtn" type="button">閉じる</button>
+            </div>
+            <ol id="evidenceViewerLines" class="evidence-viewer-lines" aria-label="根拠行"></ol>
+            <p id="evidenceViewerNote" class="evidence-viewer-note"></p>
+        </section>
+        <div id="searchWarning" class="warning-msg" hidden></div>
+        <div id="searchError" class="error-msg" hidden></div>
+        <div class="result-actions">
+            <button class="btn btn-secondary" id="saveMarkdownBtn" type="button" hidden>Markdownで保存</button>
+            <span class="save-hint" id="saveMarkdownHint">質問・回答・根拠の抜粋が含まれます。</span>
+        </div>
+        <div class="result-area" id="searchResult"></div>
+    </div>
+</div>
+
+<script>
+/* ========================================================================
+ * offline-ai Web UI — JS
+ * モジュール: state, api, ui
+ * ======================================================================== */
+
+// --- state ---
+const state = {
+    searching: false,
+    searchAbort: null,
+    searchSequence: 0,
+    activeSearchId: 0,
+    finishSearch: null,
+    indexAbort: null,
+    healthOk: false,
+    features: { search: false, retrieval: false },
+    rawSearchText: "",
+    rawThinkingText: "",
+    activeMode: "answer",
+    activeQuery: "",
+    activeReasoning: "off",
+    activeTimeoutSeconds: 0,
+    resultMeta: null,
+    resultEvidence: null,
+    resultCompletedAt: null,
+    resultAnswerEmpty: false,
+    evidenceFocusElement: null,
+    evidenceViewSequence: 0,
+    healthPollTimer: null,
+    healthPollInterval: 15000,
+    timeoutSynced: false,
+    budgetTimer: null,
+};
+
+// --- budgetCountdown ---
+// 全体残り時間表示のカウントダウン計算。SSE `budget` で受け取ったサーバー確定値
+// (timeoutSeconds / remainingSeconds) と受信時刻からの経過時間で再計算する。
+// 制御そのものではなく案内表示のため、タイムアウト判定は常にサーバー側で行う。
+// --- budgetCountdown: BEGIN (pure, DOM非依存 — testで抽出evalされる) ---
+const budgetCountdown = {
+    now() {
+        return performance.now();
+    },
+    // ブラウザのバックグラウンド抑制・スリープ後も経過時間から再計算するため、
+    // 単純な1ずつの減算ではなく (now - startedAtMs) を都度使う。0未満にはしない。
+    computeRemainingSeconds(timeoutSeconds, remainingAtStart, startedAtMs, nowMs) {
+        const elapsedSeconds = (nowMs - startedAtMs) / 1000;
+        const remaining = remainingAtStart - elapsedSeconds;
+        if (!Number.isFinite(remaining)) return 0;
+        return Math.max(0, Math.min(timeoutSeconds, Math.round(remaining)));
+    },
+};
+// --- budgetCountdown: END ---
+
+// --- markdown renderer ---
+const md = {
+    render(src) {
+        if (!src) return "";
+        const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+        const lines = src.split("\n");
+        let html = "";
+        let inCode = false, codeLang = "", codeBuf = [];
+        let inTable = false, tableBuf = [];
+        let inList = false, listType = "", listBuf = [];
+
+        const flushList = () => {
+            if (!inList) return;
+            html += `<${listType}>${listBuf.join("")}</${listType}>`;
+            inList = false; listBuf = [];
+        };
+        const flushTable = () => {
+            if (!inTable) return;
+            const rows = tableBuf.filter(r => !/^\s*\|[\s:|-]+\|\s*$/.test(r));
+            if (rows.length === 0) { inTable = false; tableBuf = []; return; }
+            let t = "<table>";
+            rows.forEach((row, i) => {
+                const cells = row.replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+                const tag = i === 0 ? "th" : "td";
+                const tr = i === 0 ? "thead" : (i === 1 ? "tbody" : "");
+                if (tr === "thead") t += "<thead>";
+                if (tr === "tbody") t += "</thead><tbody>";
+                t += "<tr>" + cells.map(c => `<${tag}>${this.inline(esc(c))}</${tag}>`).join("") + "</tr>";
+            });
+            t += "</tbody></table>";
+            html += t;
+            inTable = false; tableBuf = [];
+        };
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            // fenced code block
+            if (/^```/.test(line)) {
+                if (!inCode) {
+                    flushList(); flushTable();
+                    inCode = true; codeLang = line.slice(3).trim(); codeBuf = [];
+                } else {
+                    html += `<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`;
+                    inCode = false;
+                }
+                continue;
+            }
+            if (inCode) { codeBuf.push(line); continue; }
+
+            // table row
+            if (/^\|.+\|/.test(line)) {
+                flushList();
+                if (!inTable) inTable = true;
+                tableBuf.push(line);
+                continue;
+            }
+            flushTable();
+
+            // blank line
+            if (/^\s*$/.test(line)) { flushList(); continue; }
+
+            // heading
+            const hm = line.match(/^(#{1,6})\s+(.+)/);
+            if (hm) { flushList(); const lvl = hm[1].length; html += `<h${lvl}>${this.inline(esc(hm[2]))}</h${lvl}>`; continue; }
+
+            // hr
+            if (/^[-*_]{3,}\s*$/.test(line)) { flushList(); html += "<hr>"; continue; }
+
+            // blockquote
+            if (/^>\s?/.test(line)) { flushList(); html += `<blockquote><p>${this.inline(esc(line.replace(/^>\s?/, "")))}</p></blockquote>`; continue; }
+
+            // unordered list
+            const ulm = line.match(/^(\s*)[-*+]\s+(.*)/);
+            if (ulm) {
+                if (!inList || listType !== "ul") { flushList(); inList = true; listType = "ul"; listBuf = []; }
+                listBuf.push(`<li>${this.inline(esc(ulm[2]))}</li>`);
+                continue;
+            }
+
+            // ordered list
+            const olm = line.match(/^(\s*)\d+[.)]\s+(.*)/);
+            if (olm) {
+                if (!inList || listType !== "ol") { flushList(); inList = true; listType = "ol"; listBuf = []; }
+                listBuf.push(`<li>${this.inline(esc(olm[2]))}</li>`);
+                continue;
+            }
+
+            // paragraph
+            flushList();
+            html += `<p>${this.inline(esc(line))}</p>`;
+        }
+
+        if (inCode) html += `<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`;
+        flushList(); flushTable();
+        return html;
+    },
+
+    escapeAttr(s) {
+        return s
+            .replace(/&/g, "&amp;")
+            .replace(/"/g, "&quot;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+    },
+
+    sanitizeHref(rawHref) {
+        const raw = (rawHref || "").trim();
+        if (!raw) return "#";
+
+        const collapsed = raw.replace(/[\u0000-\u001f\u007f\s]+/g, "").toLowerCase();
+        if (
+            collapsed.startsWith("javascript:") ||
+            collapsed.startsWith("data:") ||
+            collapsed.startsWith("vbscript:")
+        ) {
+            return "#";
+        }
+
+        const normalizedSlashes = collapsed.replace(/\\/g, "/");
+        if (normalizedSlashes.startsWith("//")) {
+            return "#";
+        }
+
+        if (raw.startsWith("#") || (raw.startsWith("/") && !raw.startsWith("//")) || raw.startsWith("./") || raw.startsWith("../")) {
+            return raw;
+        }
+
+        try {
+            const url = new URL(raw, window.location.origin);
+            if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+                return url.href;
+            }
+        } catch {}
+        return "#";
+    },
+
+    inline(s) {
+        return s
+            .replace(/`([^`]+)`/g, "<code>$1</code>")
+            .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+            .replace(/\*(.+?)\*/g, "<em>$1</em>")
+            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, href) => {
+                const safeHref = this.escapeAttr(this.sanitizeHref(href));
+                return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+            });
+    },
+};
+
+// --- api ---
+const api = {
+    async health() {
+        try {
+            const res = await fetch("/api/health");
+            return await res.json();
+        } catch {
+            return { status: "unavailable", ollama: false, model: "", features: { search: false, retrieval: false } };
+        }
+    },
+
+    async indexStatus() {
+        try {
+            const res = await fetch("/api/index/status");
+            return await res.json();
+        } catch {
+            return { state: "failed", error_code: "INDEX_STATUS_UNAVAILABLE" };
+        }
+    },
+
+    async startIndex(resume = false) {
+        const path = resume ? "/api/index/resume" : "/api/index/start";
+        const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        return data;
+    },
+
+    async cancelIndex(jobId) {
+        const res = await fetch("/api/index/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ job_id: jobId }),
+        });
+        return await res.json();
+    },
+
+    indexSSE(jobId, callbacks) {
+        const ctrl = new AbortController();
+        state.indexAbort = ctrl;
+        fetch(`/api/index/events?job_id=${encodeURIComponent(jobId)}`, { signal: ctrl.signal })
+            .then(async (res) => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            try { callbacks.onEvent(JSON.parse(line.slice(6))); } catch {}
+                        }
+                    }
+                }
+            })
+            .catch((err) => { if (err.name !== "AbortError") callbacks.onError(err.message); });
+        return ctrl;
+    },
+
+    async viewEvidence(evidenceId) {
+        const params = new URLSearchParams({ evidence_id: evidenceId });
+        const res = await fetch(`/api/evidence/view?${params}`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        return data;
+    },
+
+    searchSSE(query, mode, reasoning, timeoutSeconds, callbacks) {
+        const ctrl = new AbortController();
+        state.searchAbort = ctrl;
+
+        const params = new URLSearchParams({ q: query, mode });
+        if (reasoning) params.set("reasoning", reasoning);
+        if (Number.isFinite(timeoutSeconds)) params.set("timeout_seconds", String(timeoutSeconds));
+
+        fetch(`/api/search?${params}`, { signal: ctrl.signal })
+            .then(async (res) => {
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    callbacks.onError(err.error?.message || `HTTP ${res.status}`);
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            try {
+                                const event = JSON.parse(line.slice(6));
+                                callbacks.onEvent(event);
+                            } catch {}
+                        }
+                    }
+                }
+            })
+            .catch((err) => {
+                if (err.name !== "AbortError") {
+                    callbacks.onError(err.message);
+                }
+            })
+            .finally(() => {
+                callbacks.onEnd();
+            });
+
+        return ctrl;
+    },
+
+};
+
+// --- ui ---
+const ui = {
+    els: {},
+
+    init() {
+        this.els = {
+            statusDot: document.getElementById("statusDot"),
+            statusText: document.getElementById("statusText"),
+            indexStatus: document.getElementById("indexStatus"),
+            indexStartBtn: document.getElementById("indexStartBtn"),
+            indexCancelBtn: document.getElementById("indexCancelBtn"),
+            searchInput: document.getElementById("searchInput"),
+            searchModeSelect: document.getElementById("searchModeSelect"),
+            searchModeHint: document.getElementById("searchModeHint"),
+            reasoningSelect: document.getElementById("reasoningSelect"),
+            searchTimeoutInput: document.getElementById("searchTimeoutInput"),
+            searchBtn: document.getElementById("searchBtn"),
+            cancelSearchBtn: document.getElementById("cancelSearchBtn"),
+            searchStatus: document.getElementById("searchStatus"),
+            searchBudget: document.getElementById("searchBudget"),
+            searchThinking: document.getElementById("searchThinking"),
+            searchThinkingSummary: document.getElementById("searchThinkingSummary"),
+            searchThinkingText: document.getElementById("searchThinkingText"),
+            searchEvidence: document.getElementById("searchEvidence"),
+            searchEvidenceSummary: document.getElementById("searchEvidenceSummary"),
+            searchEvidenceWarnings: document.getElementById("searchEvidenceWarnings"),
+            searchEvidenceList: document.getElementById("searchEvidenceList"),
+            evidenceViewer: document.getElementById("evidenceViewer"),
+            evidenceViewerTitle: document.getElementById("evidenceViewerTitle"),
+            evidenceViewerCloseBtn: document.getElementById("evidenceViewerCloseBtn"),
+            evidenceViewerLines: document.getElementById("evidenceViewerLines"),
+            evidenceViewerNote: document.getElementById("evidenceViewerNote"),
+            searchError: document.getElementById("searchError"),
+            searchWarning: document.getElementById("searchWarning"),
+            saveMarkdownBtn: document.getElementById("saveMarkdownBtn"),
+            saveMarkdownHint: document.getElementById("saveMarkdownHint"),
+            searchResult: document.getElementById("searchResult"),
+        };
+
+        this.bindEvents();
+        this.updateSearchModeUI();
+        this.pollHealth();
+    },
+
+    bindEvents() {
+        this.els.indexStartBtn.addEventListener("click", () => this.startIndex());
+        this.els.indexCancelBtn.addEventListener("click", () => this.cancelIndex());
+        // Search
+        this.els.searchBtn.addEventListener("click", () => this.startSearch());
+        this.els.cancelSearchBtn.addEventListener("click", () => this.cancelSearch());
+        this.els.searchModeSelect.addEventListener("change", () => this.updateSearchModeUI());
+        this.els.evidenceViewerCloseBtn.addEventListener("click", () => this.closeEvidenceViewer());
+        this.els.saveMarkdownBtn.addEventListener("click", () => this.saveMarkdown());
+        this.els.searchInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing && e.keyCode !== 229 && !state.searching) {
+                e.preventDefault();
+                this.startSearch();
+            }
+        });
+
+    },
+
+    async pollHealth() {
+        const update = async () => {
+            // 検索SSE購読中はポーリングを止め、Ollama呼び出しの競合を避ける
+            // （検索完了後に onEnd から1回だけ再取得する）。
+            if (state.searching) {
+                this.scheduleHealthPoll();
+                return;
+            }
+            const h = await api.health();
+            state.healthOk = h.status !== "unavailable";
+            state.features = h.features || { search: false, retrieval: false };
+
+            // サーバーが返す既定・最小・最大へ入力属性と初期値を同期する（初回のみ）。
+            // 検索中は入力を無効化しているため、値の同期による誤操作は起きない。
+            if (!state.timeoutSynced && Number.isFinite(h.searchTimeoutMin) && Number.isFinite(h.searchTimeoutMax)) {
+                this.els.searchTimeoutInput.min = String(h.searchTimeoutMin);
+                this.els.searchTimeoutInput.max = String(h.searchTimeoutMax);
+                this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
+                state.timeoutSynced = true;
+            }
+
+            this.els.statusDot.className = "status-dot " + h.status;
+            const modelInfo = h.model ? ` (${h.model})` : "";
+            if (h.status === "ok") {
+                this.els.statusText.textContent = "Ollama 接続済み" + modelInfo;
+            } else if (h.status === "degraded") {
+                const disabled = [];
+                if (!h.features.search) disabled.push("検索");
+                this.els.statusText.textContent = disabled.length
+                    ? `一部機能無効: ${disabled.join(", ")}` + modelInfo
+                    : "ローカル検索のみ利用可能";
+            } else {
+                this.els.statusText.textContent = h.features?.retrieval
+                    ? "ローカル検索のみ利用可能（Ollama未接続）"
+                    : "Ollama 未接続";
+            }
+            const index = await api.indexStatus();
+            this.renderIndex(index);
+            // building/cancelling中は15秒間隔を維持し、それ以外は60秒へ落とす。
+            state.healthPollInterval = (index.state === "building" || index.state === "cancelling") ? 15000 : 60000;
+            this.scheduleHealthPoll();
+        };
+        this.pollHealthUpdate = update;
+        await update();
+    },
+
+    scheduleHealthPoll() {
+        if (state.healthPollTimer) clearTimeout(state.healthPollTimer);
+        state.healthPollTimer = setTimeout(() => this.pollHealthUpdate(), state.healthPollInterval);
+    },
+
+    renderIndex(index) {
+        const stateName = index.state || "missing";
+        const processed = Number(index.processed || 0);
+        const total = Number(index.total || 0);
+        const percent = total ? (processed / total * 100).toFixed(1) : (stateName === "ready" ? "100.0" : "0.0");
+        const parts = [`状態: ${stateName}`, `${processed} / ${total} (${percent}%)`];
+        if (index.rate_per_second) parts.push(`速度 ${index.rate_per_second}/秒`);
+        if (index.eta_seconds !== null && index.eta_seconds !== undefined) parts.push(`概算残り ${index.eta_seconds}秒`);
+        if (index.error_code) parts.push(`code=${index.error_code}`);
+        if (stateName === "missing" || stateName === "stale" || stateName === "cancelled" || stateName === "failed") {
+            parts.push(stateName === "ready" ? "" : "検索はキーワードのみです。準備ボタンで再開できます。");
+        }
+        this.els.indexStatus.textContent = parts.filter(Boolean).join(" / ");
+        this.els.indexStartBtn.hidden = stateName === "building" || stateName === "cancelling" || stateName === "ready";
+        this.els.indexCancelBtn.hidden = !(stateName === "building" || stateName === "cancelling");
+        this.els.indexStartBtn.textContent = stateName === "cancelled" || stateName === "failed" ? "インデックスを再開" : "インデックスを準備";
+    },
+
+    async startIndex() {
+        try {
+            const current = await api.indexStatus();
+            const data = await api.startIndex(current.state === "cancelled" || current.state === "failed");
+            this.renderIndex(data);
+            if (data.job_id) {
+                if (state.indexAbort) state.indexAbort.abort();
+                api.indexSSE(data.job_id, {
+                    onEvent: (event) => this.renderIndex(event),
+                    onError: (message) => { this.els.indexStatus.textContent = `index event error: ${message}`; },
+                });
+            }
+        } catch (error) {
+            this.els.indexStatus.textContent = error.message || "index start failed";
+        }
+    },
+
+    async cancelIndex() {
+        const current = await api.indexStatus();
+        if (current.job_id) this.renderIndex(await api.cancelIndex(current.job_id));
+    },
+
+    updateSearchModeUI() {
+        const mode = this.els.searchModeSelect.value === "search" ? "search" : "answer";
+        const searchOnly = mode === "search";
+        this.els.reasoningSelect.disabled = searchOnly || state.searching;
+        this.els.searchModeHint.textContent = searchOnly
+            ? "回答生成は行いません。検索用テキストの根拠だけを表示します。"
+            : "回答を生成し、根拠を表示します。";
+    },
+
+    startSearch() {
+        const query = this.els.searchInput.value.trim();
+        if (!query) return;
+        const mode = this.els.searchModeSelect.value === "search" ? "search" : "answer";
+        const featureAvailable = mode === "search" ? state.features.retrieval : state.features.search;
+        if (!featureAvailable) {
+            this.els.searchError.textContent = mode === "search"
+                ? "ローカル検索機能が利用できません。"
+                : "回答検索機能が利用できません。Ollama が起動しているか確認してください。";
+            this.els.searchError.hidden = false;
+            return;
+        }
+
+        const searchId = ++state.searchSequence;
+        state.activeSearchId = searchId;
+        state.searching = true;
+        state.rawSearchText = "";
+        state.rawThinkingText = "";
+        state.activeMode = mode;
+        state.activeQuery = query;
+        state.activeReasoning = mode === "search" ? "off" : (this.els.reasoningSelect.value || "off");
+        state.activeTimeoutSeconds = parseInt(this.els.searchTimeoutInput.value, 10);
+        state.resultMeta = null;
+        state.resultEvidence = null;
+        state.resultCompletedAt = null;
+        state.resultAnswerEmpty = false;
+        this.els.searchBtn.hidden = true;
+        this.els.cancelSearchBtn.hidden = false;
+        this.els.searchResult.innerHTML = "";
+        this.els.searchResult.classList.remove("raw");
+        this.els.searchError.hidden = true;
+        this.els.searchWarning.hidden = true;
+        this.els.searchWarning.textContent = "";
+        this.els.searchStatus.hidden = true;
+        this.els.searchThinking.hidden = true;
+        this.els.searchThinking.open = true;
+        this.els.searchThinkingText.textContent = "";
+        this.els.searchThinkingSummary.textContent = "思考中…";
+        this.els.searchEvidence.hidden = true;
+        this.els.searchEvidence.open = false;
+        this.els.searchEvidenceList.replaceChildren();
+        this.els.searchEvidenceWarnings.textContent = "";
+        this.closeEvidenceViewer(false);
+        this.els.saveMarkdownBtn.hidden = true;
+        this.els.searchInput.disabled = true;
+        this.els.searchModeSelect.disabled = true;
+        this.els.searchTimeoutInput.disabled = true;
+        this.updateSearchModeUI();
+        this.clearBudgetTimer();
+
+        const reasoning = mode === "search" ? "off" : this.els.reasoningSelect.value;
+        // 開始時点の入力値を確定する。検索中は入力を無効化しているため以後は変わらない。
+        const timeoutSeconds = parseInt(this.els.searchTimeoutInput.value, 10);
+        let renderTimer = null;
+        let thinkingRenderTimer = null;
+        let thinkingClosed = false;
+
+        const closeThinking = () => {
+            if (thinkingClosed) return;
+            thinkingClosed = true;
+            this.els.searchThinking.open = false;
+        };
+
+        const finishSearch = () => {
+            if (state.activeSearchId !== searchId || !state.searching) return;
+            state.searching = false;
+            if (state.searchAbort) state.searchAbort = null;
+            this.els.searchBtn.hidden = false;
+            this.els.cancelSearchBtn.hidden = true;
+            this.els.searchInput.disabled = false;
+            this.els.searchModeSelect.disabled = false;
+            this.els.searchTimeoutInput.disabled = false;
+            this.updateSearchModeUI();
+            this.els.searchInput.focus();
+            clearTimeout(renderTimer);
+            clearTimeout(thinkingRenderTimer);
+            this.clearBudgetTimer();
+            // ensure final render
+            if (state.rawSearchText) {
+                this.els.searchResult.innerHTML = md.render(state.rawSearchText);
+            }
+            // 検索中止めていたポーリングを完了後に1回だけ即時再取得する
+            if (state.healthPollTimer) clearTimeout(state.healthPollTimer);
+            this.pollHealthUpdate();
+            state.finishSearch = null;
+        };
+        state.finishSearch = finishSearch;
+
+        api.searchSSE(query, mode, reasoning, timeoutSeconds, {
+            onEvent: (ev) => {
+                // 遅い旧SSEのfinally/onEndやreconnect replayが、次の検索の
+                // DOMと操作状態を上書きしない。
+                if (state.activeSearchId !== searchId) return;
+                if (ev.type === "status") {
+                    this.els.searchStatus.textContent = ev.text;
+                    this.els.searchStatus.hidden = false;
+                } else if (ev.type === "budget") {
+                    this.startBudgetDisplay(ev.timeoutSeconds, ev.remainingSeconds);
+                } else if (ev.type === "result_meta") {
+                    state.resultMeta = JSON.parse(JSON.stringify(ev));
+                } else if (ev.type === "evidence") {
+                    state.resultEvidence = JSON.parse(JSON.stringify(ev));
+                    this.renderEvidence(ev);
+                } else if (ev.type === "thinking") {
+                    this.els.searchStatus.hidden = true;
+                    this.els.searchThinking.hidden = false;
+                    state.rawThinkingText += ev.text;
+                    // 既存のcontentスロットリングと同じ80ms間引きでDOM更新する
+                    if (!thinkingRenderTimer) {
+                        thinkingRenderTimer = setTimeout(() => {
+                            this.els.searchThinkingSummary.textContent = `思考中… (${state.rawThinkingText.length} 文字)`;
+                            this.els.searchThinkingText.textContent = state.rawThinkingText;
+                            this.els.searchThinkingText.scrollTop = this.els.searchThinkingText.scrollHeight;
+                            thinkingRenderTimer = null;
+                        }, 80);
+                    }
+                } else if (ev.type === "chunk") {
+                    this.els.searchStatus.hidden = true;
+                    // 最初のcontent到着でthinking領域を自動的に畳み、回答本文へフォーカスする
+                    closeThinking();
+                    state.rawSearchText += ev.text;
+                    // throttle re-render to avoid excessive DOM updates during streaming
+                    if (!renderTimer) {
+                        renderTimer = setTimeout(() => {
+                            this.els.searchResult.innerHTML = md.render(state.rawSearchText);
+                            this.els.searchResult.scrollTop = this.els.searchResult.scrollHeight;
+                            renderTimer = null;
+                        }, 80);
+                    }
+                } else if (ev.type === "answer_empty") {
+                    state.resultAnswerEmpty = true;
+                    // 本文 0 文字で終了した理由を明示する（無言の空回答を残さない）。
+                    this.els.searchWarning.textContent = ev.reason === "length"
+                        ? "モデルの出力上限に達したため回答本文を生成できませんでした。「推論: 非表示」で再試行するか、OLLAMA_NUM_CTX を大きくしてください。"
+                        : "回答本文が生成されませんでした。再試行してください。";
+                    this.els.searchWarning.hidden = false;
+                } else if (ev.type === "done") {
+                    this.els.searchStatus.hidden = true;
+                    closeThinking();
+                    this.clearBudgetTimer();
+                    // final render
+                    clearTimeout(renderTimer);
+                    clearTimeout(thinkingRenderTimer);
+                    if (state.rawThinkingText) {
+                        this.els.searchThinkingSummary.textContent = `思考 (${state.rawThinkingText.length} 文字)`;
+                        this.els.searchThinkingText.textContent = state.rawThinkingText;
+                    }
+                    state.resultCompletedAt = ev.completedAt || new Date().toISOString();
+                    if (state.activeMode === "search") {
+                        this.els.searchResult.textContent = state.resultEvidence?.items?.length
+                            ? "検索が完了しました。根拠一覧を確認してください。"
+                            : "該当する資料が見つかりませんでした。";
+                    } else {
+                        this.els.searchResult.innerHTML = md.render(state.rawSearchText);
+                    }
+                    this.els.searchResult.scrollTop = this.els.searchResult.scrollHeight;
+                    this.updateSaveButton();
+                    finishSearch();
+                } else if (ev.type === "error") {
+                    this.els.searchError.textContent = ev.message || "エラーが発生しました";
+                    this.els.searchError.hidden = false;
+                    this.els.searchStatus.hidden = true;
+                    this.clearBudgetTimer();
+                    state.resultMeta = null;
+                    state.resultEvidence = null;
+                    state.resultCompletedAt = null;
+                    this.els.saveMarkdownBtn.hidden = true;
+                    finishSearch();
+                }
+            },
+            onError: (msg) => {
+                if (state.activeSearchId !== searchId) return;
+                this.els.searchError.textContent = msg;
+                this.els.searchError.hidden = false;
+                state.resultMeta = null;
+                state.resultEvidence = null;
+                state.resultCompletedAt = null;
+                this.els.saveMarkdownBtn.hidden = true;
+                this.clearBudgetTimer();
+                finishSearch();
+            },
+            onEnd: () => {
+                if (state.activeSearchId !== searchId) return;
+                this.clearBudgetTimer();
+                finishSearch();
+            },
+        });
+    },
+
+    startBudgetDisplay(timeoutSeconds, remainingSeconds) {
+        this.clearBudgetTimer();
+        if (!Number.isFinite(timeoutSeconds) || !Number.isFinite(remainingSeconds)) return;
+        const startedAtMs = budgetCountdown.now();
+        const render = () => {
+            const remaining = budgetCountdown.computeRemainingSeconds(
+                timeoutSeconds, remainingSeconds, startedAtMs, budgetCountdown.now()
+            );
+            this.els.searchBudget.textContent = `全体残り ${remaining} / ${timeoutSeconds}秒`;
+            this.els.searchBudget.hidden = false;
+        };
+        render();
+        state.budgetTimer = setInterval(render, 1000);
+    },
+
+    // done / error / fetchエラー / 利用者中止 / onEnd の全終了経路から呼ばれる。
+    // 完了後に最終値を残さず表示領域を隠し、次回検索で新しいbudgetを受けて開始する。
+    clearBudgetTimer() {
+        if (state.budgetTimer) {
+            clearInterval(state.budgetTimer);
+            state.budgetTimer = null;
+        }
+        this.els.searchBudget.hidden = true;
+    },
+
+    renderEvidence(ev) {
+        const items = Array.isArray(ev.items) ? ev.items : [];
+        this.els.searchEvidenceList.replaceChildren();
+        for (const item of items) {
+            const row = document.createElement("li");
+            const title = document.createElement("strong");
+            title.textContent = item.sourceTitle || item.path || "不明な資料";
+            row.appendChild(title);
+
+            const metaParts = [];
+            if (item.page !== null && item.page !== undefined && item.page !== "") metaParts.push(`ページ ${item.page}`);
+            if (item.heading) metaParts.push(`見出し ${item.heading}`);
+            if (item.startLine !== null && item.startLine !== undefined && item.endLine !== null && item.endLine !== undefined) {
+                metaParts.push(`行 ${item.startLine}-${item.endLine}`);
+            }
+            if (item.layoutType) metaParts.push(`種別 ${item.layoutType}`);
+            if (item.parser) metaParts.push(`parser ${item.parser}`);
+            if (item.source) metaParts.push(`検索 ${item.source}`);
+            const meta = document.createElement("div");
+            meta.className = "evidence-meta";
+            meta.textContent = metaParts.join(" / ") || "位置情報なし";
+            row.appendChild(meta);
+
+            if (item.evidenceId && item.viewable) {
+                const viewButton = document.createElement("button");
+                viewButton.type = "button";
+                viewButton.className = "btn btn-secondary";
+                viewButton.textContent = "該当箇所を表示";
+                viewButton.addEventListener("click", () => this.openEvidence(item, viewButton));
+                row.appendChild(viewButton);
+            } else if (item.viewReason) {
+                const unavailable = document.createElement("div");
+                unavailable.className = "evidence-meta";
+                unavailable.textContent = item.viewReason;
+                row.appendChild(unavailable);
+            }
+
+            if (item.snippet) {
+                const snippet = document.createElement("div");
+                snippet.className = "evidence-snippet";
+                snippet.textContent = item.snippet;
+                row.appendChild(snippet);
+            }
+            this.els.searchEvidenceList.appendChild(row);
+        }
+        const confidence = Number.isFinite(Number(ev.confidence)) ? Number(ev.confidence).toFixed(2) : "-";
+        const route = ev.route ? ` / route ${ev.route}` : "";
+        this.els.searchEvidenceSummary.textContent = `根拠 ${items.length}件（${ev.evidenceStatus || "不明"} / 信頼度 ${confidence}${route}）`;
+        const warnings = Array.isArray(ev.warnings) ? ev.warnings : [];
+        this.els.searchEvidenceWarnings.textContent = warnings.length ? `検索時の注意:\n${warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
+        this.els.searchEvidence.hidden = false;
+    },
+
+    async openEvidence(item, sourceButton) {
+        if (!item.evidenceId) return;
+        const viewId = ++state.evidenceViewSequence;
+        const searchId = state.activeSearchId;
+        const isCurrentView = () => viewId === state.evidenceViewSequence && searchId === state.activeSearchId;
+        state.evidenceFocusElement = sourceButton;
+        this.els.evidenceViewerTitle.textContent = item.sourceTitle || item.path || "根拠箇所";
+        this.els.evidenceViewerLines.replaceChildren();
+        this.els.evidenceViewerNote.textContent = "読み込み中...";
+        this.els.evidenceViewer.hidden = false;
+        try {
+            const data = await api.viewEvidence(item.evidenceId);
+            if (!isCurrentView()) return;
+            this.els.evidenceViewerLines.replaceChildren();
+            for (const line of Array.isArray(data.lines) ? data.lines : []) {
+                const row = document.createElement("li");
+                if (line.highlighted) row.classList.add("highlighted");
+                const number = document.createElement("span");
+                number.className = "evidence-viewer-line-number";
+                number.textContent = String(line.lineNumber ?? "");
+                const text = document.createElement("span");
+                text.textContent = String(line.text ?? "");
+                row.append(number, text);
+                this.els.evidenceViewerLines.appendChild(row);
+            }
+            const range = `${data.highlightStartLine ?? data.startLine}-${data.highlightEndLine ?? data.endLine}`;
+            this.els.evidenceViewerNote.textContent = data.truncated
+                ? `検索用テキストの行 ${range} を中心に表示しています（表示上限により省略）。`
+                : `検索用テキストの行 ${range} を強調表示しています。`;
+        } catch (error) {
+            if (!isCurrentView()) return;
+            this.els.evidenceViewerLines.replaceChildren();
+            this.els.evidenceViewerNote.textContent = error.message || "根拠箇所を表示できません";
+        }
+        this.els.evidenceViewerCloseBtn.focus();
+    },
+
+    closeEvidenceViewer(restoreFocus = true) {
+        ++state.evidenceViewSequence;
+        this.els.evidenceViewer.hidden = true;
+        this.els.evidenceViewerLines.replaceChildren();
+        this.els.evidenceViewerNote.textContent = "";
+        if (restoreFocus && state.evidenceFocusElement?.isConnected) {
+            state.evidenceFocusElement.focus();
+        }
+        state.evidenceFocusElement = null;
+    },
+
+    updateSaveButton() {
+        const canSave = Boolean(
+            state.resultMeta && state.resultEvidence && state.resultCompletedAt && !state.resultAnswerEmpty
+        );
+        this.els.saveMarkdownBtn.hidden = !canSave;
+    },
+
+    _markdownFence(value) {
+        const text = String(value ?? "");
+        const runs = text.match(/`+/g) || [];
+        const longest = runs.reduce((max, run) => Math.max(max, run.length), 0);
+        return "`".repeat(Math.max(3, longest + 1));
+    },
+
+    _markdownTextBlock(label, value) {
+        const fence = this._markdownFence(value);
+        return `### ${label}\n${fence}text\n${String(value ?? "")}\n${fence}`;
+    },
+
+    _markdownMeta(value) {
+        return String(value ?? "")
+            .replace(/\\/g, "\\\\")
+            .replace(/[\r\n]+/g, " ")
+            .replace(/([`*_{}\[\]()#+.!|<>~])/g, "\\$1");
+    },
+
+    _formatJst(iso) {
+        try {
+            return new Intl.DateTimeFormat("ja-JP", {
+                timeZone: "Asia/Tokyo", dateStyle: "medium", timeStyle: "medium",
+            }).format(new Date(iso)) + " JST";
+        } catch {
+            return String(iso || "");
+        }
+    },
+
+    saveMarkdown() {
+        if (!state.resultMeta || !state.resultEvidence || !state.resultCompletedAt || state.resultAnswerEmpty) return;
+        const meta = state.resultMeta;
+        const evidence = state.resultEvidence;
+        const startedAt = meta.startedAt || "";
+        const completedAt = state.resultCompletedAt;
+        const modeLabel = meta.mode === "search" ? "資料を探す（回答生成なし）" : "回答を作る";
+        const lines = [
+            "# offline-ai 検索結果",
+            "",
+            `- 実行開始（UTC）: ${this._markdownMeta(startedAt)}`,
+            `- 実行開始（JST）: ${this._markdownMeta(this._formatJst(startedAt))}`,
+            `- 実行完了（UTC）: ${this._markdownMeta(completedAt)}`,
+            `- 実行完了（JST）: ${this._markdownMeta(this._formatJst(completedAt))}`,
+            `- モード: ${this._markdownMeta(modeLabel)}`,
+            "",
+            this._markdownTextBlock("質問", state.activeQuery),
+            "",
+            this._markdownTextBlock("回答", meta.mode === "search" ? "回答生成なし" : state.rawSearchText),
+            "",
+            "### 根拠一覧",
+            "",
+        ];
+        const items = Array.isArray(evidence.items) ? evidence.items : [];
+        items.forEach((item, index) => {
+            const location = [
+                item.page === null || item.page === undefined || item.page === "" ? "" : `ページ ${item.page}`,
+                item.heading ? `見出し ${item.heading}` : "",
+                item.startLine !== null && item.startLine !== undefined && item.endLine !== null && item.endLine !== undefined
+                    ? `行 ${item.startLine}-${item.endLine}` : "",
+            ].filter(Boolean).join(" / ");
+            lines.push(
+                `#### ${index + 1}. ${this._markdownMeta(item.sourceTitle || "不明な資料")}`,
+                "",
+                `- source内相対パス: ${this._markdownMeta(item.path)}`,
+                `- 位置: ${this._markdownMeta(location || "不明")}`,
+                `- 検索時SHA-256: ${this._markdownMeta(item.sourceSha256 || "不明")}`,
+                "",
+                this._markdownTextBlock("検索時の抜粋", item.snippet),
+                "",
+            );
+        });
+        lines.push(
+            "",
+            "### 実行条件",
+            "",
+            `- chatモデル: ${this._markdownMeta(meta.chatModel || "未使用")}`,
+            `- Embeddingモデル: ${this._markdownMeta(meta.embeddingModel || "未使用")}`,
+            `- 適用reasoning: ${this._markdownMeta(meta.reasoning || "off")}`,
+            `- route: ${this._markdownMeta(evidence.route)}`,
+            `- indexState: ${this._markdownMeta(evidence.indexState)}`,
+            `- 根拠ステータス: ${this._markdownMeta(evidence.evidenceStatus)}`,
+            `- 根拠信頼度: ${this._markdownMeta(evidence.confidence)}`,
+            `- 注意: ${this._markdownMeta((evidence.warnings || []).join(" / ")) || "なし"}`,
+            "",
+            "保存対象には質問・回答・根拠の抜粋が含まれます。",
+            "",
+        );
+        const requestId = String(meta.requestId || "unknown").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 12) || "result";
+        const timestamp = new Date(startedAt || Date.now()).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+        const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `offline-ai_${timestamp}_${requestId}.md`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+        this.els.saveMarkdownHint.textContent = "ダウンロードを開始しました。質問・回答・根拠の抜粋が含まれます。";
+    },
+
+    cancelSearch() {
+        if (state.searchAbort) {
+            state.searchAbort.abort();
+            state.searchAbort = null;
+        }
+        this.clearBudgetTimer();
+        if (state.finishSearch) state.finishSearch();
+    },
+
+};
+
+// --- init ---
+document.addEventListener("DOMContentLoaded", () => ui.init());
+</script>
+</body>
+</html>

@@ -1,0 +1,159 @@
+{
+    "schema_version": "1.0",
+    "public_root": ".",
+    "profiles": ["source-repository"],
+    "documents": [
+        {
+            "path": "README.md",
+            "required_sections": [
+                "配布状態",
+                "対応環境",
+                "導入",
+                "プライバシー",
+                "削除・ライセンス・問い合わせ"
+            ]
+        },
+        {
+            "path": "LICENSE",
+            "required_sections": []
+        }
+    ],
+    "candidate": {
+        "allowlist": [
+            "README.md",
+            "CHANGELOG.md",
+            "SUPPORT.md",
+            "THIRD-PARTY-NOTICES.md",
+            "UNINSTALL.md",
+            "VERSION",
+            "offline-ai-setup-guide.md",
+            "release-metadata.json",
+            "release/preparation-policy.json",
+            "legal/README.md",
+            "LICENSE",
+            "search.bat",
+            "index.bat",
+            "web.bat",
+            "install-offline.bat",
+            "download-package.bat",
+            "_internal/*.py",
+            "_internal/ARCHITECTURE.md",
+            "_internal/OfflineAi.Common.psm1",
+            "_internal/OfflineAi.ModelSelection.psm1",
+            "_internal/OllamaRegistryDownloader.psm1",
+            "_internal/build-offline-package.ps1",
+            "_internal/download-offline-package.ps1",
+            "_internal/install-offline.ps1",
+            "_internal/download-manifest.json",
+            "_internal/.model.example",
+            "_internal/scripts/collect_skill_source.ps1",
+            "_internal/web/index.html",
+            "_internal/distribution-policy.json",
+            "_internal/schemas/**",
+            "_internal/scripts/Test-DistributionPolicy.ps1",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "CODE_OF_CONDUCT.md",
+            ".gitattributes",
+            ".gitignore",
+            "pyproject.toml",
+            "scripts/**",
+            "tests/**",
+            ".github/**"
+        ],
+        "denylist": [
+            "infographic/**",
+            "skill-source/**",
+            "offline-package/**",
+            "legal/models/**",
+            "_internal/embed_cache.json",
+            "_internal/embed_index_status.json",
+            "_internal/.model",
+            "_internal/.model_embed",
+            "_internal/.pdftotext",
+            "_internal/install-state.json",
+            "_internal/optional-components/**",
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "**/*.pyo",
+            ".pytest_cache/**",
+            "**/Thumbs.db",
+            "**/desktop.ini",
+            "**/.DS_Store",
+            "**/*.log",
+            "**/*.tmp"
+        ],
+        "max_file_bytes": 2097152,
+        "max_total_bytes": 20971520,
+        "allow_reparse_points": false
+    },
+    "validation": {
+        "required_receipt_types": [
+            "quality",
+            "manual-acceptance",
+            "clean-verification"
+        ],
+        "expected_test_projects": ["offline-ai-pytest", "offline-ai-pester"],
+        "minimum_test_count": 223,
+        "allow_skips": true,
+        "minimum_line_coverage": 90,
+        "minimum_branch_coverage": null,
+        "require_formatter": true,
+        "require_linter": true,
+        "require_dependency_review": true
+    },
+    "manual_acceptance": [
+        {
+            "id": "clean-vm-e2e-install-search-web",
+            "requirement": "required",
+            "reason": "Windows 11 x64 clean VMで標準user・apostropheを含むpath・別drive OLLAMA_MODELSにてinstall/search/web(health/SSE/cancel/shutdown)/restart/uninstallと、checksum不一致・disk不足・model衝突等の失敗系を検証する。旧remediation plan E2E-1、TODO OD-2に対応。"
+        },
+        {
+            "id": "hardware-performance-baseline",
+            "requirement": "required",
+            "reason": "選択candidate名、catalog digest、model manifest digest、license layer digest、Ollama版を同一receiptへ固定した上で、CPU-only・partial offload・full GPUの各構成でRAM/VRAM/応答時間をclean machineで実測し、README/setup guideへ反映する。旧remediation plan PERF-1、TODO OD-3に対応。"
+        },
+        {
+            "id": "package-candidate-freshness",
+            "requirement": "required",
+            "reason": "現行sourceからuser-built transport release candidateを再生成し、version・createdAt・inventory・legal model copy・checksumsが一致することを確認する。`-PublicRelease`はlicense確定前に使用しない。旧remediation plan PKG-1、TODO OD-4に対応。"
+        },
+        {
+            "id": "installer-pinning-verification",
+            "requirement": "required",
+            "reason": "必須installer(Python/Ollama)のversion・SHA-256・Authenticode signerを固定し検証する。旧remediation plan SUP-1に対応。"
+        },
+        {
+            "id": "model-identity-pinning",
+            "requirement": "required",
+            "reason": "release対象の選択candidate名、download-manifest.json digest、Ollama版、model manifest digest、license layer digestを同一candidate receiptへ固定する。旧remediation plan MODEL-1に対応。"
+        },
+        {
+            "id": "third-party-license-notice-review",
+            "requirement": "required",
+            "reason": "Python・Ollama・選択modelなど残存componentのlicense・版・source・配布条件を人間可読な台帳(THIRD-PARTY-NOTICES.md)へ反映する。旧remediation plan LIC-1に対応。"
+        },
+        {
+            "id": "install-context-privilege-check",
+            "requirement": "conditional",
+            "reason": "optional PowerShell MSI等を公開bundleへ含める場合、必要な権限とinstall contextを事前判定する。含めるか否かは未決(旧remediation plan PRIV-1・未決事項)。含めないと決した場合はnot-applicableへ切替える。"
+        },
+        {
+            "id": "publisher-bundle-go-no-go",
+            "requirement": "conditional",
+            "reason": "publisher配布prebuilt bundleの採否をownerがGO/NO-GO判断する。GOの場合はPython license stack・installer SBOM/pass-through terms・残存model/runtimeの再配布審査が別途必要。旧remediation plan「Publisher prebuilt bundle」節、TODO OD-5に対応。"
+        },
+        {
+            "id": "offline-ai-index-cli-web-acceptance",
+            "requirement": "required",
+            "reason": "現行資料集合相当でindex.bat/Webのbatch build、進捗、cancel、checkpoint resume、source変更stale判定、browser reload、server restart、keyword-only fallback、通常検索120秒、retrieval child timeoutを実機検証する。Embedding初回構築は検索要求から分離し、skip/timeout/NOT_MEASUREDをPASSへ数えない。"
+        }
+    ],
+    "artifacts": [],
+    "integrity": {
+        "require_hashes": true,
+        "require_sbom": false,
+        "require_dependency_review": true,
+        "require_clean_install": true
+    }
+}

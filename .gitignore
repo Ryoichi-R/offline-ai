@@ -1,0 +1,36 @@
+# 利用者資料。非追跡・非配布（常に最優先で除外する）。
+/skill-source/
+/infographic/
+/.test-results/
+.env
+.env.*
+
+# 実行時生成cache・利用者環境固有file
+_internal/embed_cache.json
+_internal/embed_cache.json.tmp
+_internal/embed_cache.checkpoints/**
+_internal/embed_cache.lock
+_internal/embed_index_status.json
+_internal/embed_index_status.json.*
+_internal/embed_cache.json.tmp.*
+_internal/.model
+_internal/.model_embed
+_internal/.pdftotext
+_internal/install-state.json
+_internal/optional-components/
+
+# 搬送package（build/download-offline-package.ps1の出力）
+/offline-package/
+/offline-ai-offline-package/
+**/ollama-models/blobs/
+**/ollama-models/manifests/
+
+# model license可視化物（package build時に生成。sourceには存在しない）
+legal/models/
+
+# Python生成物
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
