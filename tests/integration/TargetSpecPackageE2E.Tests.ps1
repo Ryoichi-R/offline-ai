@@ -107,6 +107,7 @@ Describe 'offline-ai target-spec schema v2 package to installer E2E' -Tag 'Windo
         $installRoot = Join-Path $workRoot 'installed-app'
         $modelsRoot = Join-Path $workRoot 'installed-models'
         $fakeBin = Join-Path $workRoot 'fake-bin'
+        $installFixturePath = Join-Path $workRoot 'invoke-install-fixture.ps1'
         $oldPath = $env:PATH
         $oldModels = $env:OLLAMA_MODELS
         $oldConsoleOutputEncoding = [Console]::OutputEncoding
@@ -115,6 +116,29 @@ Describe 'offline-ai target-spec schema v2 package to installer E2E' -Tag 'Windo
             [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
             New-Item -Path $emptyInstallers -ItemType Directory -Force | Out-Null
             New-Item -Path $workRoot -ItemType Directory -Force | Out-Null
+            # Child processes cannot inherit Pester mocks. Stub only the RAM query in
+            # this child; keep the real installer, thresholds, and disk checks intact.
+            [IO.File]::WriteAllText($installFixturePath, @'
+param(
+    [string]$InstallerPath,
+    [string]$PackageRoot,
+    [string]$AppInstallPath,
+    [string]$ModelConfigMode = 'OverwriteDefault',
+    [UInt64]$FixtureRamBytes = 32GB
+)
+$global:OfflineAiFixtureRamBytes = $FixtureRamBytes
+function global:Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Filter)
+    if ($ClassName -eq 'Win32_ComputerSystem') {
+        return [PSCustomObject]@{ TotalPhysicalMemory = $global:OfflineAiFixtureRamBytes }
+    }
+    CimCmdlets\Get-CimInstance @PSBoundParameters
+}
+& $InstallerPath -PackageRoot $PackageRoot -AppInstallPath $AppInstallPath `
+    -ModelConfigMode $ModelConfigMode -SkipRunSmokeTest -SkipEmbeddingSmokeTest
+exit $LASTEXITCODE
+'@, [Text.UTF8Encoding]::new($false))
             $chatFixture = New-E2eRegistryModel -RegistryRoot $registryRoot -Repository 'library/qwen3.5' -Tag '4b' -Stem 'qwen3.5-4b'
             $overrideChatFixture = New-E2eRegistryModel -RegistryRoot $registryRoot -Repository 'library/qwen3.5' -Tag '27b' -Stem 'qwen3.5-27b'
             $embedFixture = New-E2eRegistryModel -RegistryRoot $registryRoot -Repository 'library/bge-m3' -Tag 'latest' -Stem 'bge-m3'
@@ -258,14 +282,26 @@ Describe 'offline-ai target-spec schema v2 package to installer E2E' -Tag 'Windo
             $env:PATH = "$fakeBin;$oldPath"
             $env:OLLAMA_MODELS = $modelsRoot
 
-            $keepOutput = & $script:PowerShellHost -NoProfile -File $script:InstallOfflinePath `
+            $lowRamOutput = & $script:PowerShellHost -NoProfile -File $installFixturePath `
+                -InstallerPath $script:InstallOfflinePath `
                 -PackageRoot $packageRoot `
                 -AppInstallPath $installRoot `
                 -ModelConfigMode KeepExisting `
-                -SkipRunSmokeTest `
-                -SkipEmbeddingSmokeTest 2>&1
+                -FixtureRamBytes ([UInt64](16GB - 1)) 2>&1
+            $lowRamText = $lowRamOutput | Out-String
+            $LASTEXITCODE | Should -Be 1 -Because $lowRamText
+            $lowRamText | Should -Match 'preflight failed: RAM'
+            (Get-Content -LiteralPath (Join-Path $installRoot '_internal\.model') -Raw -Encoding UTF8).Trim() | Should -Be 'qwen3.5:9b'
+            Test-Path -LiteralPath (Join-Path $installRoot '_internal\install-state.json') | Should -BeFalse
+
+            $keepOutput = & $script:PowerShellHost -NoProfile -File $installFixturePath `
+                -InstallerPath $script:InstallOfflinePath `
+                -PackageRoot $packageRoot `
+                -AppInstallPath $installRoot `
+                -ModelConfigMode KeepExisting 2>&1
             $keepText = $keepOutput | Out-String
             $LASTEXITCODE | Should -Be 0 -Because $keepText
+            $keepText | Should -Match 'preflight: RAM 32GB'
             (Get-Content -LiteralPath (Join-Path $installRoot '_internal\.model') -Raw -Encoding UTF8).Trim() | Should -Be 'qwen3.5:9b'
             $keepState = Get-Content -LiteralPath (Join-Path $installRoot '_internal\install-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
             $keepState.installationStatus | Should -Be 'Completed'
@@ -273,12 +309,11 @@ Describe 'offline-ai target-spec schema v2 package to installer E2E' -Tag 'Windo
             $keepState.models.appliedChatModel | Should -Be 'qwen3.5:9b'
             $keepState.models.placementObservation.status | Should -BeIn @('Observed', 'ModelNotLoaded', 'Unavailable')
 
-            $overwriteOutput = & $script:PowerShellHost -NoProfile -File $script:InstallOfflinePath `
+            $overwriteOutput = & $script:PowerShellHost -NoProfile -File $installFixturePath `
+                -InstallerPath $script:InstallOfflinePath `
                 -PackageRoot $packageRoot `
                 -AppInstallPath $installRoot `
-                -ModelConfigMode OverwriteDefault `
-                -SkipRunSmokeTest `
-                -SkipEmbeddingSmokeTest 2>&1
+                -ModelConfigMode OverwriteDefault 2>&1
             $overwriteText = $overwriteOutput | Out-String
             $LASTEXITCODE | Should -Be 0 -Because $overwriteText
             (Get-Content -LiteralPath (Join-Path $installRoot '_internal\.model') -Raw -Encoding UTF8).Trim() | Should -Be 'qwen3.5:4b'
@@ -290,11 +325,10 @@ Describe 'offline-ai target-spec schema v2 package to installer E2E' -Tag 'Windo
             $packageManifest.installable = $false
             [IO.File]::WriteAllText((Join-Path $packageRoot 'manifest.json'), ($packageManifest | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
             Set-PackageChecksums -PackageRoot $packageRoot
-            $rejectOutput = & $script:PowerShellHost -NoProfile -File $script:InstallOfflinePath `
+            $rejectOutput = & $script:PowerShellHost -NoProfile -File $installFixturePath `
+                -InstallerPath $script:InstallOfflinePath `
                 -PackageRoot $packageRoot `
-                -AppInstallPath $installRoot `
-                -SkipRunSmokeTest `
-                -SkipEmbeddingSmokeTest 2>&1
+                -AppInstallPath $installRoot 2>&1
             $rejectText = $rejectOutput | Out-String
             $LASTEXITCODE | Should -Be 1 -Because $rejectText
             $rejectText | Should -Match 'インストールできません'
