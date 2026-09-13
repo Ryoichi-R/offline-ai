@@ -2267,6 +2267,20 @@ class _EmbedIndex:
     norms: list[float]
 
 
+@dataclass
+class QueryContext:
+    """要求ローカルの使い捨てquery embeddingコンテキスト。
+
+    その試行で重複排除済みのqueriesと取得済みvectors、モデル識別を保持する。
+    親子展開の子選択（予算超過時の優先順位付け）専用に使い、要求終了時に
+    破棄する。ディスクや通常ログへは保存しない。
+    """
+
+    queries: list[str]
+    vectors: dict[str, list[float]]
+    embed_model: str
+
+
 def _build_embed_index(cache: dict) -> _EmbedIndex:
     """cache の entries から一度だけノルムを計算し、多クエリ一括採点用の索引を作る。"""
     entries_map = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
@@ -2285,26 +2299,26 @@ def _build_embed_index(cache: dict) -> _EmbedIndex:
     return _EmbedIndex(chunk_ids=chunk_ids, entries=entries, vectors=vectors, norms=norms)
 
 
-def embedding_search_multi(
-    queries: list[str], embed_model: str, index: _EmbedIndex, top_k: int = 8,
-    *, raise_on_error: bool = False,
-) -> dict[str, list]:
+def _embedding_search_multi_impl(
+    queries: list[str], embed_model: str, index: _EmbedIndex, top_k: int,
+    *, raise_on_error: bool,
+) -> tuple[dict[str, list], QueryContext | None]:
     """複数クエリのembeddingを1バッチで取得し、entriesを1パス走査して採点する。
 
-    戻り値は ``{query: [match, ...]}``。各クエリの結果は ``embedding_search`` を
-    個別に呼んだ場合と ``round(sim, 4)`` の桁で一致する（次元不一致entryのスキップ、
-    閾値境界、top_k切り詰めを含む）。
+    ``embedding_search_multi`` と ``embedding_search_multi_with_context`` の
+    共通実装。戻り値は ``({query: [match, ...]}, QueryContext | None)``。
+    query取得に失敗した場合や候補が無い場合は ``QueryContext`` を返さない。
     """
     unique_queries = list(dict.fromkeys(queries))
     if not unique_queries or not index.chunk_ids:
-        return {query: [] for query in queries}
+        return {query: [] for query in queries}, None
     try:
         query_vectors = _get_embeddings(unique_queries, embed_model)
     except EmbeddingBatchError as exc:
         if raise_on_error:
             raise
         print(f"[WARN] Embedding取得: {exc.code}", file=sys.stderr)
-        return {query: [] for query in queries}
+        return {query: [] for query in queries}, None
 
     query_norms = [math.sqrt(sum(v * v for v in vec)) for vec in query_vectors]
     scored_by_query: dict[str, list] = {query: [] for query in unique_queries}
@@ -2350,7 +2364,44 @@ def embedding_search_multi(
     for query in unique_queries:
         scored_by_query[query].sort(key=lambda x: x["score"], reverse=True)
         scored_by_query[query] = scored_by_query[query][:top_k]
-    return {query: scored_by_query[query] for query in queries}
+
+    context = QueryContext(
+        queries=unique_queries,
+        vectors=dict(zip(unique_queries, query_vectors)),
+        embed_model=embed_model,
+    )
+    return {query: scored_by_query[query] for query in queries}, context
+
+
+def embedding_search_multi(
+    queries: list[str], embed_model: str, index: _EmbedIndex, top_k: int = 8,
+    *, raise_on_error: bool = False,
+) -> dict[str, list]:
+    """複数クエリのembeddingを1バッチで取得し、entriesを1パス走査して採点する。
+
+    戻り値は ``{query: [match, ...]}``。各クエリの結果は ``embedding_search`` を
+    個別に呼んだ場合と ``round(sim, 4)`` の桁で一致する（次元不一致entryのスキップ、
+    閾値境界、top_k切り詰めを含む）。既存の戻り値契約を維持する公開wrapper。
+    """
+    results, _context = _embedding_search_multi_impl(
+        queries, embed_model, index, top_k, raise_on_error=raise_on_error
+    )
+    return results
+
+
+def embedding_search_multi_with_context(
+    queries: list[str], embed_model: str, index: _EmbedIndex, top_k: int = 8,
+    *, raise_on_error: bool = False,
+) -> tuple[dict[str, list], QueryContext | None]:
+    """``embedding_search_multi`` と同じ検索結果に加え、要求ローカルの
+    ``QueryContext``（重複排除済みqueriesとその取得済みvectors）を返す。
+
+    親子展開の子選択（予算超過時の優先順位付け）専用。API呼出しを二重化
+    しないよう、内部実装は ``embedding_search_multi`` と共有する。
+    """
+    return _embedding_search_multi_impl(
+        queries, embed_model, index, top_k, raise_on_error=raise_on_error
+    )
 
 
 INDEX_STATES = {
@@ -3993,6 +4044,101 @@ def _expansion_group_id(file_sha256: str, path: str, parent_heading_line: int) -
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+def _build_chunk_id_lookup(index: "_EmbedIndex") -> dict[str, int]:
+    """``_EmbedIndex.chunk_ids`` から位置を引く要求内lookup。index・共有memoは変更しない。"""
+    return {chunk_id: position for position, chunk_id in enumerate(index.chunk_ids)}
+
+
+def _max_similarity_to_context(
+    chunk_id: str,
+    chunk_lookup: dict[str, int],
+    embed_index: "_EmbedIndex",
+    query_context: QueryContext,
+) -> float | None:
+    """指定chunkの、その試行の全query vectorとの類似度の最大値を返す。
+
+    子の類似度は選択順位だけに使い、展開資格の足切りにしない（閾値なし採点）。
+    次元不一致・ゼロnorm・欠損は None（無効）として返し、呼び出し側は原文順
+    fallbackへ戻す。
+    """
+    position = chunk_lookup.get(chunk_id)
+    if position is None:
+        return None
+    vector = embed_index.vectors[position]
+    norm = embed_index.norms[position]
+    if norm == 0.0:
+        return None
+    best: float | None = None
+    for query in query_context.queries:
+        query_vector = query_context.vectors.get(query)
+        if query_vector is None or len(query_vector) != len(vector):
+            continue
+        query_norm = math.sqrt(sum(v * v for v in query_vector))
+        if query_norm == 0.0:
+            continue
+        similarity = sum(a * b for a, b in zip(query_vector, vector)) / (query_norm * norm)
+        if best is None or similarity > best:
+            best = similarity
+    return best
+
+
+def _order_ranges_for_selection(
+    child_chunks: list[dict],
+    merged_ranges: list[tuple[int, int]],
+    *,
+    query_context: QueryContext | None,
+    embed_index: "_EmbedIndex | None",
+    chunk_lookup: dict[str, int] | None,
+) -> tuple[list[tuple[int, int]], str]:
+    """予算超過時にどの範囲を優先して採用するかの順序を決める。
+
+    有効な既存クエリベクトルと子の既存ベクトルが利用できる場合、子自身の
+    類似度降順、同点は既存キーワードスコア降順、最後に原文順で選ぶ。複数
+    チャンクからなる範囲は、配下チャンクの最大類似度を選択用に使う。
+    Embedding経路が無効・失敗、または対象子のベクトルが不完全なら原文順
+    （既定の fallback）で選び、理由を返す。選択順序は採用可否だけに使い、
+    採用後の表示順序は呼び出し側が原文順へ戻す。
+    """
+    if query_context is None or embed_index is None or chunk_lookup is None:
+        return list(merged_ranges), "embedding_unavailable"
+
+    document_order = {range_: position for position, range_ in enumerate(merged_ranges)}
+    scored: list[tuple[tuple[int, int], float | None, float]] = []
+    any_valid_similarity = False
+    for range_ in merged_ranges:
+        start, end = range_
+        chunks_in_range = [
+            chunk
+            for chunk in child_chunks
+            if chunk["start_line"] >= start and chunk["end_line"] <= end
+        ]
+        best_similarity: float | None = None
+        best_keyword_score = 0.0
+        for chunk in chunks_in_range:
+            similarity = _max_similarity_to_context(
+                str(chunk.get("chunk_id", "")), chunk_lookup, embed_index, query_context
+            )
+            if similarity is not None:
+                any_valid_similarity = True
+                if best_similarity is None or similarity > best_similarity:
+                    best_similarity = similarity
+            keyword_score = float(chunk.get("keyword_score", 0) or 0)
+            if keyword_score > best_keyword_score:
+                best_keyword_score = keyword_score
+        scored.append((range_, best_similarity, best_keyword_score))
+
+    if not any_valid_similarity:
+        return list(merged_ranges), "embedding_unavailable"
+
+    def sort_key(item: tuple[tuple[int, int], float | None, float]) -> tuple[float, float, int]:
+        range_, similarity, keyword_score = item
+        similarity_value = similarity if similarity is not None else float("-inf")
+        return (-similarity_value, -keyword_score, document_order[range_])
+
+    ordered = sorted(scored, key=sort_key)
+    return [item[0] for item in ordered], ""
+
+
 def _expand_single_parent(
     parent_match: dict,
     source_chunks: list[dict],
@@ -4001,12 +4147,21 @@ def _expand_single_parent(
     memo_key: tuple | None,
     max_ranges: int,
     char_budget: int | None,
+    query_context: QueryContext | None = None,
+    embed_index: "_EmbedIndex | None" = None,
 ) -> tuple[list[dict], bool, str]:
     """1件の親candidateを展開する。戻り値は ``(展開item群, partialか, 理由)``。
 
     展開item は ``group_id`` / ``expanded_from`` / ``group_order`` を持つ、
-    通常の match と同じ形の dict。P1a は既存クエリベクトルを使わず、常に
-    原文順（chunk 開始行の昇順）で選ぶ。
+    通常の match と同じ形の dict。
+
+    選択の単位は親の「直接の子見出し」（孫を含む自身の節全体）である。
+    行範囲上は連続していても、選択候補としては別々に扱う
+    （``_source_structure.direct_child_ranges``）。予算超過時の優先順位は
+    ``_order_ranges_for_selection`` が決め、``query_context`` / ``embed_index``
+    が利用できない場合は常に原文順（見出し出現順）で選ぶ。採用された子節に
+    属する既存チャンクは、行範囲が連続するものを1つの表示範囲へまとめる
+    （表示は常に原文順）。
     """
     path = normalize_source_path(parent_match.get("path", ""))
     start_line = parent_match.get("start_line")
@@ -4031,21 +4186,47 @@ def _expand_single_parent(
         return [], False, "not_expandable"
 
     expand_start, expand_end = _source_structure.expand_range(nodes, parent_node)
-    child_chunks = _child_chunks_in_range(source_chunks, path, expand_start, expand_end)
-    if not child_chunks:
+    all_child_chunks = _child_chunks_in_range(source_chunks, path, expand_start, expand_end)
+    if not all_child_chunks:
         return [], False, "no_child_chunks"
 
-    line_ranges = [(chunk["start_line"], chunk["end_line"]) for chunk in child_chunks]
-    merged_ranges = _merge_contiguous_line_ranges(line_ranges)
+    candidate_sections = _source_structure.direct_child_ranges(nodes, parent_node)
+    if not candidate_sections:
+        candidate_sections = [(expand_start, expand_end)]
 
     group_id = _expansion_group_id(file_sha256, path, parent_node.heading_line)
     parent_chunk_id = str(parent_match.get("chunk_id") or "")
     modified_at = parent_match.get("modifiedAt", "")
 
+    chunk_lookup = _build_chunk_id_lookup(embed_index) if embed_index is not None else None
+    selection_order, _selection_reason = _order_ranges_for_selection(
+        all_child_chunks,
+        candidate_sections,
+        query_context=query_context,
+        embed_index=embed_index,
+        chunk_lookup=chunk_lookup,
+    )
+    chosen_sections = selection_order[:max_ranges]
+    partial = len(candidate_sections) > max_ranges
+
+    selected_chunks = [
+        chunk
+        for chunk in all_child_chunks
+        if any(
+            section_start <= chunk["start_line"] and chunk["end_line"] <= section_end
+            for section_start, section_end in chosen_sections
+        )
+    ]
+    # 採用された子節の表示は選択順序に関わらず常に原文順。行範囲が連続する
+    # チャンクは1つの実在範囲へまとめる（離れた子節を1つの広い start/end に
+    # 偽装しない）。
+    line_ranges = [(chunk["start_line"], chunk["end_line"]) for chunk in selected_chunks]
+    merged_ranges = _merge_contiguous_line_ranges(line_ranges)
+
     items: list[dict] = []
     used_chars = 0
-    partial = len(merged_ranges) > max_ranges
-    for order, (start, end) in enumerate(merged_ranges[:max_ranges], start=1):
+    order = 0
+    for start, end in merged_ranges:
         text = _range_text_from_lines(lines, start, end)
         if char_budget is not None:
             remaining = char_budget - used_chars
@@ -4056,6 +4237,7 @@ def _expand_single_parent(
                 text = text[:remaining]
                 partial = True
         used_chars += len(text)
+        order += 1
         items.append(
             {
                 "path": path,
@@ -4088,13 +4270,17 @@ def expand_parent_candidates(
     max_ranges_per_parent: int | None = None,
     max_total_ranges: int | None = None,
     char_budget: int | None = None,
+    query_context: QueryContext | None = None,
+    embed_index: "_EmbedIndex | None" = None,
 ) -> tuple[list[dict], list[dict]]:
     """支持判定・件数制限後の候補から、展開資格のある親candidateを展開する。
 
     戻り値は ``(expanded_items, expansion_meta)``。呼び出し順位の高い候補から
     ``max_parents`` 件まで、各展開元は ``max_ranges_per_parent`` 範囲まで、
     全体で ``max_total_ranges`` 範囲までを上限とする。直接ヒットとの重複排除
-    は行わない（呼び出し側の責務）。P1a は原文順のみを扱う。
+    は行わない（呼び出し側の責務）。``query_context`` / ``embed_index`` が
+    利用できる場合は子の類似度で予算超過時の優先順位付けを行い、利用できない
+    場合は原文順で選ぶ。
     """
     max_parents = (
         EXPANSION_MAX_PARENTS_PER_QUERY if max_parents is None else max_parents
@@ -4128,6 +4314,8 @@ def expand_parent_candidates(
             memo_key=memo_key,
             max_ranges=remaining_ranges,
             char_budget=per_parent_budget,
+            query_context=query_context,
+            embed_index=embed_index,
         )
         if not items:
             if reason and reason != "not_expandable":
@@ -4255,6 +4443,8 @@ def finalize_ranked_matches(
     source_root: Path | None = None,
     memo_key: tuple | None = None,
     char_budget: int | None = None,
+    query_context: QueryContext | None = None,
+    embed_index: "_EmbedIndex | None" = None,
 ) -> tuple[list[dict], float, str]:
     """file別上限・相対スコア足切り・親子展開・confidence算出までの決定的な後段。
 
@@ -4263,7 +4453,8 @@ def finalize_ranked_matches(
     親子展開（既定OFF・source_chunks指定時のみ）→ confidence算出。
 
     ``source_chunks`` を渡さない（既定）場合は展開ステップを一切実行せず、
-    既存呼び出し元との挙動を完全に保つ。
+    既存呼び出し元との挙動を完全に保つ。``query_context`` / ``embed_index`` は
+    展開の予算超過時に子の類似度で優先順位付けする（省略時は原文順）。
     """
     supported = filter_by_relevance_support(query, matches)
     constraint_conflict = _has_explicit_constraint_conflict(query, supported)
@@ -4288,6 +4479,8 @@ def finalize_ranked_matches(
             source_root=source_root,
             memo_key=memo_key,
             char_budget=expansion_budget,
+            query_context=query_context,
+            embed_index=embed_index,
         )
         expanded_items = _dedupe_expansion_against_direct_hits(expanded_items, limited)
         if expanded_items:
@@ -4445,9 +4638,10 @@ def run_retrieval_pipeline(
         )
         # 1-c/1-d: クエリ変体の埋め込みを1バッチで取得し、1パスで全クエリ採点する。
         precomputed_by_query: dict[str, list] = {}
+        query_context: QueryContext | None = None
         if embed_model and embed_index is not None:
             try:
-                precomputed_by_query = embedding_search_multi(
+                precomputed_by_query, query_context = embedding_search_multi_with_context(
                     queries,
                     embed_model,
                     embed_index,
@@ -4466,6 +4660,7 @@ def run_retrieval_pipeline(
                     warnings.append(route_reason)
                 logger.warning("Embedding search (multi) failed: %s", e)
                 precomputed_by_query = {}
+                query_context = None
         attempt_matches: list[dict] = []
         for search_query in queries:
             check_cancel()
@@ -4513,6 +4708,8 @@ def run_retrieval_pipeline(
             source_root=SKILL_SOURCE_DIR,
             memo_key=source_memo_key,
             char_budget=PROMPT_EVIDENCE_CHAR_LIMIT,
+            query_context=query_context if expansion_enabled else None,
+            embed_index=embed_index if expansion_enabled else None,
         )
         attempts.append(
             RetrievalAttempt(

@@ -79,7 +79,7 @@ def test_search_mode_embedding_failure_does_not_retry(monkeypatch, tmp_path):
         calls["embed"] += 1
         raise search.EmbeddingBatchError("EMBED_TRANSPORT_ERROR", "failed")
 
-    monkeypatch.setattr(search, "embedding_search_multi", fail_embedding)
+    monkeypatch.setattr(search, "embedding_search_multi_with_context", fail_embedding)
     monkeypatch.setattr(
         search,
         "build_or_update_embed_index",

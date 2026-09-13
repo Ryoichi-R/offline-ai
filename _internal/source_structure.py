@@ -179,3 +179,18 @@ def node_by_heading_line(nodes: list[HeadingNode], heading_line: int) -> Heading
         if node.heading_line == heading_line:
             return node
     return None
+
+
+def direct_child_ranges(nodes: list[HeadingNode], node: HeadingNode) -> list[tuple[int, int]]:
+    """親の直接の子見出しごとに、見出し行から自身の節の終端（孫を含む）までの
+    範囲を返す。
+
+    ``expand_range`` が配下全体を1つの連続範囲として返すのに対し、こちらは
+    「子節単位の選択」（予算超過時に子の類似度で優先順位付けする）のための
+    候補粒度を提供する。子見出し同士が行範囲上連続していても、選択の単位
+    としては別々の候補のままにする。
+    """
+    return [
+        (nodes[child_index].heading_line, nodes[child_index].section_end_line)
+        for child_index in node.children_indices
+    ]

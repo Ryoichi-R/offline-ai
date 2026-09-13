@@ -166,6 +166,39 @@ def test_expand_range_covers_all_descendants_in_document_order():
     assert end == len(text.splitlines())
 
 
+def test_direct_child_ranges_keeps_siblings_as_separate_candidates_even_when_contiguous():
+    """行範囲上連続する兄弟見出しでも、選択単位としては別々の候補のままにする。"""
+    text = "# 親\n\n## 子1\n本文1\n## 子2\n本文2\n"
+    nodes = _tree(text)
+    parent = nodes[0]
+    child1, child2 = nodes[1], nodes[2]
+
+    ranges = ss.direct_child_ranges(nodes, parent)
+
+    assert ranges == [
+        (child1.heading_line, child1.section_end_line),
+        (child2.heading_line, child2.section_end_line),
+    ]
+
+
+def test_direct_child_ranges_covers_grandchildren_within_each_child():
+    text = "# 親\n\n## 子1\n### 孫1\n本文\n## 子2\n本文2\n"
+    nodes = _tree(text)
+    parent = nodes[0]
+    child1 = nodes[1]
+
+    ranges = ss.direct_child_ranges(nodes, parent)
+
+    assert ranges[0] == (child1.heading_line, child1.section_end_line)
+    assert ranges[0][1] >= nodes[2].section_end_line  # 孫1の節も子1の範囲に含まれる
+
+
+def test_direct_child_ranges_empty_for_leaf_parent():
+    text = "# 親\n本文\n"
+    nodes = _tree(text)
+    assert ss.direct_child_ranges(nodes, nodes[0]) == []
+
+
 def test_expand_range_without_children_returns_own_body():
     text = "# 親\n本文のみ\n"
     nodes = _tree(text)
