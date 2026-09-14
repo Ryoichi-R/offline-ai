@@ -307,6 +307,8 @@ class RouteOutcome:
     attempts: int = 0
     # search の段階追跡（試行ごと、本文を含まない）。候補段階の recall 算出に使う。
     trace: list[dict] = field(default_factory=list)
+    # 検索計画の必須語（agentic-lite のみ）。展開を除いた通常根拠の再判定に使う。
+    must_find_terms: tuple[str, ...] = ()
 
 
 def build_corpus_chunks(corpus_dir: Path) -> list[dict]:
@@ -562,6 +564,9 @@ def run_agentic_lite_route(
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=len(result.attempts),
         trace=list(getattr(result, "trace", {}).get("attempts", [])),
+        must_find_terms=tuple(
+            str(term) for term in (getattr(result, "plan", {}) or {}).get("must_find_terms", []) or []
+        ),
     )
 
 
@@ -980,16 +985,24 @@ def _candidate_line_recall(ranged: list[ExpectedSource], trace: list[dict]) -> f
 def _expansion_expectation_met(question: Question, outcome: RouteOutcome) -> bool:
     """親子展開の期待（完全展開 / 部分展開）が最終根拠で満たされたか。
 
-    ``partial`` は、部分展開の item が採用され、かつ sufficient を宣言しないこと。
+    ``partial`` は、部分展開の item が採用され、かつ展開だけを理由に sufficient を
+    宣言しないこと。計画§4に合わせ、展開itemを除いた通常根拠だけで sufficient が
+    成立する場合の sufficient は許容する（通常根拠の判定を展開で妨げない）。
     ``complete`` は、展開 item が採用され、どれも部分展開でないこと。
     """
     expanded = [m for m in outcome.matches if m.get("source") == "expanded"]
     if not expanded:
         return False
     if question.expected_expansion == "partial":
-        return any(m.get("group_partial") for m in expanded) and (
-            outcome.evidence_status != "sufficient"
+        if not any(m.get("group_partial") for m in expanded):
+            return False
+        if outcome.evidence_status != "sufficient":
+            return True
+        direct_only = [m for m in outcome.matches if m.get("source") != "expanded"]
+        _, direct_status = search._calculate_confidence(
+            question.query, direct_only, list(outcome.must_find_terms)
         )
+        return direct_status == "sufficient"
     return not any(m.get("group_partial") for m in expanded)
 
 

@@ -194,6 +194,42 @@ def test_status_is_reevaluated_after_char_budget_truncation():
     assert status != "sufficient"
 
 
+def test_partial_expansion_group_does_not_create_sufficient_status():
+    """部分展開groupが独立根拠の件数やcoverageを押し上げても、それだけで sufficient にしない。
+
+    実モデル評価で、通常根拠だけなら partial の質問が、部分展開groupの追加で
+    sufficient へ上がり得ることを確認した回帰防止（計画§4）。
+    """
+    query = "データ復元の事前準備の手順を教えてください"
+    direct = {
+        "path": "doc.md",
+        "chunk_id": "doc.md#0001",
+        "heading": "データ復元手順書",
+        "start_line": 1,
+        "end_line": 4,
+        "snippet": "データ復元手順書",
+        "source": "embedding+keyword",
+        "rrf_score": 0.033,
+        "embedding_score": 0.65,
+    }
+    partial_group = _range(
+        "g",
+        1,
+        "doc.md#0002",
+        heading="第1章 事前準備",
+        snippet="復元依頼の受付 事前準備 手順 復元対象の特定 保管世代の確認",
+        group_partial=True,
+    )
+    assert search._calculate_confidence(query, [direct])[1] == "partial"
+
+    confidence, status = search._evaluate_evidence_status(
+        query, [direct, partial_group], [], constraint_conflict=False
+    )
+
+    assert status == "partial"
+    assert confidence > search._calculate_confidence(query, [direct])[0], "confidence は採用本文全体で測る"
+
+
 def test_pre_limit_conflict_survives_final_selection():
     items = _structural_items()
     items[0] = {**items[0], "constraint_conflict": True}

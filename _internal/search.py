@@ -4627,8 +4627,19 @@ def _evaluate_evidence_status(
 
     完全構造根拠による sufficient の追加経路は、展開item（source="expanded"）が
     採用根拠に残っている場合だけ成立する。矛盾信号は sufficient を partial へ下げる。
+
+    confidence は採用した本文全体（展開itemを含む）で算出する。ただし通常経路の
+    sufficient は、展開itemを除いた通常根拠だけでも sufficient が成立する場合に限る。
+    展開groupは独立根拠の件数や coverage を押し上げ得るが、完全構造根拠の条件を
+    満たさないgroupを sufficient の成立根拠に数えないため（通常根拠が sufficient の
+    ときに展開groupを追加しても partial へは落とさない）。
     """
     confidence, status = _calculate_confidence(query, matches, must_find_terms)
+    if status == "sufficient" and any(m.get("source") == "expanded" for m in matches):
+        direct_only = [m for m in matches if m.get("source") != "expanded"]
+        _, direct_status = _calculate_confidence(query, direct_only, must_find_terms)
+        if direct_status != "sufficient":
+            status = "partial"
     if (
         status != "sufficient"
         and not constraint_conflict

@@ -754,6 +754,56 @@ def test_expansion_expectation_is_scored_and_fails_acceptance(expected, matches,
     assert check["result"] == ("PASS" if met else "FAIL")
 
 
+def test_partial_expansion_expectation_allows_sufficient_from_direct_evidence_only():
+    """計画§4: 展開を除いた通常根拠だけで sufficient が成立するなら、部分展開があっても合格。"""
+    query = "一般社員の日当はいくらですか"
+    direct = [
+        {
+            "path": "a/b.md",
+            "chunk_id": "a/b.md#0001",
+            "heading": "第2条 日当",
+            "start_line": 12,
+            "end_line": 18,
+            "snippet": "出張1日あたりの日当は、一般社員で2,500円とする。",
+            "rrf_score": 0.04,
+            "source": "keyword+embedding",
+            "embedding_score": 0.8,
+        },
+        {
+            "path": "a/c.md",
+            "chunk_id": "a/c.md#0001",
+            "heading": "第3条 宿泊費",
+            "start_line": 1,
+            "end_line": 3,
+            "snippet": "宿泊費は実費精算とし、一般社員の日当とは別に扱う。",
+            "rrf_score": 0.03,
+            "source": "keyword+embedding",
+            "embedding_score": 0.75,
+        },
+    ]
+    partial = {
+        "path": "a/b.md",
+        "start_line": 20,
+        "end_line": 22,
+        "snippet": "展開本文",
+        "source": "expanded",
+        "group_id": "g",
+        "group_partial": True,
+    }
+    question = _question(query=query, expected_expansion="partial")
+    assert harness.search._calculate_confidence(query, direct)[1] == "sufficient"
+
+    allowed = harness.score_question(
+        question, _outcome(direct + [partial], evidence_status="sufficient")
+    )
+    only_expansion = harness.score_question(
+        question, _outcome(direct[:1] + [partial], evidence_status="sufficient")
+    )
+
+    assert allowed.expansion_expectation_met is True
+    assert only_expansion.expansion_expectation_met is False
+
+
 def test_holdout_failures_are_counted_separately():
     scores = [
         _completed_score(question_id="Q01", holdout=True, passed=False, retrieval_hit=False),

@@ -16,7 +16,7 @@
 | `expected_lines_retained`              | `require_expected_lines: true` の質問だけ。期待範囲が最終根拠に残り、`required_facts` が重なる抜粋に含まれるか |
 | `candidate_line_recall`                | 期待範囲のうち、支持判定・件数制限の前の検索候補（段階追跡）に入っていた割合。候補に入らない失敗と、候補にはあるが選別で落ちる失敗を分ける |
 | `expanded_irrelevant_ranges`           | 期待範囲と重ならない展開item（無関係な子）の採用数。受入閾値にはせず報告する |
-| `expansion_expectation_met`            | `expected_expansion` の質問だけ。`partial` は部分展開itemを採用し sufficient を宣言しないこと、`complete` は展開itemがどれも部分展開でないこと |
+| `expansion_expectation_met`            | `expected_expansion` の質問だけ。`partial` は部分展開itemを採用し、展開だけを理由に sufficient を宣言しないこと（展開itemを除いた通常根拠だけで sufficient が成立する場合は許容、計画§4）。`complete` は展開itemがどれも部分展開でないこと |
 | `holdout_failed`                       | `holdout: true`（上限・重みの調整に使わない保留質問）のうち FAIL した件数 |
 | `forbidden_source_hits`                | 根拠として返してはならない file を返した件数                                     |
 | `abstain_accuracy`                     | 「該当情報なし」が正解の質問を正しく扱えた割合（判定層は下記）                   |
@@ -81,7 +81,8 @@ python tests/eval/run_eval.py --routes all --repeat 3  # 非決定性の確認
 | `notes/support-meeting-notes.txt`             | sidecar なしのプレーンテキスト                           |
 | `data/office-equipment-inventory.csv`         | CSV の表。拠点列を無視すると誤答する                     |
 | `guides/incident-response-procedure.md`       | 親子展開シナリオ。見出しだけの親チャンクがヒットしても配下本文がkeyword候補に入らない節（Q11）と、質問語彙が本文と直接重なり単独ヒットする対照節（Q12/Q13）を両方含む |
-| `guides/data-restore-procedure.md`            | 親子展開の保留シナリオ。障害対応手順書と同名の見出し「第2章 復旧対応」（Q14）、子節が5つあり範囲上限で部分展開になる親（Q15）、記載のない外部委託の近接語（Q16） |
+| `guides/data-restore-procedure.md`            | 親子展開シナリオ。障害対応手順書と同名の見出し「第2章 復旧対応」（Q14、保留）、子節が5つあり範囲上限で部分展開になる親（Q15）、記載のない外部委託の近接語（Q16、保留） |
+| `guides/device-handover-procedure.md`         | 部分展開の保留シナリオ。子節が6つあり範囲上限で部分展開になる親（Q17、Q15の後継の保留質問） |
 
 ## 評価仕様
 
@@ -112,7 +113,7 @@ corpus は fixture なので file 単位の SHA-256 は記録する。これに�
 
 Q11（親のみ検索に当たり、配下本文はkeyword候補にすら入らない）はOFF時に`evidence_line_overlap = 0`（既知の取得漏れの再現）、ON時に`1.0`（展開による解消）を示す。Q11は`require_expected_lines: true`を持ち、1.1の行範囲と`required_facts`が最終根拠（件数枠の配分後の抜粋）に残らなければ質問単位でFAILとし、route受入判定にも`expected_lines_retained`（欠落0件、repeat中に1回でも欠落すればFAIL）として反映する。平均の`evidence_line_overlap`が閾値を上回っても、この欠落は相殺しない。`keyword`/`hybrid` routeは製品pipelineと同じ`select_final_evidence`で件数枠の配分と状態の再判定を行う。
 
-Q14〜Q16は、上限・重みの調整に使っていない保留質問（`holdout: true`）である。Q14は別資料の同名見出しで、障害対応手順書側の「第2章 復旧対応」の展開が`expanded_irrelevant_ranges`に1件として現れる（keyword route、2026-09-14）。必須語を持たない経路では、この展開を理由に sufficient を宣言しない。Q15は`expected_expansion: partial`で、部分展開の範囲（1.1）と必要事項が最終根拠に残り、sufficient を宣言しないことを確認する。Q16は該当なしの近接語で、関連資料が当たっても sufficient を宣言しないことを確認する。keyword route の`candidate_line_recall`はQ11・Q15で0（候補に入らず、親子展開でだけ最終根拠に届く）である。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
+Q14・Q16・Q17は、上限・重みの調整に使っていない保留質問（`holdout: true`）である。Q15は2026-09-14の実モデル評価の結果を見て判定条件（部分展開時の sufficient の扱い）と`required_facts`の表記（`所属長の承認`→`所属長`、言い換え「所属長承認済み」を許容）を見直したため保留質問から外し、後継としてQ17を追加した。Q14は別資料の同名見出しで、障害対応手順書側の「第2章 復旧対応」の展開が`expanded_irrelevant_ranges`に1件として現れる（keyword route、2026-09-14）。必須語を持たない経路では、この展開を理由に sufficient を宣言しない。Q15・Q17は`expected_expansion: partial`で、部分展開の範囲（1.1）と必要事項が最終根拠に残り、展開だけを理由に sufficient を宣言しないことを確認する。Q16は該当なしの近接語で、関連資料が当たっても sufficient を宣言しないことを確認する。keyword route の`candidate_line_recall`はQ11・Q15で0（候補に入らず、親子展開でだけ最終根拠に届く）である。Q17は質問文を作成時に一度直した（keyword経路で親見出しが候補に入らずシナリオが成立しなかったため。システムの上限・重みは変更していない）。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
 
 ## ハーネス自体の検証
 
