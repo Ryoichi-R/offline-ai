@@ -13,6 +13,7 @@
 | `evidence_coverage`                    | 期待 source のうち実際に返せた割合（複数文書比較で 0.5 等になる）                |
 | `evidence_precision`                   | 返した根拠のうち期待 source だった割合（無関係な根拠の混入量）                   |
 | `evidence_line_overlap`                | 返した根拠の行範囲が期待範囲と重なった割合（同一文書内の別条文を掴んでいないか） |
+| `expected_lines_retained`              | `require_expected_lines: true` の質問だけ。期待範囲が最終根拠に残り、`required_facts` が重なる抜粋に含まれるか |
 | `forbidden_source_hits`                | 根拠として返してはならない file を返した件数                                     |
 | `abstain_accuracy`                     | 「該当情報なし」が正解の質問を正しく扱えた割合（判定層は下記）                   |
 | `latency_ms_median` / `latency_ms_max` | 検索の応答時間                                                                   |
@@ -82,8 +83,9 @@ python tests/eval/run_eval.py --routes all --repeat 3  # 非決定性の確認
 - `answerable: true` の質問は `expected_sources` 必須
 - `answerable: false`（該当情報なし）の質問へ `expected_sources` は指定不可
 - 質問 ID の重複、行範囲の逆転、未知の `acceptance` キーは拒否
+- `require_expected_lines`（任意、真偽値）は行範囲付きの `expected_sources` を持つ質問にだけ指定可
 
-`required_facts` / `forbidden_facts` は回答生成を伴う評価のために保持している項目であり、現行の retrieval 評価では採点に使用しない。回答本文の意味単位の採点は、Phase 2 の手動受入で判定する。
+`required_facts` / `forbidden_facts` は回答生成を伴う評価のために保持している項目であり、現行の retrieval 評価では `require_expected_lines: true` の質問で最終抜粋への残存確認に `required_facts` を使う以外は採点に使用しない。回答本文の意味単位の採点は、Phase 2 の手動受入で判定する。
 
 ## receipt の秘密情報の扱い
 
@@ -99,7 +101,7 @@ corpus は fixture なので file 単位の SHA-256 は記録する。これに�
 
 既定ON（2026-09-14、E:実機でのP2比較受入結果を踏まえ利用者判断で切替。`result/offline-ai/parent-child-expansion-p2-20260913/`）。`OFFLINE_AI_PARENT_CHILD_EXPANSION=false`で無効化できる。有効時は`keyword`/`hybrid`/`agentic-lite`いずれのrouteも`finalize_ranked_matches`へcorpusのchunksと`corpus_dir`（`source_root`）を渡し、見出しだけの親candidateから配下本文への展開を行う。評価は製品`skill-source`を一切読まない契約を保つため、展開有効時は必ず固定`corpus_dir`を`source_root`として渡す（`_expansion_kwargs`）。`agentic-lite`routeでは、展開が資料の実bytesを読み直す都合上、`search.SKILL_SOURCE_DIR`自体を一時的に`corpus_dir`へ差し替える（`_isolated_agentic_inputs`）。
 
-Q11（親のみ検索に当たり、配下本文はkeyword候補にすら入らない）はOFF時に`evidence_line_overlap = 0`（既知の取得漏れの再現）、ON時に`1.0`（展開による解消）を示す。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
+Q11（親のみ検索に当たり、配下本文はkeyword候補にすら入らない）はOFF時に`evidence_line_overlap = 0`（既知の取得漏れの再現）、ON時に`1.0`（展開による解消）を示す。Q11は`require_expected_lines: true`を持ち、1.1の行範囲と`required_facts`が最終根拠（件数枠の配分後の抜粋）に残らなければ質問単位でFAILとし、route受入判定にも`expected_lines_retained`（欠落0件、repeat中に1回でも欠落すればFAIL）として反映する。平均の`evidence_line_overlap`が閾値を上回っても、この欠落は相殺しない。`keyword`/`hybrid` routeは製品pipelineと同じ`select_final_evidence`で件数枠の配分と状態の再判定を行う。Q12/Q13は質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケースで、ON/OFFいずれも`1.0`を維持する（展開が既存の直接ヒット経路を壊さないことの確認）。
 
 ## ハーネス自体の検証
 

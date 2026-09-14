@@ -99,6 +99,21 @@ def test_parse_spec_rejects_reversed_line_range():
         harness.parse_spec(data, spec_path=SPEC_PATH)
 
 
+def test_parse_spec_rejects_non_bool_require_expected_lines():
+    data = _minimal_spec()
+    data["questions"][0]["require_expected_lines"] = "yes"
+    with pytest.raises(harness.SpecError, match="require_expected_lines"):
+        harness.parse_spec(data, spec_path=SPEC_PATH)
+
+
+def test_parse_spec_requires_line_range_for_require_expected_lines():
+    data = _minimal_spec()
+    data["questions"][0]["expected_sources"][0] = {"path": "a/b.md"}
+    data["questions"][0]["require_expected_lines"] = True
+    with pytest.raises(harness.SpecError, match="行範囲付き"):
+        harness.parse_spec(data, spec_path=SPEC_PATH)
+
+
 # ---------------------------------------------------------------------------
 # 同梱の実仕様と corpus
 # ---------------------------------------------------------------------------
@@ -218,6 +233,47 @@ def test_score_question_line_overlap_is_zero_when_range_misses():
     )
     assert score.retrieval_hit is True
     assert score.evidence_line_overlap == 0.0
+
+
+def test_score_question_require_expected_lines_needs_facts_in_overlapping_excerpt():
+    """行範囲が重なっていても、必要事項が最終抜粋から消えていればFAILにする。"""
+    question = _question(require_expected_lines=True, required_facts=("3,000円",))
+    truncated = _outcome([{"path": "a/b.md", "start_line": 12, "end_line": 13, "snippet": "日当は"}])
+    retained = _outcome(
+        [{"path": "a/b.md", "start_line": 12, "end_line": 18, "snippet": "日当は3,000円"}]
+    )
+
+    missing_score = harness.score_question(question, truncated)
+    retained_score = harness.score_question(question, retained)
+
+    assert missing_score.evidence_line_overlap == 1.0
+    assert missing_score.expected_lines_retained is False
+    assert missing_score.passed is False
+    assert retained_score.expected_lines_retained is True
+    assert retained_score.passed is True
+
+
+def test_score_question_without_require_expected_lines_keeps_previous_verdict():
+    score = harness.score_question(
+        _question(required_facts=("3,000円",)),
+        _outcome([{"path": "a/b.md", "start_line": 40, "end_line": 41, "snippet": "別"}]),
+    )
+    assert score.expected_lines_retained is None
+    assert score.passed is True
+
+
+def test_evaluate_acceptance_fails_when_required_lines_missing_in_any_run():
+    missing = _completed_score(expected_lines_retained=False, passed=False)
+    retained = _completed_score(expected_lines_retained=True)
+    summaries = [
+        harness.aggregate_route([retained]),
+        harness.aggregate_route([missing]),
+        harness.aggregate_route([retained]),
+    ]
+    representative = harness._representative_summary(summaries)
+    result = harness.evaluate_acceptance(representative, {"min_retrieval_hit_rate": 0.9})
+    assert representative["expected_lines_missing"] == 1
+    assert result["verdict"] == "FAIL"
 
 
 def test_score_question_multi_document_coverage_is_partial():
@@ -433,6 +489,31 @@ def test_keyword_route_is_deterministic():
     assert first.status == harness.STATUS_COMPLETED
     assert [m["chunk_id"] for m in first.matches] == [m["chunk_id"] for m in second.matches]
     assert first.evidence_status == second.evidence_status
+
+
+@pytest.mark.parametrize("expansion, expected_pass", [("true", True), ("false", False)])
+def test_shipped_q11_fails_per_question_when_expanded_lines_are_missing(
+    monkeypatch, expansion, expected_pass
+):
+    """Q11は必要な行範囲が最終根拠に無ければ、質問単位とroute判定の両方でFAILになる。"""
+    monkeypatch.setenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", expansion)
+    spec = harness.load_spec(SPEC_PATH)
+    chunks = harness.build_corpus_chunks(spec.corpus_dir)
+    question = next(q for q in spec.questions if q.id == "Q11")
+    assert question.require_expected_lines is True
+
+    outcome = harness.run_keyword_route(question, chunks, corpus_dir=spec.corpus_dir)
+    score = harness.score_question(question, outcome)
+
+    assert score.expected_lines_retained is expected_pass
+    assert score.passed is expected_pass
+    summary = harness.aggregate_route([score])
+    check = next(
+        c
+        for c in harness.evaluate_acceptance(summary, spec.acceptance)["checks"]
+        if c["criterion"] == "expected_lines_retained"
+    )
+    assert check["result"] == ("PASS" if expected_pass else "FAIL")
 
 
 def test_hybrid_and_agentic_routes_skip_without_models():

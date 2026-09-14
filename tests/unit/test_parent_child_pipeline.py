@@ -117,17 +117,19 @@ def test_expansion_output_never_exceeds_eight_items(monkeypatch, tmp_path):
         monkeypatch.delenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", raising=False)
 
 
-def test_expansion_groups_are_not_split_by_limit(monkeypatch, tmp_path):
-    """件数上限適用時、同一groupのitemは分断されず全採用か全除外になる。"""
+def test_expansion_group_split_by_limit_marks_retained_ranges_partial():
+    """件数上限で一部の範囲を省いたgroupは、残った範囲を部分展開として記録する。"""
     items = [
-        {"path": "a.md", "start_line": 1, "end_line": 1, "group_id": None, "chunk_id": "a#1"},
-        {"path": "b.md", "start_line": 1, "end_line": 1, "group_id": "g1", "chunk_id": "g1#r01"},
-        {"path": "b.md", "start_line": 3, "end_line": 3, "group_id": "g1", "chunk_id": "g1#r02"},
-        {"path": "b.md", "start_line": 5, "end_line": 5, "group_id": "g1", "chunk_id": "g1#r03"},
+        {"path": "a.md", "start_line": 1, "end_line": 1, "chunk_id": "a#1"},
+        {"path": "b.md", "start_line": 1, "end_line": 1, "group_id": "g1", "group_order": 1},
+        {"path": "b.md", "start_line": 3, "end_line": 3, "group_id": "g1", "group_order": 2},
+        {"path": "b.md", "start_line": 5, "end_line": 5, "group_id": "g1", "group_order": 3},
     ]
-    limited = search._limit_items_preserving_groups(items, 2)
+    limited = search._allocate_evidence_slots(items, 2)
     group_items = [m for m in limited if m.get("group_id") == "g1"]
-    assert len(group_items) in (0, 3)
+    assert [m["start_line"] for m in group_items] == [1]
+    assert all(m["group_partial"] is True for m in group_items)
+    assert "group_partial" not in items[1], "入力dictを変更しない"
 
 
 def test_retry_queries_use_pre_expansion_candidates(monkeypatch, tmp_path):

@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import search  # noqa: E402  - sys.path 設定後に読み込む
 import eval_harness as harness  # noqa: E402
 
-HARNESS_VERSION = "1.2.0"
+HARNESS_VERSION = "1.3.0"
 DEFAULT_SPEC = Path(__file__).resolve().parent / "eval-spec.json"
 DEFAULT_OUT_DIR = OFFLINE_AI_ROOT / ".test-results" / "offline-ai-eval"
 
@@ -119,6 +119,7 @@ def _score_to_dict(score: harness.QuestionScore) -> dict:
         "evidence_coverage": score.evidence_coverage,
         "evidence_precision": score.evidence_precision,
         "evidence_line_overlap": score.evidence_line_overlap,
+        "expected_lines_retained": score.expected_lines_retained,
         "forbidden_source_hits": score.forbidden_source_hits,
         "abstain_correct": score.abstain_correct,
         "abstain_layer": score.abstain_layer,
@@ -222,15 +223,15 @@ def build_markdown(receipt: dict) -> str:
         lines.append("### 質問別（run 1）")
         lines.append("")
         lines.append(
-            "| ID | 区分 | 状態 | 判定 | hit | coverage | precision | line一致 | evidence_status | attempts | latency(ms) |"
+            "| ID | 区分 | 状態 | 判定 | hit | coverage | precision | line一致 | 必要範囲 | evidence_status | attempts | latency(ms) |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for question in first_run["questions"]:
             verdict = (
                 "-" if question["passed"] is None else ("PASS" if question["passed"] else "FAIL")
             )
             lines.append(
-                "| {qid} | {cat} | {st} | {v} | {hit} | {cov} | {prec} | {line} | {ev} | {attempts} | {lat} |".format(
+                "| {qid} | {cat} | {st} | {v} | {hit} | {cov} | {prec} | {line} | {retained} | {ev} | {attempts} | {lat} |".format(
                     qid=question["question_id"],
                     cat=question["category"],
                     st=question["status"],
@@ -239,6 +240,7 @@ def build_markdown(receipt: dict) -> str:
                     cov=_format_metric(question["evidence_coverage"]),
                     prec=_format_metric(question["evidence_precision"]),
                     line=_format_metric(question["evidence_line_overlap"]),
+                    retained=_format_metric(question.get("expected_lines_retained")),
                     ev=question["evidence_status"] or "-",
                     attempts=question["attempts"],
                     lat=_format_metric(question["latency_ms"]),

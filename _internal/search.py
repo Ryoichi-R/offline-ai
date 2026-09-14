@@ -3582,22 +3582,62 @@ def compute_evidence_char_limit(
     return min(limit, math.floor(evidence_token_budget * per_token))
 
 
+def _truncate_line_aligned(
+    text: str, start_line: int, max_chars: int
+) -> tuple[str, int] | None:
+    """行範囲の本文を ``max_chars`` 以内へ行単位で切り詰め、``(本文, end_line)`` を返す。
+
+    本文は ``start_line`` から始まる原資料の連続行を ``\\n`` で結合したものを前提
+    とする。引用範囲と渡した本文を一致させるため行の途中では切らず、1行も
+    収まらない場合は ``None`` を返す（呼び出し側はその範囲を採用しない）。
+    """
+    kept: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        extra = len(line) + (1 if kept else 0)
+        if used + extra > max_chars:
+            break
+        kept.append(line)
+        used += extra
+    if not kept:
+        return None
+    return "\n".join(kept), start_line + len(kept) - 1
+
+
 def _fit_prompt_budget(
     matches: list[dict], char_limit: int = PROMPT_EVIDENCE_CHAR_LIMIT
 ) -> list[dict]:
     used = 0
     fitted = []
-    for match in matches:
+    shortened_groups: set[str] = set()
+    for index, match in enumerate(matches):
         item = dict(match)
         snippet = item.get("snippet", "") or ""
         remaining = char_limit - used
         if remaining <= 0:
+            shortened_groups.update(
+                str(m["group_id"]) for m in matches[index:] if m.get("group_id")
+            )
             break
         if len(snippet) > remaining:
-            snippet = snippet[:remaining]
+            if item.get("group_id"):
+                shortened_groups.add(str(item["group_id"]))
+            if item.get("source") == "expanded" and isinstance(item.get("start_line"), int):
+                # 展開itemの本文は原資料の行範囲そのものなので、切り詰め後の
+                # 実際の行範囲へ end_line を合わせる。1行も収まらなければ採用しない。
+                truncated = _truncate_line_aligned(snippet, item["start_line"], remaining)
+                if truncated is None:
+                    continue
+                snippet, item["end_line"] = truncated
+            else:
+                snippet = snippet[:remaining]
             item["snippet"] = snippet
         used += len(snippet)
         fitted.append(item)
+    if shortened_groups:
+        for item in fitted:
+            if item.get("group_id") and str(item["group_id"]) in shortened_groups:
+                item["group_partial"] = True
     return fitted
 
 
@@ -4235,8 +4275,12 @@ def _expand_single_parent(
                 partial = True
                 break
             if len(text) > remaining:
-                text = text[:remaining]
+                # 引用範囲を実際に渡す本文へ合わせる（切り詰め前の end_line を残さない）。
                 partial = True
+                truncated = _truncate_line_aligned(text, start, remaining)
+                if truncated is None:
+                    break
+                text, end = truncated
         used_chars += len(text)
         order += 1
         items.append(
@@ -4345,34 +4389,156 @@ def expand_parent_candidates(
     return expanded_items, expansion_meta
 
 
-def _limit_items_preserving_groups(items: list[dict], limit: int) -> list[dict]:
-    """件数上限を適用する。同一 group の item は分断せず全採用/全除外を揃える。
+# Web の根拠イベント（web_services.build_evidence_event）の防御上限と揃えた、
+# 回答・検索専用の全経路で共通の平坦化後の最大件数。
+EVIDENCE_OUTPUT_MAX_ITEMS = 8
 
-    離れた複数の子節を一つの広い start/end に偽装しないという契約上、
-    group（親子展開の1親候補分の範囲群）を件数上限の途中で切ると引用が
-    矛盾する。順位順に評価し、残枠に収まる item・group だけを採用する。
+
+def final_evidence_match_limit() -> int:
+    """採用根拠の件数上限。既存設定と Web の8件上限の小さい方。"""
+    return max(1, min(RETRIEVAL_PROMPT_MATCH_LIMIT, EVIDENCE_OUTPUT_MAX_ITEMS))
+
+
+def _allocate_evidence_slots(items: list[dict], limit: int) -> list[dict]:
+    """通常根拠と展開groupへ件数枠を配分する。
+
+    展開itemを通常根拠の後ろへ単純に並べて先頭から切ると、直接ヒットが多い
+    質問で展開本文が黙って落ちる。そこで次の順に配分する。
+
+    1. 各展開groupへ先に1枠ずつ割り当てる（通常根拠があれば最低1枠は残す）。
+    2. 残枠を順位順（groupは展開元の親の直後）に配分する。通常根拠が残って
+       いる間、展開範囲の合計は ``max(group数, limit // 2)`` と
+       ``EXPANSION_MAX_TOTAL_RANGES`` の小さい方までとし、通常根拠の枠を確保する。
+    3. 通常根拠を使い切って枠が余れば、残りの展開範囲へ配分する。
+
+    group内の範囲は ``group_order``（原文順）の先頭から採用し、範囲を省いた
+    group は ``group_partial`` を立てる。入力の dict は変更しない。
     """
     if limit <= 0:
         return []
-    result: list[dict] = []
-    used = 0
-    decided_groups: set[str] = set()
+    direct: list[dict] = []
+    groups: dict[str, list[dict]] = {}
     for item in items:
+        group_id = item.get("group_id")
+        if group_id:
+            groups.setdefault(str(group_id), []).append(item)
+        else:
+            direct.append(item)
+    for group_items in groups.values():
+        group_items.sort(key=lambda m: int(m.get("group_order") or 0))
+
+    parent_position = {
+        str(m.get("chunk_id")): index for index, m in enumerate(direct) if m.get("chunk_id")
+    }
+    groups_after: dict[int, list[str]] = {}
+    for group_id, group_items in groups.items():
+        position = parent_position.get(str(group_items[0].get("expanded_from") or ""), len(direct))
+        groups_after.setdefault(position, []).append(group_id)
+    sequence: list[tuple[str, object]] = []
+    for index, item in enumerate(direct):
+        sequence.append(("item", item))
+        sequence.extend(("group", group_id) for group_id in groups_after.get(index, []))
+    sequence.extend(("group", group_id) for group_id in groups_after.get(len(direct), []))
+    ordered_groups = [value for kind, value in sequence if kind == "group"]
+
+    taken: dict[str, int] = {group_id: 0 for group_id in groups}
+    selected_direct: set[int] = set()
+    used = 0
+    first_slots = min(len(ordered_groups), max(0, limit - (1 if direct else 0)))
+    for group_id in ordered_groups[:first_slots]:
+        taken[group_id] = 1
+        used += 1
+    expansion_cap = min(EXPANSION_MAX_TOTAL_RANGES, max(first_slots, limit // 2))
+    expansion_used = used
+
+    for kind, value in sequence:
         if used >= limit:
             break
-        group_id = item.get("group_id")
-        if not group_id:
-            result.append(item)
+        if kind == "item":
+            selected_direct.add(id(value))
             used += 1
             continue
-        if group_id in decided_groups:
+        group_id = str(value)
+        while (
+            used < limit
+            and expansion_used < expansion_cap
+            and taken[group_id] < len(groups[group_id])
+        ):
+            taken[group_id] += 1
+            used += 1
+            expansion_used += 1
+    for group_id in ordered_groups:
+        while used < limit and taken[group_id] < len(groups[group_id]):
+            taken[group_id] += 1
+            used += 1
+
+    result: list[dict] = []
+    omitted_ranges = 0
+    for kind, value in sequence:
+        if kind == "item":
+            if id(value) in selected_direct:
+                result.append(value)
             continue
-        group_items = [m for m in items if m.get("group_id") == group_id]
-        decided_groups.add(group_id)
-        if used + len(group_items) <= limit:
-            result.extend(group_items)
-            used += len(group_items)
+        group_id = str(value)
+        group_items = groups[group_id]
+        count = taken[group_id]
+        omitted_ranges += len(group_items) - count
+        partial = count < len(group_items)
+        for item in group_items[:count]:
+            result.append({**item, "group_partial": True} if partial else item)
+    if omitted_ranges:
+        logger.info("親子展開: 件数上限により展開範囲 %d 件を省略した", omitted_ranges)
     return result
+
+
+def _evaluate_evidence_status(
+    query: str,
+    matches: list[dict],
+    must_find_terms: list[str] | None,
+    *,
+    constraint_conflict: bool,
+) -> tuple[float, str]:
+    """採用根拠だけで confidence と evidence_status を判定する。
+
+    完全構造根拠による sufficient の追加経路は、展開item（source="expanded"）が
+    採用根拠に残っている場合だけ成立する。矛盾信号は sufficient を partial へ下げる。
+    """
+    confidence, status = _calculate_confidence(query, matches, must_find_terms)
+    if (
+        status != "sufficient"
+        and not constraint_conflict
+        and confidence >= 0.55
+        and _has_complete_structural_evidence(matches, must_find_terms)
+    ):
+        status = "sufficient"
+    if status == "sufficient" and constraint_conflict:
+        status = "partial"
+    return confidence, status
+
+
+def select_final_evidence(
+    query: str,
+    evidence_items: list[dict],
+    *,
+    limit: int,
+    must_find_terms: list[str] | None = None,
+    char_limit: int | None = None,
+) -> tuple[list[dict], float, str]:
+    """件数枠の配分・根拠予算の適用後に、採用根拠だけで状態を再判定する。
+
+    CLI/Web/評価harnessで共通に使う最終選択。制限前に検出済みの矛盾
+    （先頭itemの ``constraint_conflict``）は、候補が件数/予算で落ちても維持する。
+    """
+    had_conflict = any(m.get("constraint_conflict") for m in evidence_items)
+    matches = _allocate_evidence_slots(evidence_items, limit)
+    if char_limit is not None:
+        matches = _fit_prompt_budget(matches, char_limit)
+    confidence, status = _evaluate_evidence_status(
+        query, matches, must_find_terms, constraint_conflict=had_conflict
+    )
+    if had_conflict and matches:
+        matches[0] = {**matches[0], "constraint_conflict": True}
+    return matches, confidence, status
 
 
 def _dedupe_expansion_against_direct_hits(
@@ -4451,7 +4617,9 @@ def finalize_ranked_matches(
 
     rerank後の順位付き候補を受け取り、`(matches, confidence, evidence_status)` を返す。
     処理順序: 支持判定 → 制限前矛盾検出 → file別上限 → 相対スコア足切り →
-    親子展開（既定OFF・source_chunks指定時のみ）→ confidence算出。
+    親子展開（有効時かつsource_chunks指定時のみ）→ confidence算出。
+    出力件数の上限はここでは適用しない。最終的な採用根拠と状態は
+    ``select_final_evidence`` で件数枠を配分した後に再判定する。
 
     ``source_chunks`` を渡さない（既定）場合は展開ステップを一切実行せず、
     既存呼び出し元との挙動を完全に保つ。``query_context`` / ``embed_index`` は
@@ -4490,17 +4658,9 @@ def finalize_ranked_matches(
                 query, expanded_items
             )
 
-    confidence, status = _calculate_confidence(query, limited, must_find_terms)
-    if (
-        status != "sufficient"
-        and expansion_enabled
-        and not constraint_conflict
-        and confidence >= 0.55
-        and _has_complete_structural_evidence(limited, must_find_terms)
-    ):
-        status = "sufficient"
-    if status == "sufficient" and constraint_conflict:
-        status = "partial"
+    confidence, status = _evaluate_evidence_status(
+        query, limited, must_find_terms, constraint_conflict=constraint_conflict
+    )
     if constraint_conflict and limited:
         limited[0] = {**limited[0], "constraint_conflict": True}
     return limited, confidence, status
@@ -4701,7 +4861,7 @@ def run_retrieval_pipeline(
         # evidence_items として毎試行 combined の同一snapshotから作り直し、
         # 再展開で件数やIDが増殖しない決定的処理にする（展開後の根拠を
         # 検索候補へ書き戻すと再統合を招くため）。
-        evidence_items, final_confidence, final_status = finalize_ranked_matches(
+        ranked_evidence, _, _ = finalize_ranked_matches(
             query,
             combined,
             must_find_terms=plan.get("must_find_terms", []),
@@ -4711,6 +4871,14 @@ def run_retrieval_pipeline(
             char_budget=PROMPT_EVIDENCE_CHAR_LIMIT,
             query_context=query_context if expansion_enabled else None,
             embed_index=embed_index if expansion_enabled else None,
+        )
+        # 継続判断は件数枠を配分した後の採用根拠で行う。上限で落ちた展開本文を
+        # 根拠に数えたまま sufficient と判定しないため。
+        evidence_items, final_confidence, final_status = select_final_evidence(
+            query,
+            ranked_evidence,
+            limit=final_evidence_match_limit(),
+            must_find_terms=plan.get("must_find_terms", []),
         )
         attempts.append(
             RetrievalAttempt(
@@ -4733,16 +4901,12 @@ def run_retrieval_pipeline(
 
     attempt_dicts = [attempt.__dict__ for attempt in attempts]
     if search_only:
-        # 回答用 prompt 予算・prompt builder を通さず、SSE防御上限と
-        # 既存の件数設定だけを適用する（既定5、最大8）。同一 group の item は
-        # 分断せず、全採用/全除外のどちらかにする。
-        matches = _limit_items_preserving_groups(
-            evidence_items, min(RETRIEVAL_PROMPT_MATCH_LIMIT, 8)
-        )
+        # 回答用 prompt 予算・prompt builder を通さない。件数枠（既定5、最大8）は
+        # ループ内の select_final_evidence で配分・状態再判定済み。
         return RetrievalResult(
             query=query,
             attempts=attempts,
-            matches=matches,
+            matches=evidence_items,
             confidence=final_confidence,
             evidence_status=final_status,
             user_prompt="",
@@ -4766,20 +4930,16 @@ def run_retrieval_pipeline(
         else 0
     )
     evidence_char_limit = compute_evidence_char_limit(shell_chars)
-    matches = _limit_items_preserving_groups(evidence_items, RETRIEVAL_PROMPT_MATCH_LIMIT)
-    matches = _fit_prompt_budget(matches, evidence_char_limit)
-    if len(matches) < len(evidence_items):
-        # 最終出力時の追加切詰め。制限前に検出済みの矛盾は維持したまま、
-        # 実際に採用した本文だけで信頼度・sufficient判定を再照合する。
-        had_conflict = bool(evidence_items and evidence_items[0].get("constraint_conflict"))
-        final_confidence, final_status = _calculate_confidence(
-            query, matches, plan.get("must_find_terms", [])
-        )
-        if had_conflict:
-            if final_status == "sufficient":
-                final_status = "partial"
-            if matches:
-                matches[0] = {**matches[0], "constraint_conflict": True}
+    # 最終出力時の根拠予算。制限前に検出済みの矛盾は維持したまま、実際に
+    # 採用した本文だけで信頼度・sufficient判定（完全構造根拠の経路を含む）を
+    # 再照合する。切り詰めが無ければループ内の判定と同じ結果になる。
+    matches, final_confidence, final_status = select_final_evidence(
+        query,
+        evidence_items,
+        limit=final_evidence_match_limit(),
+        must_find_terms=plan.get("must_find_terms", []),
+        char_limit=evidence_char_limit,
+    )
     user_prompt = build_user_prompt(
         query,
         matches,

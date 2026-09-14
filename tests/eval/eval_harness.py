@@ -103,6 +103,9 @@ class Question:
     required_facts: tuple[str, ...] = ()
     forbidden_facts: tuple[str, ...] = ()
     abstain_layer: str = ABSTAIN_LAYER_RETRIEVAL
+    # True の場合、行範囲付き expected_sources が最終根拠に残り、required_facts が
+    # その範囲と重なる抜粋に含まれていなければ質問単位で FAIL とする。
+    require_expected_lines: bool = False
     notes: str = ""
 
 
@@ -205,6 +208,15 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
             raise SpecError(f"{question_id}: abstain_layer は {ABSTAIN_LAYERS} のいずれか")
         if answerable and "abstain_layer" in raw:
             raise SpecError(f"{question_id}: answerable な質問へ abstain_layer は指定できない")
+        require_expected_lines = raw.get("require_expected_lines", False)
+        if not isinstance(require_expected_lines, bool):
+            raise SpecError(f"{question_id}: require_expected_lines は真偽値")
+        if require_expected_lines and not any(
+            e.line_start is not None and e.line_end is not None for e in expected
+        ):
+            raise SpecError(
+                f"{question_id}: require_expected_lines には行範囲付きの expected_sources が必要"
+            )
         questions.append(
             Question(
                 id=question_id,
@@ -225,6 +237,7 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
                     raw.get("forbidden_facts"), "forbidden_facts", question_id
                 ),
                 abstain_layer=abstain_layer,
+                require_expected_lines=require_expected_lines,
                 notes=str(raw.get("notes", "")).strip(),
             )
         )
@@ -306,6 +319,18 @@ def _expansion_kwargs(chunks: list[dict], corpus_dir: Path | None) -> dict:
     }
 
 
+def _finalize_route_evidence(
+    query: str, merged: list[dict], chunks: list[dict], corpus_dir: Path | None
+) -> tuple[list[dict], float, str]:
+    """製品 pipeline と同じ後段（展開 → 件数枠の配分 → 状態の再判定）を適用する。"""
+    ranked, _, _ = search.finalize_ranked_matches(
+        query, merged, **_expansion_kwargs(chunks, corpus_dir)
+    )
+    return search.select_final_evidence(
+        query, ranked, limit=search.final_evidence_match_limit()
+    )
+
+
 def run_keyword_route(
     question: Question, chunks: list[dict], *, corpus_dir: Path | None = None
 ) -> RouteOutcome:
@@ -318,15 +343,13 @@ def run_keyword_route(
         chunks=chunks,
     )
     merged = search.merge_and_filter_matches([], keyword_matches, candidate_limit=candidate_limit)
-    matches, confidence, evidence_status = search.finalize_ranked_matches(
-        question.query, merged, **_expansion_kwargs(chunks, corpus_dir)
+    matches, confidence, evidence_status = _finalize_route_evidence(
+        question.query, merged, chunks, corpus_dir
     )
     return RouteOutcome(
         route=ROUTE_KEYWORD,
         status=STATUS_COMPLETED,
-        matches=search._limit_items_preserving_groups(
-            matches, search.RETRIEVAL_PROMPT_MATCH_LIMIT
-        ),
+        matches=matches,
         confidence=confidence,
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
@@ -390,15 +413,13 @@ def run_hybrid_route(
     )
     merged = search.merge_results(keyword_matches, embed_matches, max_results=candidate_limit * 2)
     merged = search.filter_by_rrf_score(merged, search.SEARCH_MIN_RRF_SCORE)
-    matches, confidence, evidence_status = search.finalize_ranked_matches(
-        question.query, merged, **_expansion_kwargs(chunks, corpus_dir)
+    matches, confidence, evidence_status = _finalize_route_evidence(
+        question.query, merged, chunks, corpus_dir
     )
     return RouteOutcome(
         route=ROUTE_HYBRID,
         status=STATUS_COMPLETED,
-        matches=search._limit_items_preserving_groups(
-            matches, search.RETRIEVAL_PROMPT_MATCH_LIMIT
-        ),
+        matches=matches,
         confidence=confidence,
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
@@ -642,6 +663,8 @@ class QuestionScore:
     evidence_coverage: float | None = None
     evidence_precision: float | None = None
     evidence_line_overlap: float | None = None
+    # require_expected_lines の質問だけ True/False。対象外は None。
+    expected_lines_retained: bool | None = None
     forbidden_source_hits: int = 0
     abstain_correct: bool | None = None
     abstain_layer: str = ""
@@ -676,6 +699,35 @@ def redact_match(match: dict) -> dict:
     return redacted
 
 
+def _expected_lines_retained(
+    question: Question, ranged: list[ExpectedSource], matches: list[dict]
+) -> bool:
+    """行範囲付きの期待根拠がすべて最終根拠に残り、必要事項が抜粋にあるか。
+
+    各期待範囲と重なる返却根拠が1件以上必要。``required_facts`` がある場合は、
+    期待範囲と重なる根拠の抜粋（最終的に渡した本文）に全て含まれる必要がある。
+    行範囲が重なるだけで本文が切り詰められて必要記述が消えたケースを落とすため。
+    """
+    overlapping_snippets: list[str] = []
+    for expected in ranged:
+        hits = [
+            match
+            for match in matches
+            if search.normalize_source_path(match.get("path", "")) == expected.path
+            and _ranges_overlap(
+                match.get("start_line"),
+                match.get("end_line"),
+                expected.line_start,
+                expected.line_end,
+            )
+        ]
+        if not hits:
+            return False
+        overlapping_snippets.extend(str(m.get("snippet") or "") for m in hits)
+    text = "\n".join(overlapping_snippets)
+    return all(fact in text for fact in question.required_facts)
+
+
 def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
     """1質問1 route の採点。skip / error は PASS でも FAIL でもなく `None` とする。"""
     if outcome.status != STATUS_COMPLETED:
@@ -700,6 +752,7 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
     coverage: float | None = None
     precision: float | None = None
     line_overlap: float | None = None
+    expected_lines_retained: bool | None = None
     retrieval_hit: bool | None = None
     hit_at_1: bool | None = None
     abstain_correct: bool | None = None
@@ -735,6 +788,8 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
                         satisfied += 1
                         break
             line_overlap = satisfied / len(ranged)
+            if question.require_expected_lines:
+                expected_lines_retained = _expected_lines_retained(question, ranged, outcome.matches)
     elif question.abstain_layer == ABSTAIN_LAYER_RETRIEVAL:
         # corpus に一切記載がないケース。retrieval が根拠なしを返せることが要件。
         abstain_correct = outcome.evidence_status == "insufficient"
@@ -745,7 +800,11 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
         abstain_correct = outcome.evidence_status != "sufficient"
 
     if question.answerable:
-        passed = bool(retrieval_hit) and forbidden_hits == 0
+        passed = (
+            bool(retrieval_hit)
+            and forbidden_hits == 0
+            and expected_lines_retained is not False
+        )
     else:
         passed = bool(abstain_correct) and forbidden_hits == 0
 
@@ -760,6 +819,7 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
         evidence_coverage=None if coverage is None else round(coverage, 4),
         evidence_precision=None if precision is None else round(precision, 4),
         evidence_line_overlap=None if line_overlap is None else round(line_overlap, 4),
+        expected_lines_retained=expected_lines_retained,
         forbidden_source_hits=forbidden_hits,
         abstain_correct=abstain_correct,
         abstain_layer="" if question.answerable else question.abstain_layer,
@@ -808,6 +868,12 @@ def aggregate_route(scores: list[QuestionScore]) -> dict[str, Any]:
         "evidence_coverage_mean": _mean(s.evidence_coverage for s in answerable),
         "evidence_precision_mean": _mean(s.evidence_precision for s in answerable),
         "evidence_line_overlap_mean": _mean(s.evidence_line_overlap for s in answerable),
+        "expected_lines_required": sum(
+            1 for s in answerable if s.expected_lines_retained is not None
+        ),
+        "expected_lines_missing": sum(
+            1 for s in answerable if s.expected_lines_retained is False
+        ),
         "forbidden_source_hits": sum(s.forbidden_source_hits for s in completed),
         "abstain_accuracy": (
             round(sum(1 for s in unanswerable if s.abstain_correct) / len(unanswerable), 4)
@@ -868,6 +934,18 @@ def evaluate_acceptance(summary: dict[str, Any], acceptance: dict[str, float]) -
                 "result": "NOT_MEASURED"
                 if actual is None
                 else ("PASS" if actual <= acceptance[key] else "FAIL"),
+            }
+        )
+    if summary.get("expected_lines_required"):
+        # 平均 line 一致が閾値を上回っても、指定質問の必要範囲が落ちたら FAIL にする。
+        missing = summary.get("expected_lines_missing", 0)
+        checks.append(
+            {
+                "criterion": "expected_lines_retained",
+                "metric": "expected_lines_missing",
+                "threshold": 0,
+                "actual": missing,
+                "result": "PASS" if missing == 0 else "FAIL",
             }
         )
     if summary.get("answer_layer_abstain_pending"):
@@ -1012,6 +1090,10 @@ def _representative_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     for metric in ("passed", "failed", "forbidden_source_hits"):
         values = [s.get(metric, 0) for s in summaries]
         representative[metric] = int(statistics.median(values))
+    # 必要範囲の欠落は1回でも起きれば代表値へ残す（中央値で相殺しない）。
+    representative["expected_lines_missing"] = max(
+        s.get("expected_lines_missing", 0) for s in summaries
+    )
     return representative
 
 
