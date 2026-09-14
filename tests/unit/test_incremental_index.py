@@ -886,3 +886,158 @@ def test_cli_full_flag_is_passed_only_to_build(monkeypatch):
     ]
     with pytest.raises(SystemExit):
         index_cli.main(["resume", "--full"])
+
+
+# --- 検索・引用（差分更新後の検索経路） --------------------------------------
+
+
+def _fake_query_embeddings(texts, _model, **_kwargs):
+    return [_vector(text) for text in texts]
+
+
+def _current_chunks_by_id(env) -> dict[str, dict]:
+    return {chunk["chunk_id"]: chunk for chunk in search.build_source_chunks(env.src)}
+
+
+def test_search_after_incremental_update_excludes_deleted_and_old_text(env, monkeypatch):
+    """差分更新後のEmbedding検索に、削除した資料・変更前の本文が出ず、引用位置が現行資料と一致する。"""
+    env.write("a.md", "# 見出しA\n旧本文キーワード甲\n")
+    env.write("b.md", "# 見出しB\n削除予定キーワード乙\n")
+    env.build()
+
+    env.write("a.md", "# 前置き\n追加した前置き行\n\n# 見出しA\n新本文キーワード丙\n")
+    (env.src / "b.md").unlink()
+    env.build()
+
+    monkeypatch.setattr(search, "_get_embeddings", _fake_query_embeddings)
+    cache = search.load_embed_cache()
+    index = search._build_embed_index(cache)
+    current = _current_chunks_by_id(env)
+    queries = [
+        "# 見出しA\n旧本文キーワード甲",
+        "# 見出しB\n削除予定キーワード乙",
+        current["a.md#0002"]["text"],
+    ]
+    results = search.embedding_search_multi(queries, MODEL, index, top_k=10)
+
+    returned = [match for matches in results.values() for match in matches]
+    assert returned, "現行資料のentryは検索できる"
+    for match in returned:
+        assert match["path"] == "a.md"
+        assert "旧本文" not in match["snippet"] and "削除予定" not in match["snippet"]
+        chunk = current[match["chunk_id"]]
+        assert (match["start_line"], match["end_line"], match["heading"]) == (
+            chunk["start_line"],
+            chunk["end_line"],
+            chunk["heading"],
+        )
+    best = results[current["a.md#0002"]["text"]][0]
+    assert best["chunk_id"] == "a.md#0002"
+    assert (best["start_line"], best["heading"]) == (4, "見出しA")
+
+
+def test_pipeline_uses_updated_index_and_falls_back_to_keyword_when_stale(env, monkeypatch):
+    env.write("a.md", "# 手順\n差分更新で変更した本文\n")
+    env.write("b.md", "# 別資料\n削除される資料の本文\n")
+    env.build()
+    (env.src / "b.md").unlink()
+    env.build()
+    monkeypatch.setattr(search, "_get_embeddings", _fake_query_embeddings)
+    monkeypatch.setattr(search, "detect_embed_model", lambda: MODEL)
+    monkeypatch.setattr(
+        search, "_is_model_available", lambda *_a, **_k: search.ModelStatus.AVAILABLE
+    )
+
+    ready = search.run_retrieval_pipeline("差分更新で変更した本文", model="m", mode="search")
+
+    assert ready.route == "hybrid"
+    assert ready.matches and all(m["path"] == "a.md" for m in ready.matches)
+
+    env.write("a.md", "# 手順\n再構築前に外部で編集した本文\n")
+    search._invalidate_source_chunk_memo()
+    stale = search.run_retrieval_pipeline("外部で編集した本文", model="m", mode="search")
+
+    assert stale.route == "keyword"
+    assert "stale" in stale.route_reason
+    assert all("差分更新で変更した本文" not in (m.get("snippet") or "") for m in stale.matches)
+
+
+# --- 停止・障害（昇格直後・状態保存失敗） ---------------------------------------
+
+
+def test_stop_right_after_promotion_is_recovered_on_restart(env, monkeypatch):
+    """置換直後・checkpoint整理前にプロセスが止まっても、再起動時に昇格済みcacheから状態を再整合する。"""
+    _changed_sources(env)
+    coordinator = index_service.IndexCoordinator()
+    before_generation = env.cache()["generation"]
+    coordinator._persist(
+        {
+            "state": "building",
+            "job_id": "job-stopped",
+            "_allow_restart": True,
+            "_allow_generation_change": True,
+            "generation": before_generation,
+            "embed_model": MODEL,
+            "mode": "incremental",
+            "total": 2,
+            "processed": 0,
+        }
+    )
+
+    class ProcessStopped(BaseException):
+        pass
+
+    real_remove = search._remove_checkpoint_files
+
+    def stop_after_replace(*, include_state=False):
+        # 置換で昇格済みになった後の checkpoint 整理だけを「停止」させる
+        # （構築開始時の整理呼び出しは通常どおり実行する）。
+        if include_state and env.cache()["generation"] != before_generation:
+            raise ProcessStopped("stopped right after promotion")
+        return real_remove(include_state=include_state)
+
+    monkeypatch.setattr(search, "_remove_checkpoint_files", stop_after_replace)
+    with pytest.raises(ProcessStopped):
+        env.build()
+    monkeypatch.setattr(search, "_remove_checkpoint_files", real_remove)
+
+    assert env.cache()["generation"] != before_generation, "検証済み候補は昇格済み"
+    assert search.get_embed_index_status(MODEL)["state"] == "ready"
+    assert search.load_index_status()["state"] == "building", "状態ファイルは古いまま"
+
+    restarted = index_service.IndexCoordinator()
+    restarted.reconcile_orphaned_state()
+
+    assert search.load_index_status()["state"] == "ready"
+    assert search.get_embed_index_status(MODEL)["state"] == "ready"
+    env.build()
+    assert env.calls == [], "昇格済みcacheを再計算しない"
+    assert not list(env.checkpoint_path.glob("batch-*.json"))
+
+
+def test_status_save_failure_after_promotion_is_reported_and_recoverable(env, monkeypatch):
+    """昇格後の状態保存に失敗しても、検証済みcacheは保持され、失敗を記録し、次回更新で再計算しない。"""
+    _changed_sources(env)
+    real_save = index_service.save_index_status
+
+    def fail_ready_status(status):
+        if status.get("state") == "ready":
+            return False
+        return real_save(status)
+
+    monkeypatch.setattr(index_service, "save_index_status", fail_ready_status)
+    coordinator = index_service.IndexCoordinator()
+
+    assert coordinator.run_blocking() == 1
+
+    persisted = search.load_index_status()
+    assert persisted["state"] == "failed"
+    assert persisted["error_code"] == "INDEX_STATUS_PERSIST_FAILED"
+    assert search.get_embed_index_status(MODEL)["state"] == "ready"
+    assert "本文Aを変更" in {entry["text"] for entry in env.cache()["entries"].values()}
+
+    monkeypatch.setattr(index_service, "save_index_status", real_save)
+    env.calls.clear()
+    assert coordinator.run_blocking() == 0
+    assert env.calls == []
+    assert search.load_index_status()["state"] == "ready"

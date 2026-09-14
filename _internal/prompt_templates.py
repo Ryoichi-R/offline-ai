@@ -86,6 +86,23 @@ SEARCH_PLAN_SYSTEM = """\
 """
 
 
+# --- 親子展開の表示 ---
+# 見出しだけの候補から配下本文を展開した根拠の由来と、範囲を省いた部分展開の注意。
+EXPANDED_EVIDENCE_NOTE = "由来: 見出しだけの検索候補から、その見出し配下の本文を展開した根拠\n"
+PARTIAL_EXPANSION_NOTE = "部分展開: この見出しの配下には、ここに提示していない範囲がある\n"
+PARTIAL_EXPANSION_CONTRACT = (
+    "「部分展開」と表示された資料は、見出し配下の一部だけを示す。"
+    "手順・一覧・条件の全体を問われても、提示された範囲だけで全体を網羅したと述べず、"
+    "提示されていない部分がある可能性を明記してください。"
+)
+
+
+def expansion_prompt_reserve_chars(max_items: int) -> int:
+    """展開表示が prompt shell に追加し得る文字数の保守的な上限。"""
+    per_item = len(EXPANDED_EVIDENCE_NOTE) + len(PARTIAL_EXPANSION_NOTE)
+    return len(PARTIAL_EXPANSION_CONTRACT) + per_item * max(0, max_items)
+
+
 def extract_keywords_prompt(query: str) -> str:
     return f"次の質問から検索キーワードを抽出してください:\n\n{query}"
 
@@ -163,6 +180,10 @@ def build_user_prompt(
             location += f"種別: {layout_type}\n"
         if confidence_value is not None:
             location += f"parser信頼度: {confidence_value}\n"
+        if match.get("source") == "expanded":
+            location += EXPANDED_EVIDENCE_NOTE
+            if match.get("group_partial"):
+                location += PARTIAL_EXPANSION_NOTE
 
         parts.append(
             f"--- 資料 {i} ---\n"
@@ -182,5 +203,7 @@ def build_user_prompt(
         "根拠ステータスが partial または insufficient の場合は、根拠不足または該当情報なしを明示し、推測で補完しないでください。"
         "関連する資料がある場合は、回答に必ず根拠となるファイルパスを含めてください。"
     )
+    if any(m.get("source") == "expanded" and m.get("group_partial") for m in snippets):
+        parts.append(PARTIAL_EXPANSION_CONTRACT)
 
     return "\n".join(parts)

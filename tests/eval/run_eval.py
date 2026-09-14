@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import search  # noqa: E402  - sys.path 設定後に読み込む
 import eval_harness as harness  # noqa: E402
 
-HARNESS_VERSION = "1.3.0"
+HARNESS_VERSION = "1.4.0"
 DEFAULT_SPEC = Path(__file__).resolve().parent / "eval-spec.json"
 DEFAULT_OUT_DIR = OFFLINE_AI_ROOT / ".test-results" / "offline-ai-eval"
 
@@ -120,6 +122,10 @@ def _score_to_dict(score: harness.QuestionScore) -> dict:
         "evidence_precision": score.evidence_precision,
         "evidence_line_overlap": score.evidence_line_overlap,
         "expected_lines_retained": score.expected_lines_retained,
+        "candidate_line_recall": score.candidate_line_recall,
+        "expanded_irrelevant_ranges": score.expanded_irrelevant_ranges,
+        "expansion_expectation_met": score.expansion_expectation_met,
+        "holdout": score.holdout,
         "forbidden_source_hits": score.forbidden_source_hits,
         "abstain_correct": score.abstain_correct,
         "abstain_layer": score.abstain_layer,
@@ -219,21 +225,35 @@ def build_markdown(receipt: dict) -> str:
                 f"| {check['criterion']} | {check['threshold']} | {_format_metric(check['actual'])} | {check['result']} |"
             )
         lines.append("")
+        summary = report["summary"]
+        lines.append(
+            "- 保留質問: {total}件中 FAIL {failed}件 / 候補recall平均: {recall} / 無関係な展開範囲: {irrelevant}件".format(
+                total=summary.get("holdout_total", 0),
+                failed=summary.get("holdout_failed", 0),
+                recall=_format_metric(summary.get("candidate_line_recall_mean")),
+                irrelevant=summary.get("expanded_irrelevant_ranges", 0),
+            )
+        )
+        lines.append("")
         first_run = report["runs"][0]
         lines.append("### 質問別（run 1）")
         lines.append("")
         lines.append(
-            "| ID | 区分 | 状態 | 判定 | hit | coverage | precision | line一致 | 必要範囲 | evidence_status | attempts | latency(ms) |"
+            "| ID | 区分 | 保留 | 状態 | 判定 | hit | coverage | precision | line一致 | 必要範囲 | 候補recall | 無関係展開 | 展開期待 | evidence_status | attempts | latency(ms) |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("|" + " --- |" * 16)
         for question in first_run["questions"]:
             verdict = (
                 "-" if question["passed"] is None else ("PASS" if question["passed"] else "FAIL")
             )
             lines.append(
-                "| {qid} | {cat} | {st} | {v} | {hit} | {cov} | {prec} | {line} | {retained} | {ev} | {attempts} | {lat} |".format(
+                "| {qid} | {cat} | {holdout} | {st} | {v} | {hit} | {cov} | {prec} | {line} | {retained} | {recall} | {irrelevant} | {expansion} | {ev} | {attempts} | {lat} |".format(
                     qid=question["question_id"],
                     cat=question["category"],
+                    holdout="yes" if question.get("holdout") else "-",
+                    recall=_format_metric(question.get("candidate_line_recall")),
+                    irrelevant=_format_metric(question.get("expanded_irrelevant_ranges")),
+                    expansion=_format_metric(question.get("expansion_expectation_met")),
                     st=question["status"],
                     v=verdict,
                     hit=_format_metric(question["retrieval_hit"]),
@@ -263,6 +283,13 @@ def build_markdown(receipt: dict) -> str:
     lines.append(
         f"- answer probe: {'実施' if receipt.get('answer_probes') is not None else '未実施'}"
     )
+    lines.append(
+        f"- answer quality probe: {'実施' if receipt.get('answer_quality_probes') is not None else '未実施'}"
+    )
+    lines.append(
+        f"- 親子展開 ON/OFF 比較: {'実施' if receipt.get('expansion_comparison') is not None else '未実施'}"
+        f"（本評価の展開設定: {receipt['environment'].get('parent_child_expansion', 'n/a')}）"
+    )
     lines.append("")
 
     if receipt.get("answer_probes") is not None:
@@ -291,6 +318,8 @@ def build_markdown(receipt: dict) -> str:
                     )
                 )
         lines.append("")
+    lines.extend(_answer_quality_markdown(receipt))
+    lines.extend(_expansion_comparison_markdown(receipt))
     return "\n".join(lines) + "\n"
 
 
@@ -328,7 +357,97 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="answer 層の no-answer probe を本文非保存で実行",
     )
+    parser.add_argument(
+        "--measure-answer-quality",
+        action="store_true",
+        help="回答可能な質問（required_facts あり）の回答を本文非保存で検査",
+    )
+    parser.add_argument(
+        "--compare-expansion",
+        action="store_true",
+        help="親子展開 OFF/ON の両方で評価し、質問ごとの status 遷移・再検索率を比較",
+    )
     return parser.parse_args(argv)
+
+
+def _verdict_label(passed) -> str:
+    if passed is True:
+        return "PASS"
+    if passed is False:
+        return "FAIL"
+    return "NOT_MEASURED"
+
+
+def _answer_quality_markdown(receipt: dict) -> list[str]:
+    probes_by_route = receipt.get("answer_quality_probes")
+    if probes_by_route is None:
+        return []
+    lines = ["## 回答品質 probe（回答可能な質問、本文非保存）", ""]
+    lines.append(
+        "| route | question | 状態 | 判定 | retrieval status | 必要事項欠落 | 期待source引用 | 該当なし回答 | forbidden fact | transport error |"
+    )
+    lines.append("|" + " --- |" * 10)
+    for route, probes in probes_by_route.items():
+        for probe in probes:
+            lines.append(
+                f"| {route} | {probe['question_id']} | {probe['status']} | {_verdict_label(probe.get('passed'))} | "
+                f"{probe.get('retrieval_status', '')} | {probe.get('missing_required_facts', '-')} | "
+                f"{probe.get('cites_expected_source', '-')} | {probe.get('abstained', '-')} | "
+                f"{probe.get('forbidden_fact', '-')} | {probe.get('transport_error', '-')} |"
+            )
+    lines.append("")
+    return lines
+
+
+def _expansion_comparison_markdown(receipt: dict) -> list[str]:
+    comparison = receipt.get("expansion_comparison")
+    if comparison is None:
+        return []
+    lines = ["## 親子展開 OFF/ON 比較（run 1）", ""]
+    for route, item in comparison.items():
+        lines.append(f"### {route}")
+        lines.append("")
+        lines.append(
+            f"- status低下: {', '.join(item['status_down']) or 'なし'} / "
+            f"status向上: {', '.join(item['status_up']) or 'なし'}"
+        )
+        lines.append(
+            f"- 新規FAIL: {', '.join(item['newly_failed']) or 'なし'} / "
+            f"新規PASS: {', '.join(item['newly_passed']) or 'なし'}"
+        )
+        lines.append(
+            f"- 再検索発生率: OFF {_format_metric(item['off_retry_rate'])} / "
+            f"ON {_format_metric(item['on_retry_rate'])}"
+        )
+        lines.append("")
+        lines.append(
+            "| ID | OFF status | ON status | 遷移 | OFF判定 | ON判定 | OFF attempts | ON attempts | OFF line一致 | ON line一致 |"
+        )
+        lines.append("|" + " --- |" * 10)
+        for q in item["questions"]:
+            lines.append(
+                f"| {q['question_id']} | {q['off_status']} | {q['on_status']} | {q['transition']} | "
+                f"{_verdict_label(q['off_passed'])} | {_verdict_label(q['on_passed'])} | "
+                f"{q['off_attempts']} | {q['on_attempts']} | "
+                f"{_format_metric(q['off_line_overlap'])} | {_format_metric(q['on_line_overlap'])} |"
+            )
+        lines.append("")
+    return lines
+
+
+@contextmanager
+def _parent_child_expansion_env(enabled: bool):
+    """親子展開の設定を一時的に切り替え、終了時に元の環境変数へ戻す。"""
+    name = "OFFLINE_AI_PARENT_CHILD_EXPANSION"
+    original = os.environ.get(name)
+    os.environ[name] = "true" if enabled else "false"
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
 
 
 def _force_utf8_stdio() -> None:
@@ -399,6 +518,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 2
 
+    expansion_comparison = None
+    if args.compare_expansion:
+        current = search._parent_child_expansion_enabled()
+        other_label = "OFF" if current else "ON"
+        with _parent_child_expansion_env(not current):
+            other_reports = harness.run_evaluation(
+                spec,
+                routes=routes,
+                chunks=chunks,
+                embed_model=embed_model,
+                embed_cache=embed_cache,
+                chat_model=chat_model,
+                repeat=1,
+                progress=lambda text: print(f"[INFO] (展開{other_label}) {text}", file=sys.stderr),
+            )
+        if current:
+            off_reports, on_reports = other_reports, route_reports
+        else:
+            off_reports, on_reports = route_reports, other_reports
+        expansion_comparison = harness.compare_expansion_reports(off_reports, on_reports)
+
     answer_probes = None
     if args.measure_answer_layer:
         answer_probes = harness.measure_answer_layer(
@@ -411,6 +551,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         for route, probes in answer_probes.items():
             harness.apply_answer_probe_to_acceptance(route_reports[route], probes)
+
+    answer_quality_probes = None
+    if args.measure_answer_quality:
+        answer_quality_probes = harness.measure_answer_quality(
+            spec,
+            routes=routes,
+            chunks=chunks,
+            embed_model=embed_model,
+            embed_cache=embed_cache,
+            chat_model=chat_model,
+        )
+        for route, probes in answer_quality_probes.items():
+            harness.apply_answer_quality_to_acceptance(route_reports[route], probes)
 
     receipt = {
         "schema_version": "1.0",
@@ -438,11 +591,16 @@ def main(argv: list[str] | None = None) -> int:
             "model_diagnostics": diagnostics,
             "repeat": args.repeat,
             "routes_requested": list(routes),
+            "parent_child_expansion": "on" if search._parent_child_expansion_enabled() else "off",
         },
         "routes": _routes_to_dict(route_reports),
     }
     if answer_probes is not None:
         receipt["answer_probes"] = answer_probes
+    if answer_quality_probes is not None:
+        receipt["answer_quality_probes"] = answer_quality_probes
+    if expansion_comparison is not None:
+        receipt["expansion_comparison"] = expansion_comparison
 
     markdown = build_markdown(receipt)
     print(markdown)

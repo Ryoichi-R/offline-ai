@@ -230,6 +230,56 @@
             "required_facts": ["3営業日"],
             "forbidden_facts": [],
             "notes": "別の親（第3章 事後報告）配下の子節で、質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケース。第1章・第2章配下の似た構造（初動対応・復旧対応）と混同せず、展開ON/OFFの両方でline overlapが1.0を維持することを確認する。"
+        },
+        {
+            "id": "Q14",
+            "category": "parent-child-same-heading-other-document",
+            "query": "データ復元手順の復旧対応で、戻したデータの整合性はどのように検証しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "2.2 整合性の検証",
+                    "line_start": 33,
+                    "line_end": 35
+                }
+            ],
+            "required_facts": ["チェックサム"],
+            "forbidden_facts": ["切り戻し"],
+            "require_expected_lines": true,
+            "holdout": true,
+            "notes": "別資料の同名見出し。障害対応手順書とデータ復元手順書が同じ「第2章 復旧対応」を持つ。正解はデータ復元手順書2.2の本文。障害対応手順書側の同名見出しの展開は無関係な展開範囲として集計する（受入判定の閾値にはしない）。必須語を持たない経路で、別資料の展開を根拠に sufficient を宣言しないことの回帰確認を兼ねる。上限・重みの調整に使わない保留質問。"
+        },
+        {
+            "id": "Q15",
+            "category": "parent-child-partial-expansion",
+            "query": "データ復元の事前準備の手順を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "1.1 復元依頼の受付",
+                    "line_start": 7,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": ["所属長の承認"],
+            "forbidden_facts": [],
+            "require_expected_lines": true,
+            "expected_expansion": "partial",
+            "holdout": true,
+            "notes": "長い手順と例外。見出しだけの親（第1章 事前準備）の配下に5つの子節があり、1展開元あたりの範囲上限（既定4）を超えるため部分展開になる。手順全体を問う質問なので、部分展開の範囲だけで sufficient を宣言しないこと、採用範囲（1.1）と必要事項が最終根拠に残ることを確認する。上限・重みの調整に使わない保留質問。"
+        },
+        {
+            "id": "Q16",
+            "category": "parent-child-no-answer-near-miss",
+            "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": ["所属長の承認", "19時以降"],
+            "holdout": true,
+            "notes": "該当なし（近接語）。データ復元手順書は存在するが、外部委託先への依頼手順は記載がない。関連資料と親見出しが検索に当たっても sufficient を宣言しないことを確認する。上限・重みの調整に使わない保留質問。"
         }
     ]
 }

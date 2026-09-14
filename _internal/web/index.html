@@ -1173,6 +1173,11 @@ const ui = {
         this.els.searchBudget.hidden = true;
     },
 
+    _expansionLabel(item) {
+        // 親子展開（見出しだけの検索候補から配下本文を追加した根拠）の由来と部分展開の表示。
+        return item.groupPartial ? "見出し配下の本文を展開（部分展開）" : "見出し配下の本文を展開";
+    },
+
     renderEvidence(ev) {
         const items = Array.isArray(ev.items) ? ev.items : [];
         this.els.searchEvidenceList.replaceChildren();
@@ -1191,6 +1196,7 @@ const ui = {
             if (item.layoutType) metaParts.push(`種別 ${item.layoutType}`);
             if (item.parser) metaParts.push(`parser ${item.parser}`);
             if (item.source) metaParts.push(`検索 ${item.source}`);
+            if (item.groupId) metaParts.push(this._expansionLabel(item));
             const meta = document.createElement("div");
             meta.className = "evidence-meta";
             meta.textContent = metaParts.join(" / ") || "位置情報なし";
@@ -1340,6 +1346,7 @@ const ui = {
                 item.heading ? `見出し ${item.heading}` : "",
                 item.startLine !== null && item.startLine !== undefined && item.endLine !== null && item.endLine !== undefined
                     ? `行 ${item.startLine}-${item.endLine}` : "",
+                item.groupId ? this._expansionLabel(item) : "",
             ].filter(Boolean).join(" / ");
             lines.push(
                 `#### ${index + 1}. ${this._markdownMeta(item.sourceTitle || "不明な資料")}`,

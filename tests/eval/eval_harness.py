@@ -90,6 +90,7 @@ class ExpectedSource:
 ABSTAIN_LAYER_RETRIEVAL = "retrieval"
 ABSTAIN_LAYER_ANSWER = "answer"
 ABSTAIN_LAYERS = (ABSTAIN_LAYER_RETRIEVAL, ABSTAIN_LAYER_ANSWER)
+EXPECTED_EXPANSIONS = ("", "complete", "partial")
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,11 @@ class Question:
     # True の場合、行範囲付き expected_sources が最終根拠に残り、required_facts が
     # その範囲と重なる抜粋に含まれていなければ質問単位で FAIL とする。
     require_expected_lines: bool = False
+    # 親子展開の期待。"complete"（配下を完全に展開）/ "partial"（予算・範囲数で部分展開し、
+    # sufficient を宣言しない）/ ""（検査しない）。
+    expected_expansion: str = ""
+    # True の質問は上限・重みの調整に使わない保留質問として別集計する。
+    holdout: bool = False
     notes: str = ""
 
 
@@ -208,6 +214,14 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
             raise SpecError(f"{question_id}: abstain_layer は {ABSTAIN_LAYERS} のいずれか")
         if answerable and "abstain_layer" in raw:
             raise SpecError(f"{question_id}: answerable な質問へ abstain_layer は指定できない")
+        expected_expansion = str(raw.get("expected_expansion", "")).strip()
+        if expected_expansion not in EXPECTED_EXPANSIONS:
+            raise SpecError(f"{question_id}: expected_expansion は {EXPECTED_EXPANSIONS} のいずれか")
+        if expected_expansion and not answerable:
+            raise SpecError(f"{question_id}: expected_expansion は answerable な質問だけに指定できる")
+        holdout = raw.get("holdout", False)
+        if not isinstance(holdout, bool):
+            raise SpecError(f"{question_id}: holdout は真偽値")
         require_expected_lines = raw.get("require_expected_lines", False)
         if not isinstance(require_expected_lines, bool):
             raise SpecError(f"{question_id}: require_expected_lines は真偽値")
@@ -238,6 +252,8 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
                 ),
                 abstain_layer=abstain_layer,
                 require_expected_lines=require_expected_lines,
+                expected_expansion=expected_expansion,
+                holdout=holdout,
                 notes=str(raw.get("notes", "")).strip(),
             )
         )
@@ -289,6 +305,8 @@ class RouteOutcome:
     latency_ms: float = 0.0
     reason: str = ""
     attempts: int = 0
+    # search の段階追跡（試行ごと、本文を含まない）。候補段階の recall 算出に使う。
+    trace: list[dict] = field(default_factory=list)
 
 
 def build_corpus_chunks(corpus_dir: Path) -> list[dict]:
@@ -320,14 +338,18 @@ def _expansion_kwargs(chunks: list[dict], corpus_dir: Path | None) -> dict:
 
 
 def _finalize_route_evidence(
-    query: str, merged: list[dict], chunks: list[dict], corpus_dir: Path | None
+    query: str,
+    merged: list[dict],
+    chunks: list[dict],
+    corpus_dir: Path | None,
+    trace: dict | None = None,
 ) -> tuple[list[dict], float, str]:
     """製品 pipeline と同じ後段（展開 → 件数枠の配分 → 状態の再判定）を適用する。"""
     ranked, _, _ = search.finalize_ranked_matches(
-        query, merged, **_expansion_kwargs(chunks, corpus_dir)
+        query, merged, trace=trace, **_expansion_kwargs(chunks, corpus_dir)
     )
     return search.select_final_evidence(
-        query, ranked, limit=search.final_evidence_match_limit()
+        query, ranked, limit=search.final_evidence_match_limit(), trace=trace
     )
 
 
@@ -343,8 +365,9 @@ def run_keyword_route(
         chunks=chunks,
     )
     merged = search.merge_and_filter_matches([], keyword_matches, candidate_limit=candidate_limit)
+    trace: dict = {"attempt": 1}
     matches, confidence, evidence_status = _finalize_route_evidence(
-        question.query, merged, chunks, corpus_dir
+        question.query, merged, chunks, corpus_dir, trace
     )
     return RouteOutcome(
         route=ROUTE_KEYWORD,
@@ -354,6 +377,7 @@ def run_keyword_route(
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=1,
+        trace=[trace],
     )
 
 
@@ -413,8 +437,9 @@ def run_hybrid_route(
     )
     merged = search.merge_results(keyword_matches, embed_matches, max_results=candidate_limit * 2)
     merged = search.filter_by_rrf_score(merged, search.SEARCH_MIN_RRF_SCORE)
+    trace: dict = {"attempt": 1}
     matches, confidence, evidence_status = _finalize_route_evidence(
-        question.query, merged, chunks, corpus_dir
+        question.query, merged, chunks, corpus_dir, trace
     )
     return RouteOutcome(
         route=ROUTE_HYBRID,
@@ -424,6 +449,7 @@ def run_hybrid_route(
         evidence_status=evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=1,
+        trace=[trace],
     )
 
 
@@ -535,6 +561,7 @@ def run_agentic_lite_route(
         evidence_status=result.evidence_status,
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=len(result.attempts),
+        trace=list(getattr(result, "trace", {}).get("attempts", [])),
     )
 
 
@@ -622,6 +649,7 @@ def measure_answer_layer(
                 embed_model=embed_model,
                 embed_cache=embed_cache,
                 chat_model=chat_model,
+                corpus_dir=spec.corpus_dir,
             )
             route_probes.append(measure_answer_probe(question, outcome, chat_model=chat_model))
         probes[route] = route_probes
@@ -646,6 +674,198 @@ def apply_answer_probe_to_acceptance(report: dict[str, Any], probes: list[dict])
     )
 
 
+def measure_answer_quality_probe(
+    question: Question,
+    outcome: RouteOutcome,
+    *,
+    chat_model: str | None,
+) -> dict[str, Any]:
+    """回答可能な質問の回答を本文保存なしで検査する。
+
+    検査は機械的な信号に限る: 空回答でない、``required_facts`` を全て含む、
+    ``forbidden_facts`` を含まない、期待 source の path を引用する、該当情報なしと
+    答えない、接続エラーでない。意味内容の正しさの証明ではなく、特定の例示文言を
+    回答へ強制する目的にも使わない（``required_facts`` は短い必要事項に留める）。
+    """
+    base = {
+        "question_id": question.id,
+        "status": "not_measured",
+        "passed": None,
+        "retrieval_status": outcome.evidence_status,
+        "returned_count": len(outcome.matches),
+    }
+    if not question.answerable or not question.required_facts:
+        base["reason"] = "回答品質の対象外（answerable かつ required_facts あり）"
+        return base
+    if outcome.status != STATUS_COMPLETED:
+        base["reason"] = f"retrieval {outcome.status}"
+        return base
+    if not chat_model:
+        base["reason"] = "chat model が利用できない"
+        return base
+
+    prompt = build_user_prompt(
+        question.query,
+        outcome.matches,
+        evidence_status=outcome.evidence_status,
+        confidence=outcome.confidence,
+    )
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    try:
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            answer = search.stream_ollama_chat(chat_model, SYSTEM_PROMPT, prompt)
+    except Exception as exc:  # noqa: BLE001 - type only is safe for receipt
+        base.update({"status": STATUS_ERROR, "passed": False, "error_type": type(exc).__name__})
+        return base
+
+    answer_text = str(answer or "")
+    transport_error = any(
+        marker in answer_text or marker in captured_stderr.getvalue()
+        for marker in ("接続エラー", "タイムアウト", "HTTPError")
+    )
+    missing_facts = sum(1 for fact in question.required_facts if fact not in answer_text)
+    forbidden_fact = any(fact in answer_text for fact in question.forbidden_facts)
+    cites_expected = any(e.path in answer_text for e in question.expected_sources)
+    abstained = any(phrase in answer_text for phrase in ANSWER_ABSTAIN_PHRASES)
+    nonempty = bool(answer_text.strip())
+    base.update(
+        {
+            "status": "measured",
+            "passed": nonempty
+            and missing_facts == 0
+            and not forbidden_fact
+            and cites_expected
+            and not abstained
+            and not transport_error,
+            "answer_nonempty": nonempty,
+            "missing_required_facts": missing_facts,
+            "forbidden_fact": forbidden_fact,
+            "cites_expected_source": cites_expected,
+            "abstained": abstained,
+            "transport_error": transport_error,
+        }
+    )
+    return base
+
+
+def measure_answer_quality(
+    spec: EvalSpec,
+    *,
+    routes: Iterable[str],
+    chunks: list[dict],
+    embed_model: str | None = None,
+    embed_cache: dict | None = None,
+    chat_model: str | None = None,
+) -> dict[str, list[dict]]:
+    """各 route の回答可能な質問を1回ずつ回答生成して検査する。回答本文は返さない。"""
+    targets = [q for q in spec.questions if q.answerable and q.required_facts]
+    probes: dict[str, list[dict]] = {}
+    for route in routes:
+        probes[route] = [
+            measure_answer_quality_probe(
+                question,
+                run_route(
+                    route,
+                    question,
+                    chunks=chunks,
+                    embed_model=embed_model,
+                    embed_cache=embed_cache,
+                    chat_model=chat_model,
+                    corpus_dir=spec.corpus_dir,
+                ),
+                chat_model=chat_model,
+            )
+            for question in targets
+        ]
+    return probes
+
+
+def apply_answer_quality_to_acceptance(report: dict[str, Any], probes: list[dict]) -> None:
+    """回答品質 probe を route 判定へ反映する。未測定だけなら NOT_MEASURED を残す。"""
+    if not probes:
+        return
+    measured = [p for p in probes if p.get("status") in {"measured", STATUS_ERROR}]
+    failed = sum(1 for p in measured if p.get("passed") is not True)
+    report["acceptance"]["checks"].append(
+        {
+            "criterion": "answer_quality_verified",
+            "metric": "answer_quality_failed",
+            "threshold": 0,
+            "actual": failed if measured else None,
+            "result": "NOT_MEASURED"
+            if len(measured) < len(probes)
+            else ("PASS" if failed == 0 else "FAIL"),
+        }
+    )
+    results = {c["result"] for c in report["acceptance"]["checks"]}
+    report["acceptance"]["verdict"] = (
+        "FAIL" if "FAIL" in results else "NOT_MEASURED" if "NOT_MEASURED" in results else "PASS"
+    )
+
+
+_STATUS_RANK = {"insufficient": 0, "partial": 1, "sufficient": 2}
+
+
+def compare_expansion_reports(
+    off_reports: dict[str, Any], on_reports: dict[str, Any]
+) -> dict[str, Any]:
+    """親子展開 OFF/ON の評価結果を質問ごとに比較する（各 route の run 1 同士）。
+
+    status 遷移（特に sufficient→partial の低下）、合否の変化、再検索の発生率と
+    試行回数を残す。低下の理由の特定は receipt の段階追跡と併せて行う。
+    """
+    comparison: dict[str, Any] = {}
+    for route in sorted(set(off_reports) & set(on_reports)):
+        off_scores = {s.question_id: s for s in off_reports[route]["runs"][0]["scores"]}
+        on_scores = {s.question_id: s for s in on_reports[route]["runs"][0]["scores"]}
+        questions = []
+        for question_id in off_scores:
+            off, on = off_scores[question_id], on_scores.get(question_id)
+            if on is None:
+                continue
+            off_rank = _STATUS_RANK.get(off.evidence_status)
+            on_rank = _STATUS_RANK.get(on.evidence_status)
+            transition = "same"
+            if off_rank is not None and on_rank is not None and off_rank != on_rank:
+                transition = "up" if on_rank > off_rank else "down"
+            questions.append(
+                {
+                    "question_id": question_id,
+                    "off_status": off.evidence_status,
+                    "on_status": on.evidence_status,
+                    "transition": transition,
+                    "off_passed": off.passed,
+                    "on_passed": on.passed,
+                    "off_attempts": off.attempts,
+                    "on_attempts": on.attempts,
+                    "off_line_overlap": off.evidence_line_overlap,
+                    "on_line_overlap": on.evidence_line_overlap,
+                }
+            )
+
+        def retry_rate(scores: dict[str, QuestionScore]) -> float | None:
+            completed = [s for s in scores.values() if s.status == STATUS_COMPLETED]
+            if not completed:
+                return None
+            return round(sum(1 for s in completed if s.attempts > 1) / len(completed), 4)
+
+        comparison[route] = {
+            "questions": questions,
+            "status_down": [q["question_id"] for q in questions if q["transition"] == "down"],
+            "status_up": [q["question_id"] for q in questions if q["transition"] == "up"],
+            "newly_failed": [
+                q["question_id"] for q in questions if q["off_passed"] and q["on_passed"] is False
+            ],
+            "newly_passed": [
+                q["question_id"] for q in questions if q["off_passed"] is False and q["on_passed"]
+            ],
+            "off_retry_rate": retry_rate(off_scores),
+            "on_retry_rate": retry_rate(on_scores),
+        }
+    return comparison
+
+
 # ---------------------------------------------------------------------------
 # 採点
 # ---------------------------------------------------------------------------
@@ -665,6 +885,13 @@ class QuestionScore:
     evidence_line_overlap: float | None = None
     # require_expected_lines の質問だけ True/False。対象外は None。
     expected_lines_retained: bool | None = None
+    # 期待行範囲のうち、支持判定前の検索候補（trace）に入っていた割合。trace が無ければ None。
+    candidate_line_recall: float | None = None
+    # 期待行範囲と重ならない展開itemの件数（無関係な子の採用数）。
+    expanded_irrelevant_ranges: int | None = None
+    # expected_expansion の質問だけ True/False。対象外は None。
+    expansion_expectation_met: bool | None = None
+    holdout: bool = False
     forbidden_source_hits: int = 0
     abstain_correct: bool | None = None
     abstain_layer: str = ""
@@ -728,6 +955,44 @@ def _expected_lines_retained(
     return all(fact in text for fact in question.required_facts)
 
 
+def _candidate_line_recall(ranged: list[ExpectedSource], trace: list[dict]) -> float | None:
+    """期待行範囲が、いずれかの試行の検索候補（支持判定・件数制限の前）に入った割合。
+
+    失敗の分類（候補に入らない / 候補にはあるが選別で落ちる）に使う。
+    """
+    candidates = [ref for attempt in trace for ref in attempt.get("candidates", [])]
+    if not trace:
+        return None
+    satisfied = sum(
+        1
+        for expected in ranged
+        if any(
+            search.normalize_source_path(ref.get("path", "")) == expected.path
+            and _ranges_overlap(
+                ref.get("start_line"), ref.get("end_line"), expected.line_start, expected.line_end
+            )
+            for ref in candidates
+        )
+    )
+    return satisfied / len(ranged)
+
+
+def _expansion_expectation_met(question: Question, outcome: RouteOutcome) -> bool:
+    """親子展開の期待（完全展開 / 部分展開）が最終根拠で満たされたか。
+
+    ``partial`` は、部分展開の item が採用され、かつ sufficient を宣言しないこと。
+    ``complete`` は、展開 item が採用され、どれも部分展開でないこと。
+    """
+    expanded = [m for m in outcome.matches if m.get("source") == "expanded"]
+    if not expanded:
+        return False
+    if question.expected_expansion == "partial":
+        return any(m.get("group_partial") for m in expanded) and (
+            outcome.evidence_status != "sufficient"
+        )
+    return not any(m.get("group_partial") for m in expanded)
+
+
 def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
     """1質問1 route の採点。skip / error は PASS でも FAIL でもなく `None` とする。"""
     if outcome.status != STATUS_COMPLETED:
@@ -753,6 +1018,9 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
     precision: float | None = None
     line_overlap: float | None = None
     expected_lines_retained: bool | None = None
+    candidate_line_recall: float | None = None
+    expanded_irrelevant_ranges: int | None = None
+    expansion_expectation_met: bool | None = None
     retrieval_hit: bool | None = None
     hit_at_1: bool | None = None
     abstain_correct: bool | None = None
@@ -790,6 +1058,24 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
             line_overlap = satisfied / len(ranged)
             if question.require_expected_lines:
                 expected_lines_retained = _expected_lines_retained(question, ranged, outcome.matches)
+            candidate_line_recall = _candidate_line_recall(ranged, outcome.trace)
+            expanded_irrelevant_ranges = sum(
+                1
+                for match in outcome.matches
+                if match.get("source") == "expanded"
+                and not any(
+                    search.normalize_source_path(match.get("path", "")) == expected.path
+                    and _ranges_overlap(
+                        match.get("start_line"),
+                        match.get("end_line"),
+                        expected.line_start,
+                        expected.line_end,
+                    )
+                    for expected in ranged
+                )
+            )
+        if question.expected_expansion:
+            expansion_expectation_met = _expansion_expectation_met(question, outcome)
     elif question.abstain_layer == ABSTAIN_LAYER_RETRIEVAL:
         # corpus に一切記載がないケース。retrieval が根拠なしを返せることが要件。
         abstain_correct = outcome.evidence_status == "insufficient"
@@ -804,6 +1090,7 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
             bool(retrieval_hit)
             and forbidden_hits == 0
             and expected_lines_retained is not False
+            and expansion_expectation_met is not False
         )
     else:
         passed = bool(abstain_correct) and forbidden_hits == 0
@@ -820,6 +1107,12 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
         evidence_precision=None if precision is None else round(precision, 4),
         evidence_line_overlap=None if line_overlap is None else round(line_overlap, 4),
         expected_lines_retained=expected_lines_retained,
+        candidate_line_recall=None
+        if candidate_line_recall is None
+        else round(candidate_line_recall, 4),
+        expanded_irrelevant_ranges=expanded_irrelevant_ranges,
+        expansion_expectation_met=expansion_expectation_met,
+        holdout=question.holdout,
         forbidden_source_hits=forbidden_hits,
         abstain_correct=abstain_correct,
         abstain_layer="" if question.answerable else question.abstain_layer,
@@ -874,6 +1167,16 @@ def aggregate_route(scores: list[QuestionScore]) -> dict[str, Any]:
         "expected_lines_missing": sum(
             1 for s in answerable if s.expected_lines_retained is False
         ),
+        "candidate_line_recall_mean": _mean(s.candidate_line_recall for s in answerable),
+        "expanded_irrelevant_ranges": sum(s.expanded_irrelevant_ranges or 0 for s in answerable),
+        "expansion_expectation_required": sum(
+            1 for s in answerable if s.expansion_expectation_met is not None
+        ),
+        "expansion_expectation_failed": sum(
+            1 for s in answerable if s.expansion_expectation_met is False
+        ),
+        "holdout_total": sum(1 for s in completed if s.holdout),
+        "holdout_failed": sum(1 for s in completed if s.holdout and s.passed is False),
         "forbidden_source_hits": sum(s.forbidden_source_hits for s in completed),
         "abstain_accuracy": (
             round(sum(1 for s in unanswerable if s.abstain_correct) / len(unanswerable), 4)
@@ -946,6 +1249,17 @@ def evaluate_acceptance(summary: dict[str, Any], acceptance: dict[str, float]) -
                 "threshold": 0,
                 "actual": missing,
                 "result": "PASS" if missing == 0 else "FAIL",
+            }
+        )
+    if summary.get("expansion_expectation_required"):
+        failed = summary.get("expansion_expectation_failed", 0)
+        checks.append(
+            {
+                "criterion": "expansion_expectation_met",
+                "metric": "expansion_expectation_failed",
+                "threshold": 0,
+                "actual": failed,
+                "result": "PASS" if failed == 0 else "FAIL",
             }
         )
     if summary.get("answer_layer_abstain_pending"):
@@ -1074,6 +1388,7 @@ _STABILITY_METRICS = (
     "evidence_coverage_mean",
     "evidence_precision_mean",
     "evidence_line_overlap_mean",
+    "candidate_line_recall_mean",
     "abstain_accuracy",
     "latency_ms_median",
 )
@@ -1090,10 +1405,15 @@ def _representative_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     for metric in ("passed", "failed", "forbidden_source_hits"):
         values = [s.get(metric, 0) for s in summaries]
         representative[metric] = int(statistics.median(values))
-    # 必要範囲の欠落は1回でも起きれば代表値へ残す（中央値で相殺しない）。
-    representative["expected_lines_missing"] = max(
-        s.get("expected_lines_missing", 0) for s in summaries
-    )
+    # 必要範囲の欠落・展開期待の不一致・保留質問の失敗・無関係な展開は、1回でも
+    # 起きれば代表値へ残す（中央値で相殺しない）。
+    for metric in (
+        "expected_lines_missing",
+        "expansion_expectation_failed",
+        "holdout_failed",
+        "expanded_irrelevant_ranges",
+    ):
+        representative[metric] = max(s.get(metric, 0) for s in summaries)
     return representative
 
 

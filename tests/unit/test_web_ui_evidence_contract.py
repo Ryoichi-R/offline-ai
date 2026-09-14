@@ -45,6 +45,22 @@ def test_index_ui_exposes_incremental_preview_and_explicit_full_rebuild():
     assert "全件再構築" in html
 
 
+def test_evidence_list_and_markdown_mark_expanded_and_partial_evidence():
+    """親子展開の由来と部分展開を、根拠一覧とMarkdown保存の両方に表示する。"""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert (
+        'return item.groupPartial ? "見出し配下の本文を展開（部分展開）" : "見出し配下の本文を展開";'
+        in html
+    )
+    render_start = html.index("    renderEvidence(ev) {")
+    render_end = html.index("\n    },", render_start)
+    assert "if (item.groupId) metaParts.push(this._expansionLabel(item));" in html[render_start:render_end]
+    save_start = html.index("    saveMarkdown()")
+    save_end = html.index("    cancelSearch()", save_start)
+    assert 'item.groupId ? this._expansionLabel(item) : ""' in html[save_start:save_end]
+
+
 @pytest.mark.parametrize("transition", ["new-view", "close", "new-search"])
 @pytest.mark.parametrize("stale_error", [False, True])
 def test_late_view_response_cannot_replace_current_view_or_focus(transition, stale_error):

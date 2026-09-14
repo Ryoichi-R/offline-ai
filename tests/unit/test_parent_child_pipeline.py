@@ -174,68 +174,139 @@ def test_retry_queries_use_pre_expansion_candidates(monkeypatch, tmp_path):
         monkeypatch.delenv("OFFLINE_AI_PARENT_CHILD_EXPANSION", raising=False)
 
 
+def _structural_matches(snippet, *, partial=False, parent_heading="詳細手順", required=None):
+    parent = {
+        "path": "doc.md",
+        "chunk_id": "doc.md#0001",
+        "heading": parent_heading,
+        "start_line": 1,
+        "end_line": 1,
+        "snippet": parent_heading,
+        "source": "keyword",
+    }
+    expanded = {
+        "path": "doc.md",
+        "chunk_id": "g1#r01",
+        "heading": parent_heading,
+        "start_line": 3,
+        "end_line": 3,
+        "snippet": snippet,
+        "source": "expanded",
+        "group_id": "g1",
+        "expanded_from": "doc.md#0001",
+        "group_order": 1,
+        "group_partial": partial,
+        "group_required_ranges": required if required is not None else [[3, 3]],
+    }
+    return [parent, expanded]
+
+
 def test_sufficient_upgrade_requires_complete_expansion_and_terms():
-    """完全展開1件・must_find_terms全充足・矛盾なしでsufficientを許容する。"""
-    matches = [
-        {
-            "path": "doc.md",
-            "chunk_id": "g1#r01",
-            "heading": "詳細",
-            "start_line": 3,
-            "end_line": 3,
-            "snippet": "必須語Aと必須語Bを含む本文です。関連する説明も十分にあります。",
-            "source": "expanded",
-            "group_id": "g1",
-            "group_partial": False,
-        }
-    ]
-    assert search._has_complete_structural_evidence(matches, ["必須語A", "必須語B"]) is True
+    """完全展開1件・親の語彙一致・配下の全行・must_find_terms全充足で完全構造根拠になる。"""
+    matches = _structural_matches("必須語Aと必須語Bを含む本文です。関連する説明も十分にあります。")
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is True
 
 
 def test_sufficient_upgrade_rejected_when_terms_missing():
-    matches = [
-        {
-            "path": "doc.md",
-            "chunk_id": "g1#r01",
-            "heading": "詳細",
-            "start_line": 3,
-            "end_line": 3,
-            "snippet": "必須語Aだけを含む本文です。",
-            "source": "expanded",
-            "group_id": "g1",
-            "group_partial": False,
-        }
-    ]
-    assert search._has_complete_structural_evidence(matches, ["必須語A", "必須語B"]) is False
+    matches = _structural_matches("必須語Aだけを含む本文です。")
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is False
 
 
 def test_sufficient_upgrade_rejected_when_partial():
-    matches = [
-        {
-            "path": "doc.md",
-            "chunk_id": "g1#r01",
-            "heading": "詳細",
-            "start_line": 3,
-            "end_line": 3,
-            "snippet": "必須語Aと必須語Bを含む本文。",
-            "source": "expanded",
-            "group_id": "g1",
-            "group_partial": True,
-        }
-    ]
-    assert search._has_complete_structural_evidence(matches, ["必須語A", "必須語B"]) is False
+    matches = _structural_matches("必須語Aと必須語Bを含む本文。", partial=True)
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is False
+
+
+def test_sufficient_upgrade_rejected_without_must_find_terms():
+    """必須語が無いと親の語彙一致と完全展開だけになるため、完全構造根拠にしない。
+
+    別資料の同名見出し（例: 障害対応手順書とデータ復元手順書の「第2章 復旧対応」）の
+    展開で sufficient を宣言した事例の回帰防止。
+    """
+    matches = _structural_matches("必須語Aと必須語Bを含む本文。")
+    assert search._has_complete_structural_evidence("詳細手順を教えて", matches, []) is False
+    assert search._has_complete_structural_evidence("詳細手順を教えて", matches, None) is False
+
+
+def test_sufficient_upgrade_rejected_without_parent_lexical_support():
+    """親見出しが質問と語彙一致しない（意味近接だけの）場合は完全構造根拠にしない。"""
+    matches = _structural_matches("必須語Aと必須語Bを含む本文。", parent_heading="別の話題")
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is False
+
+
+def test_sufficient_upgrade_rejected_when_parent_is_not_adopted():
+    matches = _structural_matches("必須語Aと必須語Bを含む本文。")[1:]
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is False
+
+
+def test_sufficient_upgrade_rejected_when_body_lines_are_not_covered():
+    """配下の非空行の一部が採用根拠の行範囲に無ければ、partial印が無くても不完全とする。"""
+    matches = _structural_matches("必須語Aと必須語Bを含む本文。", required=[[3, 3], [5, 6]])
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+    ) is False
+    covering_direct = {
+        "path": "doc.md",
+        "chunk_id": "doc.md#0003",
+        "start_line": 5,
+        "end_line": 6,
+        "snippet": "直接ヒットした残りの本文",
+        "source": "keyword",
+    }
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches + [covering_direct], ["必須語A", "必須語B"]
+    ) is True
+    truncated_direct = {**covering_direct, "snippet_truncated": True}
+    assert search._has_complete_structural_evidence(
+        "詳細手順を教えて", matches + [truncated_direct], ["必須語A", "必須語B"]
+    ) is False
 
 
 def test_direct_hit_overlapping_expansion_range_is_deduped():
+    """直接ヒットと重なる行だけを展開から除き、残りを連続範囲として残す。"""
     direct = [
         {"path": "doc.md", "start_line": 3, "end_line": 4, "chunk_id": "doc.md#0002"},
     ]
     expanded = [
-        {"path": "doc.md", "start_line": 3, "end_line": 4, "chunk_id": "g1#r01", "group_id": "g1"},
-        {"path": "doc.md", "start_line": 6, "end_line": 7, "chunk_id": "g1#r02", "group_id": "g1"},
+        {
+            "path": "doc.md",
+            "start_line": 1,
+            "end_line": 7,
+            "snippet": "l1\nl2\nl3\nl4\n\nl6\nl7",
+            "chunk_id": "g1#r01",
+            "group_id": "g1",
+            "group_order": 1,
+        },
     ]
-    kept = search._dedupe_expansion_against_direct_hits(expanded, direct)
-    assert [item["chunk_id"] for item in kept] == ["g1#r02"]
+    kept, updated_direct, removed = search._dedupe_expansion_against_direct_hits(expanded, direct)
+    assert [(m["start_line"], m["end_line"], m["snippet"]) for m in kept] == [
+        (1, 2, "l1\nl2"),
+        (5, 7, "\nl6\nl7"),
+    ]
+    assert [m["chunk_id"] for m in kept] == ["g1#r01", "g1#r02"]
+    assert updated_direct[0]["expanded_overlap_groups"] == ["g1"]
+    assert "expanded_overlap_groups" not in direct[0], "入力dictを変更しない"
+    assert removed and removed[0]["reason"] == "overlaps_direct_hit"
+
+
+def test_fully_overlapped_expansion_range_is_removed():
+    direct = [{"path": "doc.md", "start_line": 3, "end_line": 4, "chunk_id": "doc.md#0002"}]
+    expanded = [
+        {"path": "doc.md", "start_line": 3, "end_line": 4, "snippet": "a\nb", "chunk_id": "g1#r01", "group_id": "g1"},
+        {"path": "doc.md", "start_line": 6, "end_line": 7, "snippet": "c\nd", "chunk_id": "g1#r02", "group_id": "g1"},
+    ]
+    kept, _direct, _removed = search._dedupe_expansion_against_direct_hits(expanded, direct)
+    assert [(m["start_line"], m["chunk_id"]) for m in kept] == [(6, "g1#r01")]
 
 
 def test_parent_without_relevance_support_is_not_expanded(monkeypatch, tmp_path):

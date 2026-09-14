@@ -51,6 +51,23 @@ def test_cli_evidence_summary_includes_location_source_and_warning():
     assert "行 10-14" in summary
     assert "検索 keyword+embedding+rerank" in summary
     assert "OCR confidence is low" in summary
+    assert "見出し配下の本文を展開" not in summary
+
+
+def test_cli_evidence_summary_marks_expanded_and_partial_evidence():
+    base = {"path": "docs/sample.md", "heading": "手順", "start_line": 3, "end_line": 9}
+    summary = build_evidence_summary(
+        [
+            {**base, "source": "expanded", "group_id": "g1", "group_partial": False},
+            {**base, "source": "expanded", "group_id": "g2", "group_partial": True},
+        ],
+        evidence_status="partial",
+        confidence=0.5,
+    )
+
+    lines = summary.splitlines()
+    assert lines[1].endswith("見出し配下の本文を展開")
+    assert lines[2].endswith("見出し配下の本文を展開（部分展開）")
 
 
 def test_prompt_contract_checks_all_query_constraints_before_reusing_values():

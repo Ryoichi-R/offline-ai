@@ -161,8 +161,9 @@ def _structural_items():
         "source": "keyword",
         "rrf_score": 0.05,
     }
-    first = _range("g", 1, "doc.md#0001", snippet="障害対応手順の初動")
-    second = _range("g", 2, "doc.md#0001", snippet="連絡網で通報する")
+    required = {"group_required_ranges": [[10, 12], [20, 22]]}
+    first = _range("g", 1, "doc.md#0001", snippet="障害対応手順の初動", **required)
+    second = _range("g", 2, "doc.md#0001", snippet="連絡網で通報する", **required)
     return [parent, first, second]
 
 

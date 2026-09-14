@@ -45,6 +45,7 @@ from prompt_templates import (
     SEARCH_PLAN_SYSTEM,
     SYSTEM_PROMPT,
     build_user_prompt,
+    expansion_prompt_reserve_chars,
     extract_keywords_prompt,
     search_plan_prompt,
 )
@@ -280,6 +281,9 @@ class RetrievalResult:
     embedding_model: str | None = None
     route_reason: str = ""
     warnings: list[str] = field(default_factory=list)
+    # 候補→支持判定・件数制限→展開→最終採用の段階追跡（本文を含まない）。
+    # ``{"attempts": [...], "final": {...}}``。通常ログへは出力しない。
+    trace: dict = field(default_factory=dict)
 
 
 def normalize_source_path(path: str | Path) -> str:
@@ -3540,7 +3544,10 @@ def _estimate_prompt_shell_chars(
         )
     except Exception:
         shell = query
-    return len(SYSTEM_PROMPT) + len(shell)
+    # 根拠ごとの展開由来・部分展開の表示は根拠を空にした shell 見積りに現れないため、
+    # 件数上限分の保守的な固定値を予約する（予算と表示状態の循環依存を避ける）。
+    reserve = expansion_prompt_reserve_chars(EVIDENCE_OUTPUT_MAX_ITEMS)
+    return len(SYSTEM_PROMPT) + len(shell) + reserve
 
 
 def compute_evidence_char_limit(
@@ -3631,13 +3638,18 @@ def _fit_prompt_budget(
                 snippet, item["end_line"] = truncated
             else:
                 snippet = snippet[:remaining]
+                # 通常チャンクの行範囲は変えないため、完全性判定に使わないよう印を付ける。
+                item["snippet_truncated"] = True
             item["snippet"] = snippet
         used += len(snippet)
         fitted.append(item)
     if shortened_groups:
-        for item in fitted:
-            if item.get("group_id") and str(item["group_id"]) in shortened_groups:
-                item["group_partial"] = True
+        fitted = [
+            _mark_group_partial(item, "char_budget")
+            if item.get("group_id") and str(item["group_id"]) in shortened_groups
+            else item
+            for item in fitted
+        ]
     return fitted
 
 
@@ -4180,6 +4192,38 @@ def _order_ranges_for_selection(
     return [item[0] for item in ordered], ""
 
 
+def _non_blank_line_runs(
+    lines: list[str], start_line: int, end_line: int
+) -> list[tuple[int, int]]:
+    """行範囲内で、空行で区切られた非空行の連続範囲を返す（1-indexed, inclusive）。"""
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for line_no in range(start_line, end_line + 1):
+        blank = line_no - 1 >= len(lines) or not lines[line_no - 1].strip()
+        if blank:
+            if run_start is not None:
+                runs.append((run_start, line_no - 1))
+                run_start = None
+        elif run_start is None:
+            run_start = line_no
+    if run_start is not None:
+        runs.append((run_start, end_line))
+    return runs
+
+
+def _ranges_cover(required: list, covered: list[tuple[int, int]]) -> bool:
+    """``required`` の各行範囲が ``covered`` の和集合に完全に含まれるか。"""
+    merged = _merge_contiguous_line_ranges(sorted(covered))
+    for start, end in required:
+        if not any(c_start <= start and end <= c_end for c_start, c_end in merged):
+            return False
+    return True
+
+
+# 完全性判定用に保持する非空行runの上限。超える場合は完全性を検証しない（不完全扱い）。
+_EXPANSION_REQUIRED_RUNS_LIMIT = 500
+
+
 def _expand_single_parent(
     parent_match: dict,
     source_chunks: list[dict],
@@ -4198,11 +4242,12 @@ def _expand_single_parent(
 
     選択の単位は親の「直接の子見出し」（孫を含む自身の節全体）である。
     行範囲上は連続していても、選択候補としては別々に扱う
-    （``_source_structure.direct_child_ranges``）。予算超過時の優先順位は
-    ``_order_ranges_for_selection`` が決め、``query_context`` / ``embed_index``
-    が利用できない場合は常に原文順（見出し出現順）で選ぶ。採用された子節に
-    属する既存チャンクは、行範囲が連続するものを1つの表示範囲へまとめる
-    （表示は常に原文順）。
+    （``_source_structure.direct_child_ranges``）。範囲数・文字予算を超える場合の
+    優先順位は ``_order_ranges_for_selection`` が決め、``query_context`` /
+    ``embed_index`` が利用できない場合は原文順（見出し出現順）で選ぶ。採用された
+    子節に属する既存チャンクは、行範囲が連続するものを1つの表示範囲へまとめる
+    （表示は常に原文順）。各itemの ``group_priority`` は選択順位（1が最優先）で、
+    後段の件数枠配分でも同じ順位を使う。
     """
     path = normalize_source_path(parent_match.get("path", ""))
     start_line = parent_match.get("start_line")
@@ -4230,6 +4275,14 @@ def _expand_single_parent(
     all_child_chunks = _child_chunks_in_range(source_chunks, path, expand_start, expand_end)
     if not all_child_chunks:
         return [], False, "no_child_chunks"
+    # 構造を読んだbytesと、検索に使ったchunk snapshotが同じ資料世代か確認する
+    # （親候補にhashが無い場合でも、旧chunkと新しい行範囲を混在させない）。
+    if any(
+        chunk.get("file_sha256")
+        and str(chunk["file_sha256"]).lower() != file_sha256.lower()
+        for chunk in all_child_chunks
+    ):
+        return [], False, "source_changed"
 
     candidate_sections = _source_structure.direct_child_ranges(nodes, parent_node)
     if not candidate_sections:
@@ -4248,7 +4301,10 @@ def _expand_single_parent(
         chunk_lookup=chunk_lookup,
     )
     chosen_sections = selection_order[:max_ranges]
-    partial = len(candidate_sections) > max_ranges
+    partial_reasons: list[str] = []
+    if len(candidate_sections) > max_ranges:
+        partial_reasons.append("range_limit")
+    section_priority = {section: index for index, section in enumerate(chosen_sections)}
 
     selected_chunks = [
         chunk
@@ -4264,25 +4320,60 @@ def _expand_single_parent(
     line_ranges = [(chunk["start_line"], chunk["end_line"]) for chunk in selected_chunks]
     merged_ranges = _merge_contiguous_line_ranges(line_ranges)
 
-    items: list[dict] = []
+    def range_priority(range_: tuple[int, int]) -> int:
+        start, end = range_
+        overlapping = [
+            priority
+            for (section_start, section_end), priority in section_priority.items()
+            if section_start <= end and start <= section_end
+        ]
+        return min(overlapping) if overlapping else len(section_priority)
+
+    # 文字予算は選択順位の高い範囲から割り当て、表示は原文順へ戻す。
+    adopted: dict[tuple[int, int], tuple[str, int, int]] = {}
     used_chars = 0
-    order = 0
-    for start, end in merged_ranges:
+    for range_ in sorted(merged_ranges, key=lambda r: (range_priority(r), r[0])):
+        start, end = range_
         text = _range_text_from_lines(lines, start, end)
         if char_budget is not None:
             remaining = char_budget - used_chars
             if remaining <= 0:
-                partial = True
+                if "char_budget" not in partial_reasons:
+                    partial_reasons.append("char_budget")
                 break
             if len(text) > remaining:
                 # 引用範囲を実際に渡す本文へ合わせる（切り詰め前の end_line を残さない）。
-                partial = True
+                if "char_budget" not in partial_reasons:
+                    partial_reasons.append("char_budget")
                 truncated = _truncate_line_aligned(text, start, remaining)
                 if truncated is None:
-                    break
+                    continue
                 text, end = truncated
         used_chars += len(text)
-        order += 1
+        adopted[range_] = (text, end, range_priority(range_))
+
+    required_runs = _non_blank_line_runs(lines, expand_start, expand_end)
+    required_ranges = (
+        [list(run) for run in required_runs]
+        if len(required_runs) <= _EXPANSION_REQUIRED_RUNS_LIMIT
+        else None
+    )
+    adopted_ranges = [(start, end) for (start, _), (_, end, _) in adopted.items()]
+    if required_ranges is None or not _ranges_cover(required_ranges, adopted_ranges):
+        # 境界を跨ぐチャンクの除外や予算で、配下の非空行を全ては渡せていない。
+        if "uncovered_lines" not in partial_reasons:
+            partial_reasons.append("uncovered_lines")
+
+    priority_rank = {
+        range_: rank
+        for rank, range_ in enumerate(
+            sorted(adopted, key=lambda r: (adopted[r][2], r[0])), start=1
+        )
+    }
+    items: list[dict] = []
+    for order, range_ in enumerate(sorted(adopted), start=1):
+        start = range_[0]
+        text, end, _priority = adopted[range_]
         items.append(
             {
                 "path": path,
@@ -4297,12 +4388,27 @@ def _expand_single_parent(
                 "group_id": group_id,
                 "expanded_from": parent_chunk_id,
                 "group_order": order,
+                "group_priority": priority_rank[range_],
+                "group_required_ranges": required_ranges,
             }
         )
+    partial = bool(partial_reasons)
     reason = "" if items else "budget_exhausted"
     for item in items:
         item["group_partial"] = partial
+        item["group_partial_reasons"] = list(partial_reasons)
     return items, partial, reason
+
+
+def _trace_ref(match: dict, **extra) -> dict:
+    """段階追跡用の参照。本文（snippet/text）は含めない。"""
+    ref = {
+        key: match[key]
+        for key in ("chunk_id", "path", "start_line", "end_line", "source", "group_id")
+        if match.get(key) is not None
+    }
+    ref.update(extra)
+    return ref
 
 
 def expand_parent_candidates(
@@ -4317,6 +4423,7 @@ def expand_parent_candidates(
     char_budget: int | None = None,
     query_context: QueryContext | None = None,
     embed_index: "_EmbedIndex | None" = None,
+    cancel_check=None,
 ) -> tuple[list[dict], list[dict]]:
     """支持判定・件数制限後の候補から、展開資格のある親candidateを展開する。
 
@@ -4325,7 +4432,7 @@ def expand_parent_candidates(
     全体で ``max_total_ranges`` 範囲までを上限とする。直接ヒットとの重複排除
     は行わない（呼び出し側の責務）。``query_context`` / ``embed_index`` が
     利用できる場合は子の類似度で予算超過時の優先順位付けを行い、利用できない
-    場合は原文順で選ぶ。
+    場合は原文順で選ぶ。``cancel_check`` は展開元ごとに呼ぶ。
     """
     max_parents = (
         EXPANSION_MAX_PARENTS_PER_QUERY if max_parents is None else max_parents
@@ -4352,6 +4459,8 @@ def expand_parent_candidates(
         remaining_ranges = min(max_ranges_per_parent, max_total_ranges - total_ranges)
         if remaining_ranges <= 0:
             break
+        if cancel_check:
+            cancel_check()
         items, partial, reason = _expand_single_parent(
             match,
             source_chunks,
@@ -4382,6 +4491,7 @@ def expand_parent_candidates(
                 "start_line": match.get("start_line"),
                 "expanded": True,
                 "partial": partial,
+                "partial_reasons": list(items[0].get("group_partial_reasons", [])),
                 "range_count": len(items),
                 "group_id": items[0]["group_id"],
             }
@@ -4399,6 +4509,13 @@ def final_evidence_match_limit() -> int:
     return max(1, min(RETRIEVAL_PROMPT_MATCH_LIMIT, EVIDENCE_OUTPUT_MAX_ITEMS))
 
 
+def _mark_group_partial(item: dict, reason: str) -> dict:
+    reasons = list(item.get("group_partial_reasons") or [])
+    if reason not in reasons:
+        reasons.append(reason)
+    return {**item, "group_partial": True, "group_partial_reasons": reasons}
+
+
 def _allocate_evidence_slots(items: list[dict], limit: int) -> list[dict]:
     """通常根拠と展開groupへ件数枠を配分する。
 
@@ -4411,8 +4528,9 @@ def _allocate_evidence_slots(items: list[dict], limit: int) -> list[dict]:
        ``EXPANSION_MAX_TOTAL_RANGES`` の小さい方までとし、通常根拠の枠を確保する。
     3. 通常根拠を使い切って枠が余れば、残りの展開範囲へ配分する。
 
-    group内の範囲は ``group_order``（原文順）の先頭から採用し、範囲を省いた
-    group は ``group_partial`` を立てる。入力の dict は変更しない。
+    group内の範囲は ``group_priority``（選択順位、無ければ ``group_order``）の
+    高い順に採用し、表示は ``group_order``（原文順）へ戻す。範囲を省いた group は
+    ``group_partial`` を立てる。入力の dict は変更しない。
     """
     if limit <= 0:
         return []
@@ -4425,7 +4543,12 @@ def _allocate_evidence_slots(items: list[dict], limit: int) -> list[dict]:
         else:
             direct.append(item)
     for group_items in groups.values():
-        group_items.sort(key=lambda m: int(m.get("group_order") or 0))
+        group_items.sort(
+            key=lambda m: (
+                int(m.get("group_priority") or m.get("group_order") or 0),
+                int(m.get("group_order") or 0),
+            )
+        )
 
     parent_position = {
         str(m.get("chunk_id")): index for index, m in enumerate(direct) if m.get("chunk_id")
@@ -4483,9 +4606,11 @@ def _allocate_evidence_slots(items: list[dict], limit: int) -> list[dict]:
         group_items = groups[group_id]
         count = taken[group_id]
         omitted_ranges += len(group_items) - count
-        partial = count < len(group_items)
-        for item in group_items[:count]:
-            result.append({**item, "group_partial": True} if partial else item)
+        adopted = sorted(group_items[:count], key=lambda m: int(m.get("group_order") or 0))
+        for item in adopted:
+            result.append(
+                _mark_group_partial(item, "match_limit") if count < len(group_items) else item
+            )
     if omitted_ranges:
         logger.info("親子展開: 件数上限により展開範囲 %d 件を省略した", omitted_ranges)
     return result
@@ -4508,12 +4633,20 @@ def _evaluate_evidence_status(
         status != "sufficient"
         and not constraint_conflict
         and confidence >= 0.55
-        and _has_complete_structural_evidence(matches, must_find_terms)
+        and _has_complete_structural_evidence(query, matches, must_find_terms)
     ):
         status = "sufficient"
     if status == "sufficient" and constraint_conflict:
         status = "partial"
     return confidence, status
+
+
+def _evidence_key(match: dict) -> tuple:
+    return (
+        normalize_source_path(match.get("path", "")),
+        match.get("chunk_id"),
+        match.get("start_line"),
+    )
 
 
 def select_final_evidence(
@@ -4523,79 +4656,193 @@ def select_final_evidence(
     limit: int,
     must_find_terms: list[str] | None = None,
     char_limit: int | None = None,
+    trace: dict | None = None,
 ) -> tuple[list[dict], float, str]:
     """件数枠の配分・根拠予算の適用後に、採用根拠だけで状態を再判定する。
 
     CLI/Web/評価harnessで共通に使う最終選択。制限前に検出済みの矛盾
     （先頭itemの ``constraint_conflict``）は、候補が件数/予算で落ちても維持する。
+    ``trace`` を渡すと、件数枠・予算で落ちた根拠と最終採用根拠を本文なしで記録する。
     """
     had_conflict = any(m.get("constraint_conflict") for m in evidence_items)
-    matches = _allocate_evidence_slots(evidence_items, limit)
+    allocated = _allocate_evidence_slots(evidence_items, limit)
+    matches = allocated
     if char_limit is not None:
-        matches = _fit_prompt_budget(matches, char_limit)
+        matches = _fit_prompt_budget(allocated, char_limit)
     confidence, status = _evaluate_evidence_status(
         query, matches, must_find_terms, constraint_conflict=had_conflict
     )
     if had_conflict and matches:
         matches[0] = {**matches[0], "constraint_conflict": True}
+    if trace is not None:
+        allocated_keys = {_evidence_key(m) for m in allocated}
+        final_by_key = {_evidence_key(m): m for m in matches}
+        trace.setdefault("dropped", []).extend(
+            _trace_ref(m, stage="final_selection", reason="match_limit")
+            for m in evidence_items
+            if _evidence_key(m) not in allocated_keys
+        )
+        for m in allocated:
+            final = final_by_key.get(_evidence_key(m))
+            if final is None:
+                trace["dropped"].append(
+                    _trace_ref(m, stage="final_selection", reason="char_budget")
+                )
+            elif final.get("end_line") != m.get("end_line") or len(
+                final.get("snippet") or ""
+            ) != len(m.get("snippet") or ""):
+                trace.setdefault("truncated", []).append(
+                    _trace_ref(final, stage="final_selection", reason="char_budget")
+                )
+        trace["final"] = [
+            _trace_ref(
+                m,
+                group_partial=m.get("group_partial"),
+                partial_reasons=list(m.get("group_partial_reasons") or []),
+            )
+            if m.get("group_id")
+            else _trace_ref(m)
+            for m in matches
+        ]
+        trace["status"] = {"confidence": confidence, "evidence_status": status}
     return matches, confidence, status
 
 
 def _dedupe_expansion_against_direct_hits(
     expanded_items: list[dict], direct_matches: list[dict]
-) -> list[dict]:
-    """直接ヒットと展開範囲が重なる場合は直接ヒットを優先し、展開itemを除外する。
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """直接ヒットと展開範囲が重なる場合は直接ヒットを優先する。
 
-    重複の削減で独立根拠数を増やさない（直接ヒットは既に direct_matches に
-    含まれているため、重なる展開itemを足しても件数は増えない）。
+    戻り値は ``(残す展開item, 直接ヒット, 除去記録)``。
+
+    - 展開範囲のうち直接ヒットと重なる行だけを除き、残りは連続範囲ごとの展開itemに
+      分割して残す（離れた範囲を1つの広い start/end に偽装しない）。展開itemの本文は
+      原資料の行範囲そのものなので、行単位で切り出せる。
+    - 重なった直接ヒットには、展開由来を補足metadata（``expanded_overlap_groups``）
+      として残す（入力dictは変更せずコピーする）。
+    - 重複の削減で独立根拠数を増やさない（直接ヒットは既に件数に含まれる）。
     """
-    kept = []
+    direct_ranges = [
+        (index, normalize_source_path(m.get("path", "")), m["start_line"], m["end_line"])
+        for index, m in enumerate(direct_matches)
+        if isinstance(m.get("start_line"), int) and isinstance(m.get("end_line"), int)
+    ]
+    overlap_groups: dict[int, list[str]] = {}
+    kept_by_group: dict[str, list[dict]] = {}
+    removed: list[dict] = []
+    passthrough: list[dict] = []
     for item in expanded_items:
         path = item.get("path")
         start, end = item.get("start_line"), item.get("end_line")
         if not isinstance(start, int) or not isinstance(end, int):
-            kept.append(item)
+            passthrough.append(item)
             continue
-        overlaps_direct = any(
-            normalize_source_path(m.get("path", "")) == path
-            and isinstance(m.get("start_line"), int)
-            and isinstance(m.get("end_line"), int)
-            and m["start_line"] <= end
-            and start <= m["end_line"]
-            for m in direct_matches
-        )
-        if overlaps_direct:
+        cuts = []
+        for index, d_path, d_start, d_end in direct_ranges:
+            if d_path == path and d_start <= end and start <= d_end:
+                cuts.append((max(start, d_start), min(end, d_end)))
+                groups = overlap_groups.setdefault(index, [])
+                if item.get("group_id") and item["group_id"] not in groups:
+                    groups.append(item["group_id"])
+        group_key = str(item.get("group_id") or "")
+        if not cuts:
+            kept_by_group.setdefault(group_key, []).append(item)
             continue
-        kept.append(item)
-    return kept
+        removed.append(_trace_ref(item, stage="expansion", reason="overlaps_direct_hit"))
+        snippet_lines = (item.get("snippet") or "").split("\n")
+        segments: list[tuple[int, int]] = []
+        cursor = start
+        for cut_start, cut_end in _merge_contiguous_line_ranges(sorted(cuts)):
+            if cursor < cut_start:
+                segments.append((cursor, cut_start - 1))
+            cursor = max(cursor, cut_end + 1)
+        if cursor <= end:
+            segments.append((cursor, end))
+        for seg_start, seg_end in segments:
+            seg_lines = snippet_lines[seg_start - start : seg_end - start + 1]
+            if not any(line.strip() for line in seg_lines):
+                continue
+            kept_by_group.setdefault(group_key, []).append(
+                {
+                    **item,
+                    "start_line": seg_start,
+                    "end_line": seg_end,
+                    "snippet": "\n".join(seg_lines),
+                }
+            )
+
+    kept: list[dict] = list(passthrough)
+    for group_key, group_items in kept_by_group.items():
+        if not group_key:
+            kept.extend(group_items)
+            continue
+        group_items.sort(key=lambda m: m["start_line"])
+        for order, item in enumerate(group_items, start=1):
+            kept.append(
+                {**item, "chunk_id": f"{group_key}#r{order:02d}", "group_order": order}
+            )
+    updated_direct = [
+        {**m, "expanded_overlap_groups": overlap_groups[index]} if index in overlap_groups else m
+        for index, m in enumerate(direct_matches)
+    ]
+    return kept, updated_direct, removed
 
 
 def _has_complete_structural_evidence(
-    matches: list[dict], must_find_terms: list[str] | None
+    query: str, matches: list[dict], must_find_terms: list[str] | None
 ) -> bool:
-    """完全展開されたgroupが1件でもあり、必須語が全て充足されているか判定する。
+    """完全な構造根拠（展開group）が採用根拠に1件でもあるか判定する。
 
-    親の語彙一致と完全展開だけでは自動合格にしない: must_find_terms が
-    指定されている場合は、その group の採用本文で全て充足する必要がある。
+    次をすべて満たすgroupだけを完全な構造根拠とする。親の語彙一致と完全展開
+    だけでは自動合格にしない。
+
+    - ``group_partial`` でない（範囲数・文字予算・件数枠で省いた範囲がない）
+    - 展開元の親候補が採用根拠にあり、質問と語彙一致（lexical anchor）で支持される
+    - 親の配下の非空行（``group_required_ranges``）が、採用根拠（展開itemと、
+      切り詰められていない同一資料の直接ヒット）の行範囲で全て覆われる
+    - ``must_find_terms`` があり、それらを採用本文で全て充足する。必須語が無い
+      （検索専用・keyword評価など検索計画を持たない）場合は、親の語彙一致と完全展開
+      だけになるため完全構造根拠にしない。別資料の同名見出しの展開で sufficient を
+      宣言しないため。
     """
     terms = [str(t).strip().lower() for t in (must_find_terms or []) if str(t).strip()]
+    if not terms:
+        return False
+    by_chunk_id = {
+        str(m.get("chunk_id")): m for m in matches if not m.get("group_id") and m.get("chunk_id")
+    }
     seen_groups: set[str] = set()
     for match in matches:
         if match.get("source") != "expanded":
             continue
         group_id = match.get("group_id")
-        if not group_id or group_id in seen_groups or match.get("group_partial"):
+        if not group_id or group_id in seen_groups:
             continue
         seen_groups.add(group_id)
-        if not terms:
-            return True
-        group_text = " ".join(
-            (m.get("snippet", "") or "")
+        group_items = [m for m in matches if m.get("group_id") == group_id]
+        if any(m.get("group_partial") for m in group_items):
+            continue
+        required = match.get("group_required_ranges")
+        if not required:
+            continue
+        parent = by_chunk_id.get(str(match.get("expanded_from") or ""))
+        if parent is None or _lexical_anchor_length(query, parent) < LEXICAL_ANCHOR_MIN_CHARS:
+            continue
+        path = normalize_source_path(match.get("path", ""))
+        covering = [
+            m
             for m in matches
-            if m.get("group_id") == group_id
-        ).lower()
-        if all(term in group_text for term in terms):
-            return True
+            if normalize_source_path(m.get("path", "")) == path
+            and isinstance(m.get("start_line"), int)
+            and isinstance(m.get("end_line"), int)
+            and (m.get("group_id") == group_id or (not m.get("group_id") and not m.get("snippet_truncated")))
+        ]
+        if not _ranges_cover(required, [(m["start_line"], m["end_line"]) for m in covering]):
+            continue
+        text = " ".join((m.get("snippet", "") or "") for m in covering).lower()
+        if not all(term in text for term in terms):
+            continue
+        return True
     return False
 
 
@@ -4612,6 +4859,8 @@ def finalize_ranked_matches(
     char_budget: int | None = None,
     query_context: QueryContext | None = None,
     embed_index: "_EmbedIndex | None" = None,
+    trace: dict | None = None,
+    cancel_check=None,
 ) -> tuple[list[dict], float, str]:
     """file別上限・相対スコア足切り・親子展開・confidence算出までの決定的な後段。
 
@@ -4624,10 +4873,12 @@ def finalize_ranked_matches(
     ``source_chunks`` を渡さない（既定）場合は展開ステップを一切実行せず、
     既存呼び出し元との挙動を完全に保つ。``query_context`` / ``embed_index`` は
     展開の予算超過時に子の類似度で優先順位付けする（省略時は原文順）。
+    ``trace`` を渡すと、候補・落選理由・展開結果を本文なしで記録する。
     """
     supported = filter_by_relevance_support(query, matches)
     constraint_conflict = _has_explicit_constraint_conflict(query, supported)
-    limited = _limit_chunks_per_file(supported, max_per_file)
+    per_file = _limit_chunks_per_file(supported, max_per_file)
+    limited = per_file
     if len(limited) > 1:
         top_score = limited[0].get("rrf_score", 0)
         if top_score > 0:
@@ -4636,13 +4887,29 @@ def finalize_ranked_matches(
                 for m in limited
                 if m.get("rrf_score", 0) >= top_score * relative_score_floor
             ]
+    if trace is not None:
+        trace["candidates"] = [_trace_ref(m, rank=rank) for rank, m in enumerate(matches, 1)]
+        supported_ids = {id(m) for m in supported}
+        per_file_ids = {id(m) for m in per_file}
+        limited_ids = {id(m) for m in limited}
+        dropped = trace.setdefault("dropped", [])
+        for m in matches:
+            if id(m) not in supported_ids:
+                reason = "relevance_support"
+            elif id(m) not in per_file_ids:
+                reason = "per_file_limit"
+            elif id(m) not in limited_ids:
+                reason = "relative_score_floor"
+            else:
+                continue
+            dropped.append(_trace_ref(m, stage="finalize", reason=reason))
 
     expansion_enabled = _parent_child_expansion_enabled() and source_chunks is not None
     if expansion_enabled:
         expansion_budget = (
             int(char_budget * EXPANSION_BUDGET_RATIO) if char_budget else None
         )
-        expanded_items, _meta = expand_parent_candidates(
+        expanded_items, expansion_meta = expand_parent_candidates(
             limited,
             source_chunks,
             source_root=source_root,
@@ -4650,8 +4917,17 @@ def finalize_ranked_matches(
             char_budget=expansion_budget,
             query_context=query_context,
             embed_index=embed_index,
+            cancel_check=cancel_check,
         )
-        expanded_items = _dedupe_expansion_against_direct_hits(expanded_items, limited)
+        expanded_items, limited, overlap_removed = _dedupe_expansion_against_direct_hits(
+            expanded_items, limited
+        )
+        if trace is not None:
+            trace["expansion"] = expansion_meta
+            trace.setdefault("dropped", []).extend(overlap_removed)
+            trace["expanded"] = [
+                _trace_ref(m, group_partial=m.get("group_partial")) for m in expanded_items
+            ]
         if expanded_items:
             limited = limited + expanded_items
             constraint_conflict = constraint_conflict or _has_explicit_constraint_conflict(
@@ -4780,6 +5056,7 @@ def run_retrieval_pipeline(
                 f"Embeddingインデックスは{index_state}です。キーワード検索のみで続行します。"
             )
     attempts: list[RetrievalAttempt] = []
+    attempt_traces: list[dict] = []
     combined: list[dict] = []
     evidence_items: list[dict] = []
     final_confidence = 0.0
@@ -4861,6 +5138,8 @@ def run_retrieval_pipeline(
         # evidence_items として毎試行 combined の同一snapshotから作り直し、
         # 再展開で件数やIDが増殖しない決定的処理にする（展開後の根拠を
         # 検索候補へ書き戻すと再統合を招くため）。
+        attempt_trace: dict = {"attempt": attempt_index + 1}
+        attempt_traces.append(attempt_trace)
         ranked_evidence, _, _ = finalize_ranked_matches(
             query,
             combined,
@@ -4871,6 +5150,8 @@ def run_retrieval_pipeline(
             char_budget=PROMPT_EVIDENCE_CHAR_LIMIT,
             query_context=query_context if expansion_enabled else None,
             embed_index=embed_index if expansion_enabled else None,
+            trace=attempt_trace,
+            cancel_check=check_cancel,
         )
         # 継続判断は件数枠を配分した後の採用根拠で行う。上限で落ちた展開本文を
         # 根拠に数えたまま sufficient と判定しないため。
@@ -4879,6 +5160,7 @@ def run_retrieval_pipeline(
             ranked_evidence,
             limit=final_evidence_match_limit(),
             must_find_terms=plan.get("must_find_terms", []),
+            trace=attempt_trace,
         )
         attempts.append(
             RetrievalAttempt(
@@ -4916,6 +5198,7 @@ def run_retrieval_pipeline(
             embedding_model=embed_model if route == "hybrid" else None,
             route_reason=route_reason,
             warnings=list(dict.fromkeys(warnings)),
+            trace={"attempts": attempt_traces, "final": attempt_traces[-1] if attempt_traces else {}},
         )
 
     # 予算逆算が無効なら shell 見積り（build_user_prompt の追加呼び出し）を行わない。
@@ -4930,6 +5213,7 @@ def run_retrieval_pipeline(
         else 0
     )
     evidence_char_limit = compute_evidence_char_limit(shell_chars)
+    final_trace: dict = {"stage": "prompt_budget", "evidence_char_limit": evidence_char_limit}
     # 最終出力時の根拠予算。制限前に検出済みの矛盾は維持したまま、実際に
     # 採用した本文だけで信頼度・sufficient判定（完全構造根拠の経路を含む）を
     # 再照合する。切り詰めが無ければループ内の判定と同じ結果になる。
@@ -4939,6 +5223,7 @@ def run_retrieval_pipeline(
         limit=final_evidence_match_limit(),
         must_find_terms=plan.get("must_find_terms", []),
         char_limit=evidence_char_limit,
+        trace=final_trace,
     )
     user_prompt = build_user_prompt(
         query,
@@ -4960,6 +5245,7 @@ def run_retrieval_pipeline(
         embedding_model=embed_model if route == "hybrid" else None,
         route_reason=route_reason,
         warnings=list(dict.fromkeys(warnings)),
+        trace={"attempts": attempt_traces, "final": final_trace},
     )
 
 
@@ -5026,6 +5312,12 @@ def build_evidence_summary(
             location.append(f"parser {match['parser']}")
         if match.get("source"):
             location.append(f"検索 {match['source']}")
+        if match.get("group_id"):
+            location.append(
+                "見出し配下の本文を展開（部分展開）"
+                if match.get("group_partial")
+                else "見出し配下の本文を展開"
+            )
         suffix = " / ".join(location) if location else "位置情報なし"
         lines.append(f"  {index}. {title} — {suffix}")
         for warning in match.get("parser_warnings") or []:
