@@ -5038,7 +5038,21 @@ def stream_ollama_chat(
     return "".join(full_response)
 
 
+def _force_utf8_stdio() -> None:
+    """cp932 コンソールで日本語出力（根拠一覧・AI回答）が化けたり
+    UnicodeEncodeError で落ちたりしないよう標準出力をUTF-8にする。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main():
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description="Offline AI Search CLI")
     parser.add_argument(
         "query", nargs="?", default=None, help="Search query (positional)"
