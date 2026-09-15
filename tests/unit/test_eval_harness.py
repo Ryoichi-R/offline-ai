@@ -134,6 +134,20 @@ def test_shipped_spec_is_valid_and_covers_required_categories():
     assert any(not q.answerable for q in spec.questions), "該当情報なしの質問が必要"
 
 
+def test_sufficiency_holdout_spec_is_valid_and_all_holdout():
+    """O2-17 の保留評価仕様。調整に使わないため全問 holdout、正例は同じ corpus の実在範囲を指す。"""
+    spec = harness.load_spec(EVAL_DIR / "eval-spec-sufficiency-holdout.json")
+    assert spec.corpus_dir == harness.load_spec(SPEC_PATH).corpus_dir
+    assert len(spec.questions) == 38
+    assert all(q.holdout for q in spec.questions)
+    assert sum(1 for q in spec.questions if not q.answerable) == 18
+    for question in spec.questions:
+        for expected in question.expected_sources:
+            lines = (spec.corpus_dir / expected.path).read_text(encoding="utf-8").splitlines()
+            assert expected.line_end <= len(lines), question.id
+            assert expected.heading in lines[expected.line_start - 1], question.id
+
+
 def test_shipped_spec_expected_paths_exist_in_corpus():
     spec = harness.load_spec(SPEC_PATH)
     for question in spec.questions:
@@ -527,6 +541,38 @@ def test_hybrid_and_agentic_routes_skip_without_models():
     assert "PASSへ数えない" in hybrid.reason
 
 
+def test_agentic_pipeline_uses_isolated_embedding_cache_as_hybrid(monkeypatch):
+    """回帰防止: pipeline が製品cacheの索引状態で keyword のみへ落ちず、評価cacheで hybrid になる。"""
+    spec = harness.load_spec(SPEC_PATH)
+    chunks = harness.build_corpus_chunks(spec.corpus_dir)
+    embed_cache = {
+        "entries": {chunk["chunk_id"]: {**chunk, "embedding": [1.0, 0.0]} for chunk in chunks}
+    }
+    question = spec.questions[0]
+    monkeypatch.setattr(
+        harness.search,
+        "create_search_plan",
+        lambda query, model: {"keywords": [], "search_queries": [query], "must_find_terms": []},
+    )
+    monkeypatch.setattr(
+        harness.search, "_get_embeddings", lambda texts, model: [[1.0, 0.0] for _ in texts]
+    )
+    monkeypatch.setattr(
+        harness.search,
+        "load_embed_cache",
+        lambda: pytest.fail("評価中に製品の Embedding cache を読んではならない"),
+    )
+
+    with harness._isolated_agentic_inputs(
+        chunks, embed_model="embed:tag", embed_cache=embed_cache, corpus_dir=spec.corpus_dir
+    ):
+        result = harness.search.run_retrieval_pipeline(question.query, model="chat:tag")
+
+    assert result.route == "hybrid"
+    assert result.index_state == "ready"
+    assert any("embedding" in str(m.get("source", "")) for m in result.matches)
+
+
 def test_agentic_route_uses_eval_corpus_and_isolated_embedding_inputs():
     spec = harness.load_spec(SPEC_PATH)
     question = spec.questions[0]
@@ -796,8 +842,12 @@ def test_partial_expansion_expectation_allows_sufficient_from_direct_evidence_on
     allowed = harness.score_question(
         question, _outcome(direct + [partial], evidence_status="sufficient")
     )
+    # 通常根拠1件でも、類似度と具体語の一致が強ければ sufficient が成立するため、
+    # 展開だけが sufficient を支える状況は弱い通常根拠1件で作る。
+    weak_direct = [{**direct[0], "embedding_score": 0.6}]
+    assert harness.search._calculate_confidence(query, weak_direct)[1] != "sufficient"
     only_expansion = harness.score_question(
-        question, _outcome(direct[:1] + [partial], evidence_status="sufficient")
+        question, _outcome(weak_direct + [partial], evidence_status="sufficient")
     )
 
     assert allowed.expansion_expectation_met is True

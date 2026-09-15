@@ -477,7 +477,7 @@ def _isolated_agentic_inputs(
     """評価 corpus と isolated cache を既存 pipeline へ一時注入する。
 
     ``run_retrieval_pipeline`` は通常 production の ``skill-source`` と
-    ``.model_embed`` を検出する。評価時は固定 corpus と CLI 指定 model を
+    ``.model_embed``、製品の Embedding cache と索引状態を検出する。評価時は固定 corpus と CLI 指定 model を
     使う必要があるため、pipeline の本体を複製せず入力境界だけを差し替える。
     全差し替えは route の終了時に必ず復元し、製品 cache へ書き込ませない。
 
@@ -488,6 +488,8 @@ def _isolated_agentic_inputs(
     original_build_source_chunks = search.build_source_chunks
     original_detect_embed_model = search.detect_embed_model
     original_build_or_update_embed_index = search.build_or_update_embed_index
+    original_load_embed_cache = search.load_embed_cache
+    original_get_embed_index_status = search.get_embed_index_status
     original_skill_source_dir = search.SKILL_SOURCE_DIR
 
     def build_eval_source_chunks(_source_dir: Path) -> list[dict]:
@@ -507,9 +509,22 @@ def _isolated_agentic_inputs(
         # callback契約だけを受け取る。
         return embed_cache or {}
 
+    def load_eval_embed_cache() -> dict:
+        return embed_cache or {}
+
+    def eval_embed_index_status(_embed_model=None, _chunks=None, **_kwargs) -> dict:
+        # pipeline は製品cacheの header・資料manifestで ready を判定する。評価cacheは
+        # 評価corpusの全chunkから作った in-memory cache なので、cache がある場合だけ
+        # ready とする（無い場合は製品と同じく keyword のみで続行させる）。
+        if embed_model and embed_cache and embed_cache.get("entries"):
+            return {"state": "ready", "total": len(chunks), "processed": len(chunks)}
+        return {"state": "missing", "total": 0, "processed": 0}
+
     search.build_source_chunks = build_eval_source_chunks
     search.detect_embed_model = detect_eval_embed_model
     search.build_or_update_embed_index = build_eval_embed_index
+    search.load_embed_cache = load_eval_embed_cache
+    search.get_embed_index_status = eval_embed_index_status
     if corpus_dir is not None:
         search.SKILL_SOURCE_DIR = corpus_dir
         search._invalidate_structure_memo()
@@ -519,6 +534,8 @@ def _isolated_agentic_inputs(
         search.build_source_chunks = original_build_source_chunks
         search.detect_embed_model = original_detect_embed_model
         search.build_or_update_embed_index = original_build_or_update_embed_index
+        search.load_embed_cache = original_load_embed_cache
+        search.get_embed_index_status = original_get_embed_index_status
         if corpus_dir is not None:
             search.SKILL_SOURCE_DIR = original_skill_source_dir
             search._invalidate_structure_memo()

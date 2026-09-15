@@ -160,6 +160,79 @@ def test_confidence_is_insufficient_without_matches():
     assert search._calculate_confidence("該当のない質問", []) == (0.0, "insufficient")
 
 
+def _scored_confidence_matches(similarity):
+    return [
+        {**match, "embedding_score": similarity}
+        for match in _confidence_matches("keyword+embedding")
+    ]
+
+
+def test_confidence_near_miss_without_must_terms_is_not_sufficient():
+    """O2-17: 内容語の半分以上が根拠に無く類似度も強くない近接語質問は partial。"""
+    query = "日当の外部委託先への支払条件を教えてください"
+    confidence, status = search._calculate_confidence(query, _scored_confidence_matches(0.6))
+    assert confidence >= 0.55, "confidence の値自体は変えない"
+    assert status == "partial"
+
+
+def test_confidence_near_miss_keeps_sufficient_with_strong_similarity():
+    query = "日当の外部委託先への支払条件を教えてください"
+    _, status = search._calculate_confidence(query, _scored_confidence_matches(0.75))
+    assert status == "sufficient"
+
+
+def test_confidence_keeps_sufficient_when_few_content_terms_are_absent():
+    """言い換えで1語だけ根拠に無い正例（3語中1語）は下げない。"""
+    _, status = search._calculate_confidence(
+        "一般社員の日当の金額はいくらですか", _scored_confidence_matches(0.6)
+    )
+    assert status == "sufficient"
+
+
+def test_confidence_content_support_rule_applies_with_must_find_terms():
+    """検索計画の必須語は資料に無い語を推測で含むため、必須語があっても質問文の内容語で判定する。"""
+    query = "日当の外部委託先への支払条件を教えてください"
+    _, status = search._calculate_confidence(
+        query, _scored_confidence_matches(0.6), must_find_terms=["日当"]
+    )
+    assert status == "partial"
+
+
+def test_query_content_terms_skip_interrogatives_and_generic_question_words():
+    assert search._query_content_terms("宿泊費の上限を超えるときに必要な手続きは何ですか") == ["宿泊費", "上限"]
+    assert search._query_content_terms("復元作業の担当人数は何名ですか") == ["復元作業", "担当人数"]
+
+
+def test_confidence_accepts_single_evidence_only_when_semantic_and_lexical_match_are_strong():
+    query = "目標設定面談で決める目標の件数を教えてください"
+    match = {
+        "path": "guides/onboarding-handbook.md",
+        "heading": "3.1 目標設定",
+        "snippet": "入社から30日以内に、上長と初回の目標設定面談を行う。目標は3件以上5件以下とする。",
+        "rrf_score": 0.033,
+        "source": "embedding+keyword",
+        "embedding_score": 0.72,
+    }
+    assert search._calculate_confidence(query, [match])[1] == "sufficient"
+    assert search._calculate_confidence(query, [{**match, "embedding_score": 0.65}])[1] == "partial"
+    no_anchor = {**match, "heading": "3.1 目標", "snippet": "目標は3件以上5件以下とする。"}
+    assert search._calculate_confidence(query, [no_anchor])[1] == "partial"
+
+
+def test_query_content_support_ignores_expanded_items_and_unscored_matches():
+    query = "日当の外部委託先への支払条件を教えてください"
+    matches = _scored_confidence_matches(0.6) + [
+        {
+            "path": "regulations/travel.md",
+            "snippet": "外部委託先への支払条件は別表による。",
+            "source": "expanded",
+        }
+    ]
+    assert search._lacks_query_content_support(query, matches) is True
+    assert search._lacks_query_content_support(query, _confidence_matches("keyword+embedding")) is False
+    assert search._query_content_terms("ノートPCの貸与期間を教えてください") == ["ノート", "pc", "貸与期間"]
+
+
 def test_relevance_support_rejects_weak_embedding_only_near_miss():
     matches = [
         {
@@ -348,3 +421,20 @@ def test_retrieval_pipeline_cancel_still_stops_search(monkeypatch):
     with pytest.raises(_FakeWebCancelled):
         search.run_retrieval_pipeline("休暇の申請期限", model="m", cancel_check=cancel_check)
     assert not used_models
+
+
+def test_constraint_conflict_ignores_anchors_spanning_particles():
+    """「の日当は」のような助詞をまたぐ並びは、別条件を否定する文を矛盾とみなさない。"""
+    evidence = [
+        {
+            "heading": "第1条 適用範囲",
+            "snippet": "片道50キロメートル未満の移動は近距離移動として扱い、本規程の日当は支給しない。",
+        }
+    ]
+    assert not search._has_explicit_constraint_conflict(
+        "出張が半日で終わったときの日当はどうなりますか", evidence
+    )
+    assert search._has_explicit_constraint_conflict(
+        "海外出張の日当はいくらですか",
+        [{"heading": "国内出張旅費規程", "snippet": "海外出張は本規程の対象外とし、別途定める規程による。"}],
+    )

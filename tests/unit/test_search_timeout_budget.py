@@ -250,7 +250,20 @@ def _read_first_sse_data_event(server, path):
         sock.close()
 
 
-def test_search_endpoint_sse_budget_reflects_requested_timeout(running_server):
+def _wait_until_cancelled(query, reasoning, event_queue, cancel_token, request_id, **_kwargs):
+    """budget イベントだけを読む試験用の worker。
+
+    実 pipeline を走らせると、到達不能な Ollama への接続待ちの後に製品資料の
+    chunk 読み込みへ進む daemon thread が試験終了後も残り、後続の試験の
+    ``build_source_chunks`` 呼び出し回数を汚す。fixture 終了時の cancel で抜ける。
+    """
+    deadline = time.monotonic() + 10
+    while not cancel_token.is_cancelled and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_search_endpoint_sse_budget_reflects_requested_timeout(running_server, monkeypatch):
+    monkeypatch.setattr(web_server, "run_search", _wait_until_cancelled)
     status_line, first_event = _read_first_sse_data_event(
         running_server, "/api/search?q=test&timeout_seconds=480"
     )
@@ -262,8 +275,9 @@ def test_search_endpoint_sse_budget_reflects_requested_timeout(running_server):
 
 
 def test_search_endpoint_sse_budget_uses_server_default_when_timeout_omitted(
-    running_server,
+    running_server, monkeypatch
 ):
+    monkeypatch.setattr(web_server, "run_search", _wait_until_cancelled)
     _status_line, first_event = _read_first_sse_data_event(running_server, "/api/search?q=test")
 
     assert first_event["type"] == "budget"

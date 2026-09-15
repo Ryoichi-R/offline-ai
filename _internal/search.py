@@ -139,6 +139,10 @@ KEYWORD_EXTRACT_TIMEOUT = 90
 EMBED_SIM_THRESHOLD = 0.3
 SEMANTIC_SUPPORT_THRESHOLD = 0.55
 LEXICAL_ANCHOR_MIN_CHARS = 4
+# sufficient 抑制（TODO O2-17）。質問の内容語の半分以上が採用根拠に無く、
+# Embedding類似度も強くない場合は、近接語だけの根拠とみなす。
+CONTENT_TERM_ABSENT_RATIO = 0.5
+CONTENT_TERM_STRONG_SIMILARITY = 0.70
 
 EMBED_PROGRESS_INTERVAL = env_int("OFFLINE_AI_EMBED_PROGRESS_INTERVAL", 25, min_value=1)
 EMBED_PROGRESS_SECONDS = env_int("OFFLINE_AI_EMBED_PROGRESS_SECONDS", 15, min_value=1)
@@ -3719,15 +3723,27 @@ def filter_by_relevance_support(query: str, matches: list[dict]) -> list[dict]:
     return [match for match in matches if _has_relevance_support(query, match)]
 
 
+_HIRAGANA_PATTERN = re.compile(r"[ぁ-ゖ]")
+
+
 def _has_explicit_constraint_conflict(query: str, matches: list[dict]) -> bool:
     """質問の限定条件が根拠中で明示的に否定されているかを判定する。"""
     compact_query = _compact_relevance_text(query)
     if len(compact_query) < LEXICAL_ANCHOR_MIN_CHARS:
         return False
+    # 限定条件は漢字・カタカナ・英数字の語として現れる（例:「海外出張」）。助詞を
+    # またぐ並び（例:「の日当は」）は、別の条件を否定する文（「本規程の日当は支給
+    # しない」）にも一致して正例を partial にするため、照合に使わない。
     query_anchors = {
-        compact_query[index : index + LEXICAL_ANCHOR_MIN_CHARS]
-        for index in range(len(compact_query) - LEXICAL_ANCHOR_MIN_CHARS + 1)
+        anchor
+        for anchor in (
+            compact_query[index : index + LEXICAL_ANCHOR_MIN_CHARS]
+            for index in range(len(compact_query) - LEXICAL_ANCHOR_MIN_CHARS + 1)
+        )
+        if not _HIRAGANA_PATTERN.search(anchor)
     }
+    if not query_anchors:
+        return False
     for match in matches:
         evidence = " ".join(
             str(match.get(key, "") or "") for key in ("heading", "snippet")
@@ -3806,6 +3822,67 @@ def _collapse_to_independent_groups(matches: list[dict]) -> list[dict]:
     return collapsed
 
 
+_QUERY_CONTENT_TERM_PATTERN = re.compile(r"[一-龥々ァ-ヴー]{2,}|[A-Za-z0-9]{2,}")
+# 質問文に現れても回答本文には現れにくい語。疑問詞（「何名」「何年」など「何」で
+# 始まる語）と、質問の型を表す一般語を内容語として数えない。
+_QUERY_CONTENT_STOP_TERMS = frozenset(
+    {"場合", "手順", "方法", "手続", "必要", "内容", "詳細", "具体的", "一覧", "概要"}
+)
+
+
+def _query_content_terms(query: str) -> list[str]:
+    """質問の内容語（漢字・カタカナ・英数字の2文字以上の連続）を返す。"""
+    return [
+        term
+        for term in dict.fromkeys(
+            t.lower() for t in _QUERY_CONTENT_TERM_PATTERN.findall(query or "")
+        )
+        if term not in _QUERY_CONTENT_STOP_TERMS and not term.startswith("何")
+    ]
+
+
+def _lacks_query_content_support(query: str, matches: list[dict]) -> bool:
+    """質問の内容語の多くが通常根拠に無く、意味類似も強くないかを判定する。
+
+    coverage 以外の項だけで confidence が閾値付近に達するため、該当なし近接語の
+    質問（例: 資料に無い「外部委託先」への依頼手順）が sufficient になる。
+    coverage 単独・類似度単独の閾値ではこれを正例と分離できないため、両方を
+    組み合わせる。検索計画の必須語は資料に無い語を推測で含むことが多いため、
+    利用者の質問文の内容語で判定する。
+    展開itemは親のスコアを持たないため判定に使わない。Embedding類似度が一件も
+    得られない場合は判定できないため False を返す。
+    """
+    terms = _query_content_terms(query)
+    if not terms:
+        return False
+    direct = [m for m in matches if m.get("source") != "expanded"]
+    similarities = []
+    for match in direct:
+        similarity = float(match.get("embedding_score", 0) or 0)
+        if not similarity and str(match.get("source", "")) == "embedding":
+            similarity = float(match.get("score", 0) or 0)
+        if similarity:
+            similarities.append(similarity)
+    if not similarities or max(similarities) >= CONTENT_TERM_STRONG_SIMILARITY:
+        return False
+    evidence = " ".join(
+        (m.get("snippet", "") or "") + " " + (m.get("heading", "") or "")
+        for m in direct
+    ).lower()
+    absent = sum(1 for term in terms if term not in evidence)
+    return absent / len(terms) >= CONTENT_TERM_ABSENT_RATIO
+
+
+def _has_strong_single_evidence(query: str, match: dict) -> bool:
+    """独立根拠が1件でも十分とみなせる、意味・語彙の両方で強く一致する根拠か。"""
+    similarity = float(match.get("embedding_score", 0) or 0)
+    return (
+        "embedding" in str(match.get("source", ""))
+        and similarity >= CONTENT_TERM_STRONG_SIMILARITY
+        and _lexical_anchor_length(query, match) >= LEXICAL_ANCHOR_MIN_CHARS
+    )
+
+
 def _calculate_confidence(
     query: str, matches: list[dict], must_find_terms: list[str] | None = None
 ) -> tuple[float, str]:
@@ -3840,7 +3917,14 @@ def _calculate_confidence(
     has_semantic_evidence = any(
         "embedding" in str(m.get("source", "")) for m in independent
     )
-    if len(independent) >= 2 and confidence >= 0.55 and has_semantic_evidence:
+    # 独立根拠は原則2件以上を求める。1件の場合は、Embedding類似度が強く質問と
+    # 具体語でも一致する根拠に限る（規程の1条だけで答えが決まる質問のため）。
+    enough_evidence = len(independent) >= 2 or (
+        len(independent) == 1 and _has_strong_single_evidence(query, independent[0])
+    )
+    if enough_evidence and confidence >= 0.55 and has_semantic_evidence:
+        if _lacks_query_content_support(query, matches):
+            return round(confidence, 3), "partial"
         return round(confidence, 3), "sufficient"
     if confidence >= 0.28:
         return round(confidence, 3), "partial"

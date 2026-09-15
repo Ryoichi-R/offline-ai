@@ -95,6 +95,26 @@ python tests/eval/run_eval.py --routes all --repeat 3  # 非決定性の確認
 - `expected_expansion`（任意、`complete` / `partial`）は answerable な質問にだけ指定可。不一致は質問単位で FAIL、route 判定の `expansion_expectation_met` も FAIL
 - `holdout`（任意、真偽値）。保留質問の FAIL は `holdout_failed` として別集計する（repeat 中に1回でも FAIL すれば代表値に残す）
 
+### 根拠ステータスの保留評価仕様（`eval-spec-sufficiency-holdout.json`）
+
+資料に記載の無い事項を近接語で問う質問を`sufficient`と判定しないこと（TODO O2-17）を確認する別仕様である。同じcorpusを使い、該当なし近接語18問と言い換え・一般語を含む正例20問を全問`holdout: true`で持つ。質問群は判定規則の設計段階と対応する。
+
+| 質問群 | 作成時点 | 用途 |
+| --- | --- | --- |
+| H0x/H1x | 最初の規則（v1）を確定した後 | v1の不採用、v2（内容語の半分以上が根拠に無く類似度0.70未満なら`partial`）の設計 |
+| G0x/G1x | v2を確定した後 | v2の未使用の検証、v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）の設計 |
+| F0x/F1x | v3を確定した後 | v3の未使用の検証 |
+
+keyword経路は言い換え質問を検索できない既知の限界があるため、主仕様（`eval-spec.json`）の基準線を崩さないよう分けており、`--routes hybrid,agentic-lite`で使う。
+
+```bash
+python tests/eval/run_eval.py --spec tests/eval/eval-spec-sufficiency-holdout.json --routes hybrid,agentic-lite
+```
+
+2026-09-15（`bge-m3:latest`、`gpt-oss:20b`、検索計画は各1回）の未使用のF群では、agentic-lite経路で該当なし8問中6問・正例8問中7問が期待どおりだった。F04（欠けた語が「電話番号」の1語だけ）とF07（「試用期間」「延長」がともに別の文脈で資料にある）は`sufficient`のまま残る。語の有無で見分ける判定の限界であり、最終判定は回答promptの根拠契約に委ねる。G14（「担当人数」）はhybrid経路で候補を支持判定で落とし、agentic-lite経路では検索できるが`partial`になる。hybrid経路ではF05（「作業記録」と別対象の「保管期間」がそろう）も`sufficient`のまま残る。F04・F05・F07はいずれも、gpt-ossの回答では3回すべて該当情報なしを明示した。F12（半日出張の日当）は限定条件の矛盾の誤検出で`partial`となり回答が該当情報なしとも答えていたため、矛盾検出の照合を修正した。F12はこの修正の設計に使ったため、以後は未使用の検証に数えない。
+
+agentic-lite routeは、2026-09-15の修正までEmbeddingを使っていなかった（pipelineが製品のEmbedding cacheと索引状態を参照し、評価corpusでは索引が無いと判定されてkeyword検索だけで実行されていた）。それ以前のreceiptのagentic-lite結果はkeyword検索のものとして扱う。
+
 `required_facts` / `forbidden_facts` は回答生成を伴う評価のために保持している項目であり、現行の retrieval 評価では `require_expected_lines: true` の質問で最終抜粋への残存確認に `required_facts` を使う以外は採点に使用しない。回答本文の意味単位の採点は、Phase 2 の手動受入で判定する。
 
 ## receipt の秘密情報の扱い

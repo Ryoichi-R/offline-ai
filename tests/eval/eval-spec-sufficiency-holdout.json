@@ -1,0 +1,573 @@
+{
+    "schema_version": "1.0",
+    "corpus_dir": "corpus",
+    "notes": "根拠ステータス sufficient の保留評価仕様（TODO O2-17、2026-09-15追加）。必須語を持たない経路（hybrid）で、該当なしの近接語質問を sufficient と判定しないこと、言い換え質問の正例を落とさないことを確認する。H0x/H1x は判定規則v1を確定した後に作成し、v1の不採用と改良規則v2の設計に使った。G0x/G1x はv2を確定した後に作成し、v2の未使用の検証と、判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）の設計に使った。F0x/F1x はv3を確定した後に作成した未使用の検証用である。いずれも上限・重みの調整には使わない。keyword経路は言い換え質問を検索できない既知の限界があるため、主に --routes hybrid で使う。",
+    "acceptance": {
+        "min_retrieval_hit_rate": 0.9,
+        "min_evidence_coverage": 0.8,
+        "min_evidence_precision": 0.5,
+        "min_evidence_line_overlap": 0.8,
+        "max_forbidden_source_hits": 0,
+        "min_abstain_accuracy": 1.0
+    },
+    "questions": [
+        {
+            "id": "H01",
+            "category": "no-answer-near-miss",
+            "query": "備品を紛失した場合に加入している保険の補償額はいくらですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のH01）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H02",
+            "category": "no-answer-near-miss",
+            "query": "出張時にタクシーを利用できる条件を教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のH02）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H03",
+            "category": "no-answer-near-miss",
+            "query": "障害対応の当直手当はいくらですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のH03）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H04",
+            "category": "no-answer-near-miss",
+            "query": "新入社員の通勤定期代の支給方法を教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のH04）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H05",
+            "category": "no-answer-near-miss",
+            "query": "データ復元作業にかかる費用はどの部署が負担しますか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のH05）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H11",
+            "category": "synonym",
+            "query": "パソコンを借りられる期間の上限は何か月ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第2条 貸与期間",
+                    "line_start": 9,
+                    "line_end": 13
+                }
+            ],
+            "required_facts": ["12か月"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH11）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H12",
+            "category": "synonym",
+            "query": "借りた備品をなくしたときは、いつまでに誰へ知らせればよいですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-return-rules.md",
+                    "heading": "第3条 紛失・破損",
+                    "line_start": 13,
+                    "line_end": 15
+                }
+            ],
+            "required_facts": ["所属長"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH12）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H13",
+            "category": "synonym",
+            "query": "出張精算の締め切りはいつですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第4条 精算期限",
+                    "line_start": 32,
+                    "line_end": 34
+                }
+            ],
+            "required_facts": ["10営業日"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH13）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H14",
+            "category": "synonym",
+            "query": "お試しで雇用される期間はどのくらいですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "3.2 試用期間の評価",
+                    "line_start": 40,
+                    "line_end": 42
+                }
+            ],
+            "required_facts": ["3か月"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH14）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H15",
+            "category": "synonym",
+            "query": "新しい端末を受け取った人が署名する書類は何ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/device-handover-procedure.md",
+                    "heading": "1.6 受領確認",
+                    "line_start": 27,
+                    "line_end": 29
+                }
+            ],
+            "required_facts": ["受領確認書"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH15）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "H16",
+            "category": "synonym",
+            "query": "障害のあとに出す報告書の提出先はどこですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "3.1 報告書の提出期限",
+                    "line_start": 33,
+                    "line_end": 35
+                }
+            ],
+            "required_facts": ["品質管理担当"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のH16）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G01",
+            "category": "no-answer-near-miss",
+            "query": "ノートPCの購入申請の承認者は誰ですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のG01）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G02",
+            "category": "no-answer-near-miss",
+            "query": "メンター面談の交通費は支給されますか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のG02）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G03",
+            "category": "no-answer-near-miss",
+            "query": "障害報告書の保存期間は何年ですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のG03）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G04",
+            "category": "no-answer-near-miss",
+            "query": "モニタの修理を依頼する窓口はどこですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のG04）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G05",
+            "category": "no-answer-near-miss",
+            "query": "パスワードリセットの申請様式はどれですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。2026-09-15にO2-17（必須語なし経路のsufficient抑制）の検証用に追加した保留質問（O2-17検証記録のG05）。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G11",
+            "category": "synonym",
+            "query": "備品を社外へ持っていくときに記入するものは何ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第3条 持ち出し",
+                    "line_start": 15,
+                    "line_end": 17
+                }
+            ],
+            "required_facts": ["持ち出し記録簿"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG11）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G12",
+            "category": "synonym",
+            "query": "入社初日の集合時刻は何時ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "1.2 当日の流れ",
+                    "line_start": 16,
+                    "line_end": 18
+                }
+            ],
+            "required_facts": ["9時30分"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG12）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G13",
+            "category": "synonym",
+            "query": "宿泊費の上限を超えるときに必要な手続きは何ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第3条 宿泊費",
+                    "line_start": 21,
+                    "line_end": 30
+                }
+            ],
+            "required_facts": ["書面承認"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG13）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G14",
+            "category": "synonym",
+            "query": "復元作業の担当人数は何名ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "1.5 作業担当者の割当",
+                    "line_start": 23,
+                    "line_end": 25
+                }
+            ],
+            "required_facts": ["2名"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG14）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G15",
+            "category": "synonym",
+            "query": "返却時に備品を確認する担当者は誰ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-return-rules.md",
+                    "heading": "第2条 返却時の確認",
+                    "line_start": 9,
+                    "line_end": 11
+                }
+            ],
+            "required_facts": ["備品管理者"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG15）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "G16",
+            "category": "synonym",
+            "query": "目標設定面談で決める目標の件数を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "3.1 目標設定",
+                    "line_start": 36,
+                    "line_end": 38
+                }
+            ],
+            "required_facts": ["3件以上5件以下"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え質問。2026-09-15にO2-17の検証用に追加した保留質問（O2-17検証記録のG16）。質問語の一部が本文に無くても期待資料を検索し、sufficient の抑制で正例を落とさないことを確認する。上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F01",
+            "category": "no-answer-near-miss",
+            "query": "出張中に病気になった場合の医療費の扱いを教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F02",
+            "category": "no-answer-near-miss",
+            "query": "新入社員のセキュリティ研修の講師は誰が担当しますか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F03",
+            "category": "no-answer-near-miss",
+            "query": "障害対応チャットチャンネルの名前は何ですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F04",
+            "category": "no-answer-near-miss",
+            "query": "備品管理者の連絡先の電話番号は何番ですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F05",
+            "category": "no-answer-near-miss",
+            "query": "データ復元の作業記録は何年間保管しますか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F06",
+            "category": "no-answer-near-miss",
+            "query": "大阪支社にあるプロジェクタは何台ですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F07",
+            "category": "no-answer-near-miss",
+            "query": "試用期間を延長する場合の手続きを教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F08",
+            "category": "no-answer-near-miss",
+            "query": "刷新後の会議室予約システムの使い方を教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F11",
+            "category": "synonym",
+            "query": "持ち出し記録簿への記入はどんなときに必要ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第3条 持ち出し",
+                    "line_start": 15,
+                    "line_end": 17
+                }
+            ],
+            "required_facts": ["都度"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F12",
+            "category": "synonym",
+            "query": "出張が半日で終わったときの日当はどうなりますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第2条 日当",
+                    "line_start": 9,
+                    "line_end": 19
+                }
+            ],
+            "required_facts": ["半額"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。作成後、限定条件の矛盾の誤検出（「の日当は」）で partial になることが分かり矛盾検出の照合を修正したため、未使用の検証には数えない。"
+        },
+        {
+            "id": "F13",
+            "category": "synonym",
+            "query": "返却確認書にはだれが署名しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-return-rules.md",
+                    "heading": "第2条 返却時の確認",
+                    "line_start": 9,
+                    "line_end": 11
+                }
+            ],
+            "required_facts": ["備品管理者"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F14",
+            "category": "synonym",
+            "query": "障害に気づいたらエラーメッセージなどを何分以内に確認しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "1.1 検知時の確認事項",
+                    "line_start": 7,
+                    "line_end": 15
+                }
+            ],
+            "required_facts": ["5分以内"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F15",
+            "category": "synonym",
+            "query": "復元したデータはまずどこへ戻しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "2.1 復元先の準備",
+                    "line_start": 29,
+                    "line_end": 31
+                }
+            ],
+            "required_facts": ["一時領域"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F16",
+            "category": "synonym",
+            "query": "パスワードを忘れたときの本人確認では誰の確認が必要ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "notes/support-meeting-notes.txt",
+                    "heading": "決定事項",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["所属長"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F17",
+            "category": "synonym",
+            "query": "アカウント発行は申請からどのくらいで完了しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "notes/support-meeting-notes.txt",
+                    "heading": "決定事項",
+                    "line_start": 5,
+                    "line_end": 6
+                }
+            ],
+            "required_facts": ["2営業日"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        },
+        {
+            "id": "F18",
+            "category": "synonym",
+            "query": "再発防止策がちゃんと実施されたかはいつ確認しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "3.2 再発防止策のフォローアップ",
+                    "line_start": 37,
+                    "line_end": 39
+                }
+            ],
+            "required_facts": ["1か月後"],
+            "forbidden_facts": [],
+            "holdout": true,
+            "notes": "言い換え・一般語を含む質問。判定規則v3を確定した後の2026-09-15に作成した保留質問。期待資料を検索し sufficient の抑制で正例を落とさないことを確認する。規則・上限・重みの調整に使わない。"
+        }
+    ]
+}
