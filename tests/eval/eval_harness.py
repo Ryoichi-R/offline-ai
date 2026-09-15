@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import json
 import io
+import re
 import statistics
 import time
+import unicodedata
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +44,15 @@ STATUS_SKIPPED = "skipped"
 STATUS_ERROR = "error"
 
 ANSWER_ABSTAIN_PHRASES = ("該当情報なし", "関連する資料が見つかりませんでした")
+
+# 生成モデルはファイル名や数値のハイフンを U+2011（改行しないハイフン）等で書くことがある
+# （2026-09-14の実モデル評価で gpt-oss の回答に確認）。照合の前に回答と照合語の両方を正規化する。
+_ANSWER_DASH_RE = re.compile("[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d]")
+
+
+def _normalize_answer_text(text: str) -> str:
+    """回答の機械照合用に、NFKC（全角半角）とハイフン類を統一する。"""
+    return _ANSWER_DASH_RE.sub("-", unicodedata.normalize("NFKC", str(text or "")))
 
 REQUIRED_QUESTION_KEYS = ("id", "category", "query", "answerable")
 _ALLOWED_ACCEPTANCE_KEYS = {
@@ -614,8 +625,13 @@ def measure_answer_probe(
         marker in answer_text or marker in captured_stderr.getvalue()
         for marker in ("接続エラー", "タイムアウト", "HTTPError")
     )
-    abstain_phrase = any(phrase in answer_text for phrase in ANSWER_ABSTAIN_PHRASES)
-    forbidden_fact = any(fact in answer_text for fact in question.forbidden_facts)
+    normalized_answer = _normalize_answer_text(answer_text)
+    abstain_phrase = any(
+        _normalize_answer_text(phrase) in normalized_answer for phrase in ANSWER_ABSTAIN_PHRASES
+    )
+    forbidden_fact = any(
+        _normalize_answer_text(fact) in normalized_answer for fact in question.forbidden_facts
+    )
     base.update(
         {
             "status": "measured",
@@ -729,10 +745,21 @@ def measure_answer_quality_probe(
         marker in answer_text or marker in captured_stderr.getvalue()
         for marker in ("接続エラー", "タイムアウト", "HTTPError")
     )
-    missing_facts = sum(1 for fact in question.required_facts if fact not in answer_text)
-    forbidden_fact = any(fact in answer_text for fact in question.forbidden_facts)
-    cites_expected = any(e.path in answer_text for e in question.expected_sources)
-    abstained = any(phrase in answer_text for phrase in ANSWER_ABSTAIN_PHRASES)
+    normalized_answer = _normalize_answer_text(answer_text)
+    missing_facts = sum(
+        1
+        for fact in question.required_facts
+        if _normalize_answer_text(fact) not in normalized_answer
+    )
+    forbidden_fact = any(
+        _normalize_answer_text(fact) in normalized_answer for fact in question.forbidden_facts
+    )
+    cites_expected = any(
+        _normalize_answer_text(e.path) in normalized_answer for e in question.expected_sources
+    )
+    abstained = any(
+        _normalize_answer_text(phrase) in normalized_answer for phrase in ANSWER_ABSTAIN_PHRASES
+    )
     nonempty = bool(answer_text.strip())
     base.update(
         {

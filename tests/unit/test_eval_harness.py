@@ -846,6 +846,40 @@ def test_answer_quality_probe_checks_facts_citation_and_abstain(answer, passed):
     assert "answer" not in probe and "snippet" not in probe
 
 
+def test_answer_quality_probe_normalizes_non_ascii_hyphens_and_full_width_text():
+    """gpt-oss が U+2011 でファイル名を書いた実例に基づく回帰防止。"""
+    outcome = _outcome([{"path": "a/b-c.md", "start_line": 12, "end_line": 18, "snippet": "本文"}])
+    question = _answerable_question(
+        expected_sources=(harness.ExpectedSource(path="a/b-c.md", line_start=10, line_end=20),),
+    )
+    answer = "日当は３，０００円です。出典: skill-source/a/b\u2011c.md"
+    with patch.object(harness.search, "stream_ollama_chat", return_value=answer):
+        probe = harness.measure_answer_quality_probe(question, outcome, chat_model="chat")
+
+    assert probe["cites_expected_source"] is True
+    assert probe["missing_required_facts"] == 0
+    assert probe["passed"] is True
+
+
+def test_answer_layer_probe_normalizes_forbidden_facts():
+    question = _question(
+        id="Q10",
+        category="no-answer-near-miss",
+        answerable=False,
+        expected_sources=(),
+        abstain_layer=harness.ABSTAIN_LAYER_ANSWER,
+        forbidden_facts=("2,500円",),
+    )
+    outcome = _outcome([{"path": "regulations/travel.md", "snippet": "国内出張の日当"}])
+    with patch.object(
+        harness.search, "stream_ollama_chat", return_value="該当情報なし。国内は２，５００円です。"
+    ):
+        probe = harness.measure_answer_probe(question, outcome, chat_model="chat")
+
+    assert probe["forbidden_fact"] is True
+    assert probe["passed"] is False
+
+
 def test_answer_quality_probe_is_not_measured_without_model_or_facts():
     outcome = _outcome([])
     no_model = harness.measure_answer_quality_probe(_answerable_question(), outcome, chat_model=None)
