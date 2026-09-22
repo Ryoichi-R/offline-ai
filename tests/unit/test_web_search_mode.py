@@ -7,6 +7,7 @@ import pytest
 
 import source_view
 import web_server
+import web_services
 
 
 @pytest.fixture
@@ -106,6 +107,53 @@ def test_evidence_view_endpoint_requires_auth_and_returns_line_window(running_se
         "GET",
         f"/api/evidence/view?evidence_id={evidence_id}",
         headers={"Host": f"127.0.0.1:{server.bind_port}"},
+    )
+    response = conn.getresponse()
+    body = json.loads(response.read().decode("utf-8"))
+    conn.close()
+    assert response.status == 403
+    assert body["error"]["code"] == "unauthorized"
+
+
+def test_search_cancel_requires_owner_and_sets_server_token(running_server):
+    server, _tmp_path = running_server
+    token = web_services.CancellationToken(300)
+    server.job_table.submit(
+        "cancel-me",
+        token,
+        fingerprint=("test-session-token", "質問", "off", 300, "deep"),
+        mode="deep",
+    )
+    payload = json.dumps({"request_id": "cancel-me"}).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=10)
+    conn.request(
+        "POST",
+        "/api/search/cancel",
+        body=payload,
+        headers={
+            "Host": f"127.0.0.1:{server.bind_port}",
+            "Cookie": "offlineai_session=test-session-token",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    response = conn.getresponse()
+    body = json.loads(response.read().decode("utf-8"))
+    conn.close()
+    assert response.status == 200
+    assert body["cancelled"] is True
+    assert token.is_cancelled
+
+    conn = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=10)
+    conn.request(
+        "POST",
+        "/api/search/cancel",
+        body=payload,
+        headers={
+            "Host": f"127.0.0.1:{server.bind_port}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
     )
     response = conn.getresponse()
     body = json.loads(response.read().decode("utf-8"))

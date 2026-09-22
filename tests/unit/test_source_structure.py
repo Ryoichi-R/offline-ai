@@ -206,3 +206,21 @@ def test_expand_range_without_children_returns_own_body():
     start, end = ss.expand_range(nodes, parent)
     assert start == parent.body_start_line
     assert end == parent.section_end_line
+
+
+def test_section_range_for_body_hit_preserves_parent_intro_without_sibling_leak():
+    text = "# 親\n適用条件\n## 子1\n本文1\n## 子2\n本文2\n"
+    nodes = _tree(text)
+
+    start, end, heading = ss.section_range_for_line(nodes, 2)
+
+    assert (start, end, heading) == (1, 2, "親")
+
+
+def test_section_range_for_nested_body_hit_selects_innermost_section():
+    text = "# 親\n## 子\n### 孫\n本文\n"
+    nodes = _tree(text)
+
+    start, end, heading = ss.section_range_for_line(nodes, 4)
+
+    assert (start, end, heading) == (3, 4, "孫")

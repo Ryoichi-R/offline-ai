@@ -247,7 +247,10 @@ def test_prompt_does_not_add_partial_contract_for_complete_or_direct_evidence():
     assert prompt_templates.PARTIAL_EXPANSION_CONTRACT not in prompt
 
 
-def test_prompt_shell_estimate_reserves_expansion_notices():
+def test_prompt_shell_estimate_reserves_expansion_notices(monkeypatch):
+    # 案A（既定ON）の不足理由の予約は別の試験で確かめるため、ここでは無効にして
+    # 展開表示と耐性文言の予約だけを見る。
+    monkeypatch.setattr(search, "_evidence_verify_enabled", lambda: False)
     base = len(prompt_templates.SYSTEM_PROMPT) + len(
         prompt_templates.build_user_prompt(
             "質問", [], attempts=[], evidence_status="partial", confidence=0.5
@@ -256,7 +259,11 @@ def test_prompt_shell_estimate_reserves_expansion_notices():
     estimated = search._estimate_prompt_shell_chars(
         "質問", attempts=[], evidence_status="partial", confidence=0.5
     )
-    assert estimated - base == prompt_templates.expansion_prompt_reserve_chars(
-        search.EVIDENCE_OUTPUT_MAX_ITEMS
+    # 展開表示に加え、資料内指示文への耐性文言（根拠がある場合だけ現れるため
+    # 根拠を空にした shell 見積りには出ない）も予約する。
+    assert (
+        estimated - base
+        == prompt_templates.expansion_prompt_reserve_chars(search.EVIDENCE_OUTPUT_MAX_ITEMS)
+        + prompt_templates.SOURCE_INSTRUCTION_IMMUNITY_RESERVE_CHARS
     )
     assert estimated - base >= len(prompt_templates.PARTIAL_EXPANSION_CONTRACT)

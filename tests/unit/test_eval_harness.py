@@ -208,6 +208,14 @@ def _outcome(matches, **overrides) -> harness.RouteOutcome:
         confidence=0.6,
         evidence_status="sufficient",
         latency_ms=5.0,
+        # E0-1: answer probe は outcome.answer_prompt (製品と同じ最終根拠予算を
+        # 適用した回答prompt) を使う。テストでは実際の build_user_prompt を通さず、
+        # ダミーの非空文字列で代用する（prompt文字列の中身自体は probe の検査対象
+        # ではない）。
+        answer_prompt="[dummy answer prompt for test]",
+        answer_matches=matches,
+        answer_confidence=0.6,
+        answer_evidence_status="sufficient",
     )
     base.update(overrides)
     return harness.RouteOutcome(**base)
@@ -587,7 +595,7 @@ def test_agentic_route_uses_eval_corpus_and_isolated_embedding_inputs():
         observed["embed_model"] = harness.search.detect_embed_model()
         observed["embed_cache"] = harness.search.build_or_update_embed_index("embed:tag", chunks)
         return SimpleNamespace(
-            matches=[], confidence=0.0, evidence_status="insufficient", attempts=[]
+            matches=[], confidence=0.0, evidence_status="insufficient", attempts=[], user_prompt=""
         )
 
     with patch.object(harness.search, "run_retrieval_pipeline", side_effect=fake_pipeline):
@@ -607,6 +615,72 @@ def test_agentic_route_uses_eval_corpus_and_isolated_embedding_inputs():
         "embed_model": "embed:tag",
         "embed_cache": embed_cache,
     }
+
+
+def test_agentic_route_records_verification_state_for_p2():
+    spec = harness.load_spec(SPEC_PATH)
+    question = spec.questions[0]
+
+    def fake_pipeline(query, *, model):
+        return SimpleNamespace(
+            matches=[],
+            confidence=0.5,
+            evidence_status="partial",
+            attempts=[],
+            user_prompt="prompt",
+            retrieval_status="sufficient",
+            verification_status="verified",
+            verification_latency_ms=1234.56,
+        )
+
+    with patch.object(harness.search, "run_retrieval_pipeline", side_effect=fake_pipeline):
+        outcome = harness.run_agentic_lite_route(
+            question, chat_model="chat:tag", chunks=[], embed_model=None, embed_cache=None
+        )
+    score = harness.score_question(question, outcome)
+
+    assert outcome.retrieval_status == "sufficient"
+    assert outcome.verification_status == "verified"
+    assert score.evidence_status == "partial"
+    assert score.pre_verification_status == "sufficient"
+    assert score.verification_status == "verified"
+    assert score.verification_latency_ms == 1234.6
+
+
+def test_answer_probe_records_verification_and_answer_latency():
+    question = _question(
+        id="Q10",
+        query="海外出張の日当はいくらですか",
+        answerable=False,
+        expected_sources=(),
+        abstain_layer=harness.ABSTAIN_LAYER_ANSWER,
+    )
+    outcome = _outcome(
+        [],
+        route=harness.ROUTE_AGENTIC_LITE,
+        evidence_status="partial",
+        retrieval_status="sufficient",
+        verification_status="failed",
+        verification_latency_ms=15000.0,
+    )
+    with patch.object(harness.search, "stream_ollama_chat", return_value="該当情報なし。"):
+        probe = harness.measure_answer_probe(question, outcome, chat_model="chat")
+
+    assert probe["retrieval_status"] == "partial"
+    assert probe["pre_verification_status"] == "sufficient"
+    assert probe["verification_status"] == "failed"
+    assert probe["verification_latency_ms"] == 15000.0
+    assert probe["retrieval_latency_ms"] == 5.0
+    assert probe["answer_latency_ms"] >= 0
+
+
+def test_keyword_outcome_has_no_verification_state():
+    probe = harness.measure_answer_quality_probe(
+        _question(required_facts=("x",)), _outcome([]), chat_model=None
+    )
+    assert probe["pre_verification_status"] == "sufficient"
+    assert probe["verification_status"] == ""
+    assert "answer_latency_ms" not in probe
 
 
 def test_run_evaluation_keyword_route_produces_full_report():
@@ -1056,3 +1130,48 @@ def test_run_eval_markdown_includes_quality_and_comparison_sections():
     assert "回答品質 probe" in markdown
     assert "親子展開 OFF/ON 比較" in markdown
     assert "保留質問:" in markdown
+
+
+def test_answer_fixture_sink_does_not_overwrite_same_run_id(tmp_path):
+    """通しの比較と同一根拠比較は同じ run_id を使う。後者が前者を上書きしない。"""
+    sink = harness.AnswerFixtureSink(tmp_path)
+    question = _question(id="T04", forbidden_facts=("所属長の承認",))
+    kwargs = dict(
+        run_id="T04:agentic-lite:1",
+        question=question,
+        route="agentic-lite",
+        prompt="p",
+        chat_model=None,
+        judgement={},
+    )
+
+    first = sink.save(answer_text="through", **kwargs)
+    second = sink.save(answer_text="same-evidence", **kwargs)
+
+    assert first != second
+    assert second.name.endswith("__2.json")
+    assert json.loads(first.read_text(encoding="utf-8"))["answer_text"] == "through"
+    assert json.loads(second.read_text(encoding="utf-8"))["answer_text"] == "same-evidence"
+
+
+@pytest.mark.parametrize(
+    "answer, allow, passed",
+    [
+        ("窓口は人材開発課と総務部で矛盾がある。該当情報なし。 a/b.md", True, True),
+        ("窓口は人材開発課と総務部で矛盾がある。該当情報なし。 a/b.md", False, False),
+        # 必要事項が欠ける場合は、併記の許容があっても不合格
+        ("窓口は人材開発課。該当情報なし。 a/b.md", True, False),
+    ],
+)
+def test_allow_abstain_phrase_only_when_all_required_facts_present(answer, allow, passed):
+    question = _question(required_facts=("人材開発課", "総務部"), allow_abstain_phrase=allow)
+    with patch.object(harness.search, "stream_ollama_chat", return_value=answer):
+        probe = harness.measure_answer_quality_probe(question, _outcome([]), chat_model="chat")
+    assert probe["passed"] is passed
+
+
+def test_parse_spec_rejects_allow_abstain_phrase_without_required_facts():
+    data = _minimal_spec()
+    data["questions"][0]["allow_abstain_phrase"] = True
+    with pytest.raises(harness.SpecError, match="allow_abstain_phrase"):
+        harness.parse_spec(data, spec_path=SPEC_PATH)
