@@ -130,6 +130,10 @@ def _score_to_dict(score: harness.QuestionScore) -> dict:
         "abstain_correct": score.abstain_correct,
         "abstain_layer": score.abstain_layer,
         "evidence_status": score.evidence_status,
+        "pre_verification_status": score.pre_verification_status,
+        "verification_status": score.verification_status,
+        "verification_latency_ms": score.verification_latency_ms,
+        "verification_failure_reason": score.verification_failure_reason,
         "confidence": score.confidence,
         "latency_ms": score.latency_ms,
         "attempts": score.attempts,
@@ -290,37 +294,64 @@ def build_markdown(receipt: dict) -> str:
         f"- 親子展開 ON/OFF 比較: {'実施' if receipt.get('expansion_comparison') is not None else '未実施'}"
         f"（本評価の展開設定: {receipt['environment'].get('parent_child_expansion', 'n/a')}）"
     )
+    lines.append(
+        f"- 案A（根拠検証、OFFLINE_AI_EVIDENCE_VERIFY）: {env.get('evidence_verify', 'n/a')} / "
+        f"Q-1（回答prompt流用禁止）: {'あり' if env.get('use_q1', True) else 'なし（P2評価専用）'}"
+    )
     lines.append("")
 
-    if receipt.get("answer_probes") is not None:
-        lines.append("## answer 層 probe（本文非保存）")
-        lines.append("")
-        lines.append(
-            "| route | question | 状態 | 判定 | retrieval status | abstain phrase | forbidden fact | transport error |"
+    lines.extend(_answer_layer_markdown(receipt, "answer_probes", "answer 層 probe（本文非保存、通しの比較）"))
+    lines.extend(
+        _answer_layer_markdown(
+            receipt,
+            "answer_probes_same_evidence",
+            "answer 層 probe（本文非保存、E0-2 同一根拠比較。受入判定には含めない）",
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-        for route, probes in receipt["answer_probes"].items():
-            for probe in probes:
-                lines.append(
-                    "| {route} | {qid} | {status} | {passed} | {retrieval} | {phrase} | {forbidden} | {transport} |".format(
-                        route=route,
-                        qid=probe["question_id"],
-                        status=probe["status"],
-                        passed="PASS"
-                        if probe.get("passed") is True
-                        else "FAIL"
-                        if probe.get("passed") is False
-                        else "NOT_MEASURED",
-                        retrieval=probe.get("retrieval_status", ""),
-                        phrase=probe.get("abstain_phrase", "-"),
-                        forbidden=probe.get("forbidden_fact", "-"),
-                        transport=probe.get("transport_error", "-"),
-                    )
-                )
-        lines.append("")
+    )
     lines.extend(_answer_quality_markdown(receipt))
+    lines.extend(_answer_quality_markdown(receipt, key="answer_quality_probes_same_evidence", heading="回答品質 probe（回答可能な質問、本文非保存、E0-2 同一根拠比較。受入判定には含めない）"))
     lines.extend(_expansion_comparison_markdown(receipt))
+    if receipt.get("answer_fixtures_saved_to"):
+        lines.append("## E0-5 評価用回答fixture（Git管理外の別保存）")
+        lines.append("")
+        lines.append(f"- 保存先: `{receipt['answer_fixtures_saved_to']}`")
+        lines.append("- 合成corpusでの評価に限る。利用者資料の評価では使わない契約。")
+        lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def _answer_layer_markdown(receipt: dict, key: str, heading: str) -> list[str]:
+    probes_by_route = receipt.get(key)
+    if probes_by_route is None:
+        return []
+    lines = [f"## {heading}", ""]
+    lines.append(
+        "| route | run_id | question | 状態 | 判定 | retrieval status | abstain phrase | forbidden fact | diversion判定 | diversion理由 | transport error |"
+    )
+    lines.append("|" + " --- |" * 11)
+    for route, probes in probes_by_route.items():
+        for probe in probes:
+            lines.append(
+                "| {route} | {run_id} | {qid} | {status} | {passed} | {retrieval} | {phrase} | {forbidden} | {diversion} | {dreason} | {transport} |".format(
+                    route=route,
+                    run_id=probe.get("run_id", "-"),
+                    qid=probe["question_id"],
+                    status=probe["status"],
+                    passed="PASS"
+                    if probe.get("passed") is True
+                    else "FAIL"
+                    if probe.get("passed") is False
+                    else "NOT_MEASURED",
+                    retrieval=probe.get("retrieval_status", ""),
+                    phrase=probe.get("abstain_phrase", "-"),
+                    forbidden=probe.get("forbidden_fact", "-"),
+                    diversion=probe.get("diversion_verdict", "-"),
+                    dreason=probe.get("diversion_reason", "-"),
+                    transport=probe.get("transport_error", "-"),
+                )
+            )
+    lines.append("")
+    return lines
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -367,6 +398,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="親子展開 OFF/ON の両方で評価し、質問ごとの status 遷移・再検索率を比較",
     )
+    parser.add_argument(
+        "--answer-compare-evidence",
+        action="store_true",
+        help=(
+            "E0-2: answer probe を「同一根拠比較」(検索1回を固定してrepeat回生成)"
+            "と「通しの比較」(検索から repeat 回やり直す)の両方で実行し、"
+            "receipt へ別々のキーとして残す（--measure-answer-layer/"
+            "--measure-answer-quality と併用）"
+        ),
+    )
+    parser.add_argument(
+        "--save-answer-fixtures",
+        action="store_true",
+        help=(
+            "E0-5: 評価用の別保存（利用者判断）。合成corpusでの回答本文・prompt・"
+            "モデル識別情報を Git 管理外の receipt 置き場へ保存し、新旧の評価器で"
+            "再採点できるようにする。利用者資料の評価では使わないこと"
+        ),
+    )
+    parser.add_argument(
+        "--no-q1",
+        action="store_true",
+        help=(
+            "P2: Q-1（回答promptの流用禁止ルール）導入前のSYSTEM_PROMPTを使う。"
+            "--measure-answer-layer/--measure-answer-quality と併用し、Q-1の"
+            "前後を比較する評価専用オプション（既定はQ-1あり=製品の現行挙動）"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -378,19 +437,24 @@ def _verdict_label(passed) -> str:
     return "NOT_MEASURED"
 
 
-def _answer_quality_markdown(receipt: dict) -> list[str]:
-    probes_by_route = receipt.get("answer_quality_probes")
+def _answer_quality_markdown(
+    receipt: dict,
+    *,
+    key: str = "answer_quality_probes",
+    heading: str = "回答品質 probe（回答可能な質問、本文非保存）",
+) -> list[str]:
+    probes_by_route = receipt.get(key)
     if probes_by_route is None:
         return []
-    lines = ["## 回答品質 probe（回答可能な質問、本文非保存）", ""]
+    lines = [f"## {heading}", ""]
     lines.append(
-        "| route | question | 状態 | 判定 | retrieval status | 必要事項欠落 | 期待source引用 | 該当なし回答 | forbidden fact | transport error |"
+        "| route | run_id | question | 状態 | 判定 | retrieval status | 必要事項欠落 | 期待source引用 | 該当なし回答 | forbidden fact | transport error |"
     )
-    lines.append("|" + " --- |" * 10)
+    lines.append("|" + " --- |" * 11)
     for route, probes in probes_by_route.items():
         for probe in probes:
             lines.append(
-                f"| {route} | {probe['question_id']} | {probe['status']} | {_verdict_label(probe.get('passed'))} | "
+                f"| {route} | {probe.get('run_id', '-')} | {probe['question_id']} | {probe['status']} | {_verdict_label(probe.get('passed'))} | "
                 f"{probe.get('retrieval_status', '')} | {probe.get('missing_required_facts', '-')} | "
                 f"{probe.get('cites_expected_source', '-')} | {probe.get('abstained', '-')} | "
                 f"{probe.get('forbidden_fact', '-')} | {probe.get('transport_error', '-')} |"
@@ -466,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     _force_utf8_stdio()
     args = parse_args(argv)
     started_at = datetime.now(timezone.utc).isoformat()
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     routes = (
         harness.ROUTES
         if args.routes.strip().lower() == "all"
@@ -539,6 +604,13 @@ def main(argv: list[str] | None = None) -> int:
             off_reports, on_reports = route_reports, other_reports
         expansion_comparison = harness.compare_expansion_reports(off_reports, on_reports)
 
+    fixture_sink = None
+    if args.save_answer_fixtures:
+        fixture_sink = harness.AnswerFixtureSink(
+            args.out_dir / "answer-fixtures" / run_stamp, chat_model=chat_model
+        )
+
+    # E0-2: 「通しの比較」(検索から repeat 回やり直す。既定の挙動)。
     answer_probes = None
     if args.measure_answer_layer:
         answer_probes = harness.measure_answer_layer(
@@ -548,6 +620,11 @@ def main(argv: list[str] | None = None) -> int:
             embed_model=embed_model,
             embed_cache=embed_cache,
             chat_model=chat_model,
+            repeat=args.repeat,
+            same_evidence=False,
+            save_answer_fixture=args.save_answer_fixtures,
+            fixture_sink=fixture_sink,
+            use_q1=not args.no_q1,
         )
         for route, probes in answer_probes.items():
             harness.apply_answer_probe_to_acceptance(route_reports[route], probes)
@@ -561,9 +638,49 @@ def main(argv: list[str] | None = None) -> int:
             embed_model=embed_model,
             embed_cache=embed_cache,
             chat_model=chat_model,
+            repeat=args.repeat,
+            same_evidence=False,
+            save_answer_fixture=args.save_answer_fixtures,
+            fixture_sink=fixture_sink,
+            use_q1=not args.no_q1,
         )
         for route, probes in answer_quality_probes.items():
             harness.apply_answer_quality_to_acceptance(route_reports[route], probes)
+
+    # E0-2: 「同一根拠比較」(検索1回を固定し、repeat回生成して生成だけの揺れを見る)。
+    # --answer-compare-evidence 指定時だけ追加実行し、受入判定(acceptance)には
+    # 反映しない（通しの比較の判定と混ぜないため、比較表としてのみ残す）。
+    answer_probes_same_evidence = None
+    if args.answer_compare_evidence and args.measure_answer_layer:
+        answer_probes_same_evidence = harness.measure_answer_layer(
+            spec,
+            routes=routes,
+            chunks=chunks,
+            embed_model=embed_model,
+            embed_cache=embed_cache,
+            chat_model=chat_model,
+            repeat=args.repeat,
+            same_evidence=True,
+            save_answer_fixture=args.save_answer_fixtures,
+            fixture_sink=fixture_sink,
+            use_q1=not args.no_q1,
+        )
+
+    answer_quality_probes_same_evidence = None
+    if args.answer_compare_evidence and args.measure_answer_quality:
+        answer_quality_probes_same_evidence = harness.measure_answer_quality(
+            spec,
+            routes=routes,
+            chunks=chunks,
+            embed_model=embed_model,
+            embed_cache=embed_cache,
+            chat_model=chat_model,
+            repeat=args.repeat,
+            same_evidence=True,
+            save_answer_fixture=args.save_answer_fixtures,
+            fixture_sink=fixture_sink,
+            use_q1=not args.no_q1,
+        )
 
     receipt = {
         "schema_version": "1.0",
@@ -592,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
             "repeat": args.repeat,
             "routes_requested": list(routes),
             "parent_child_expansion": "on" if search._parent_child_expansion_enabled() else "off",
+            "evidence_verify": "on" if search._evidence_verify_enabled() else "off",
+            "use_q1": not args.no_q1,
         },
         "routes": _routes_to_dict(route_reports),
     }
@@ -599,8 +718,19 @@ def main(argv: list[str] | None = None) -> int:
         receipt["answer_probes"] = answer_probes
     if answer_quality_probes is not None:
         receipt["answer_quality_probes"] = answer_quality_probes
+    # E0-2: 同一根拠比較は通しの比較と別表として残し、受入判定には混ぜない。
+    if answer_probes_same_evidence is not None:
+        receipt["answer_probes_same_evidence"] = answer_probes_same_evidence
+    if answer_quality_probes_same_evidence is not None:
+        receipt["answer_quality_probes_same_evidence"] = answer_quality_probes_same_evidence
     if expansion_comparison is not None:
         receipt["expansion_comparison"] = expansion_comparison
+    if args.save_answer_fixtures:
+        # E0-5: 評価用の別保存(利用者判断)。receipt自体には本文を含めず、
+        # 保存先ディレクトリだけを記録する。
+        receipt["answer_fixtures_saved_to"] = str(
+            (args.out_dir / "answer-fixtures" / run_stamp).as_posix()
+        )
 
     markdown = build_markdown(receipt)
     print(markdown)
@@ -610,7 +740,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = run_stamp
     json_path = out_dir / f"eval-receipt-{stamp}.json"
     md_path = out_dir / f"eval-receipt-{stamp}.md"
     json_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")

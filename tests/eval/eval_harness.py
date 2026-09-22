@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import search
-from prompt_templates import SYSTEM_PROMPT, build_user_prompt
+import diversion_evaluator
+from prompt_templates import SYSTEM_PROMPT, SYSTEM_PROMPT_WITHOUT_Q1, build_user_prompt
 
 SPEC_SCHEMA_VERSION = "1.0"
 
@@ -124,6 +125,10 @@ class Question:
     # True の質問は上限・重みの調整に使わない保留質問として別集計する。
     holdout: bool = False
     notes: str = ""
+    # True の場合、回答品質probeで required_facts がすべて含まれていれば「該当情報なし」の
+    # 併記を不合格にしない（2026-09-19の利用者判断、資料内の矛盾型T10用。partial時の
+    # 「根拠不足を明示」規則により、両論を示したうえで該当情報なしとも書く回答が多いため）。
+    allow_abstain_phrase: bool = False
 
 
 @dataclass(frozen=True)
@@ -233,6 +238,11 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
         holdout = raw.get("holdout", False)
         if not isinstance(holdout, bool):
             raise SpecError(f"{question_id}: holdout は真偽値")
+        allow_abstain_phrase = raw.get("allow_abstain_phrase", False)
+        if not isinstance(allow_abstain_phrase, bool):
+            raise SpecError(f"{question_id}: allow_abstain_phrase は真偽値")
+        if allow_abstain_phrase and not raw.get("required_facts"):
+            raise SpecError(f"{question_id}: allow_abstain_phrase には required_facts が必要")
         require_expected_lines = raw.get("require_expected_lines", False)
         if not isinstance(require_expected_lines, bool):
             raise SpecError(f"{question_id}: require_expected_lines は真偽値")
@@ -266,6 +276,7 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
                 expected_expansion=expected_expansion,
                 holdout=holdout,
                 notes=str(raw.get("notes", "")).strip(),
+                allow_abstain_phrase=allow_abstain_phrase,
             )
         )
 
@@ -320,6 +331,25 @@ class RouteOutcome:
     trace: list[dict] = field(default_factory=list)
     # 検索計画の必須語（agentic-lite のみ）。展開を除いた通常根拠の再判定に使う。
     must_find_terms: tuple[str, ...] = ()
+    # E0-1: 製品の回答経路と同じ最終根拠予算(char_limit)を適用した後の採用根拠と
+    # 回答prompt。answer probe はこちらを使い、通常の検索評価用 matches/confidence/
+    # evidence_status（件数枠配分後・char_limit適用前）とは分離する。
+    # agentic-lite は run_retrieval_pipeline が返す user_prompt をそのまま使うため、
+    # answer_* と matches/confidence/evidence_status は同じ値になる。
+    answer_prompt: str = ""
+    answer_matches: list[dict] = field(default_factory=list)
+    answer_confidence: float = 0.0
+    answer_evidence_status: str = "insufficient"
+    # keyword/hybrid は検索計画(attempts)を持たないため、製品の回答経路と条件が
+    # 完全には一致しない。receipt へ明記するための注記。
+    answer_prompt_parity_note: str = ""
+    # P2: 案A（LLM根拠検証）の記録。agentic-lite だけが製品 pipeline から受け取る。
+    # retrieval_status は検証前の検索側の状態（evidence_status は検証後）。
+    # keyword/hybrid は検証を通らないため空文字のまま（not applicable）。
+    retrieval_status: str = ""
+    verification_status: str = ""
+    verification_latency_ms: float = 0.0
+    verification_failure_reason: str = ""
 
 
 def build_corpus_chunks(corpus_dir: Path) -> list[dict]:
@@ -366,6 +396,55 @@ def _finalize_route_evidence(
     )
 
 
+KEYWORD_HYBRID_PARITY_NOTE = (
+    "keyword/hybrid route には検索計画(agentic-liteのsearch plan)が無いため、"
+    "製品の回答経路(mode=answer)と検索試行の条件が完全には一致しない。"
+    "最終根拠予算(char_limit)の適用とbuild_user_promptの引数は製品と揃えている。"
+)
+
+
+def _build_answer_prompt(
+    query: str,
+    evidence_items: list[dict],
+    *,
+    confidence: float,
+    evidence_status: str,
+    attempts: list[dict] | None = None,
+) -> tuple[list[dict], float, str, str]:
+    """製品 `run_retrieval_pipeline` の回答prompt構築の最終段（根拠予算の適用 →
+    build_user_prompt）を、keyword/hybrid route にも同じ条件で再現する。
+
+    agentic-lite は pipeline 内で既にこの処理を終えているため、この関数は
+    keyword/hybrid route からだけ呼ぶ。
+    """
+    attempts = attempts or []
+    shell_chars = (
+        search._estimate_prompt_shell_chars(
+            query,
+            attempts=attempts,
+            evidence_status=evidence_status,
+            confidence=confidence,
+        )
+        if search.GENERATION_RESERVE_TOKENS > 0
+        else 0
+    )
+    evidence_char_limit = search.compute_evidence_char_limit(shell_chars)
+    matches, final_confidence, final_status = search.select_final_evidence(
+        query,
+        evidence_items,
+        limit=search.final_evidence_match_limit(),
+        char_limit=evidence_char_limit,
+    )
+    user_prompt = build_user_prompt(
+        query,
+        matches,
+        attempts=attempts,
+        evidence_status=final_status,
+        confidence=final_confidence,
+    )
+    return matches, final_confidence, final_status, user_prompt
+
+
 def run_keyword_route(
     question: Question, chunks: list[dict], *, corpus_dir: Path | None = None
 ) -> RouteOutcome:
@@ -382,6 +461,9 @@ def run_keyword_route(
     matches, confidence, evidence_status = _finalize_route_evidence(
         question.query, merged, chunks, corpus_dir, trace
     )
+    answer_matches, answer_confidence, answer_status, answer_prompt = _build_answer_prompt(
+        question.query, matches, confidence=confidence, evidence_status=evidence_status
+    )
     return RouteOutcome(
         route=ROUTE_KEYWORD,
         status=STATUS_COMPLETED,
@@ -391,6 +473,11 @@ def run_keyword_route(
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=1,
         trace=[trace],
+        answer_prompt=answer_prompt,
+        answer_matches=answer_matches,
+        answer_confidence=answer_confidence,
+        answer_evidence_status=answer_status,
+        answer_prompt_parity_note=KEYWORD_HYBRID_PARITY_NOTE,
     )
 
 
@@ -454,6 +541,9 @@ def run_hybrid_route(
     matches, confidence, evidence_status = _finalize_route_evidence(
         question.query, merged, chunks, corpus_dir, trace
     )
+    answer_matches, answer_confidence, answer_status, answer_prompt = _build_answer_prompt(
+        question.query, matches, confidence=confidence, evidence_status=evidence_status
+    )
     return RouteOutcome(
         route=ROUTE_HYBRID,
         status=STATUS_COMPLETED,
@@ -463,6 +553,11 @@ def run_hybrid_route(
         latency_ms=(time.perf_counter() - started) * 1000,
         attempts=1,
         trace=[trace],
+        answer_prompt=answer_prompt,
+        answer_matches=answer_matches,
+        answer_confidence=answer_confidence,
+        answer_evidence_status=answer_status,
+        answer_prompt_parity_note=KEYWORD_HYBRID_PARITY_NOTE,
     )
 
 
@@ -595,7 +690,105 @@ def run_agentic_lite_route(
         must_find_terms=tuple(
             str(term) for term in (getattr(result, "plan", {}) or {}).get("must_find_terms", []) or []
         ),
+        # agentic-lite は pipeline が既に最終根拠予算を適用した user_prompt を
+        # 返す（search_only=False）。matches/confidence/evidence_status と同じ
+        # 採用根拠から作られているため、answer_* はそのまま複製する。
+        answer_prompt=result.user_prompt,
+        answer_matches=list(result.matches),
+        answer_confidence=result.confidence,
+        answer_evidence_status=result.evidence_status,
+        retrieval_status=getattr(result, "retrieval_status", "") or result.evidence_status,
+        verification_status=getattr(result, "verification_status", ""),
+        verification_latency_ms=float(getattr(result, "verification_latency_ms", 0.0) or 0.0),
+        verification_failure_reason=getattr(result, "verification_failure_reason", "") or "",
     )
+
+
+def _verification_fields(outcome: RouteOutcome) -> dict[str, Any]:
+    """P2: 検索前後の状態・案Aの検証状態・遅延を probe/score 共通の形で返す。"""
+    return {
+        "pre_verification_status": outcome.retrieval_status or outcome.evidence_status,
+        "verification_status": outcome.verification_status,
+        "verification_latency_ms": round(outcome.verification_latency_ms, 1),
+        "verification_failure_reason": outcome.verification_failure_reason,
+        "retrieval_latency_ms": round(outcome.latency_ms, 1),
+    }
+
+
+def _run_id(question_id: str, route: str, run_index: int) -> str:
+    """E0-1: 検索・検証・回答を対応付けるための実行単位識別子。"""
+    return f"{question_id}:{route}:{run_index}"
+
+
+class AnswerFixtureSink:
+    """E0-5: 合成資料の評価に限り、回答本文を Git 管理外の別置き場へ保存する。
+
+    現行の「receipt へ回答本文を保存しない」契約は維持したまま、新旧の
+    評価器で再採点できるようにするための利用者判断（評価用の別保存）を実装
+    する。保存先は既定で ``.test-results/`` 配下（``.gitignore`` で除外済み）。
+
+    利用者資料の評価で誤って保存しないよう、呼び出し側（``run_eval.py``）は
+    評価専用 corpus（``tests/eval/corpus`` 配下）を扱う経路からしか
+    ``save_answer_fixture=True`` を渡さない。このクラス自体は経路を問わず
+    書き込むため、呼び出し境界（CLI 引数の既定 False）が安全装置になる。
+    """
+
+    def __init__(self, out_dir: Path, *, chat_model: str | None = None):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._chat_model_identity = (
+            search.get_embed_model_identity(chat_model) if chat_model else None
+        )
+
+    def save(
+        self,
+        *,
+        run_id: str,
+        question: "Question",
+        route: str,
+        prompt: str,
+        answer_text: str,
+        chat_model: str | None,
+        judgement: dict[str, Any],
+    ) -> Path:
+        record = {
+            "schema_version": "1.0",
+            "note": (
+                "hashは同一性の確認にしか使えず、意味の再確認はできない。"
+                "評価用の別保存であり、利用者資料の評価には使わない契約。"
+            ),
+            "saved_at": _now_utc_iso(),
+            "run_id": run_id,
+            "question_id": question.id,
+            "route": route,
+            "query": question.query,
+            "forbidden_facts": list(question.forbidden_facts),
+            "model": {
+                "name": chat_model or "",
+                "digest": (self._chat_model_identity or {}).get("digest", ""),
+            },
+            "prompt_sha256": search._text_sha256(prompt),
+            "answer_sha256": search._text_sha256(answer_text),
+            "prompt": prompt,
+            "answer_text": answer_text,
+            "judgement": judgement,
+        }
+        stem = f"{route}__{question.id}__{run_id.replace(':', '_')}"
+        path = self.out_dir / f"{stem}.json"
+        # 通しの比較と同一根拠比較は同じ run_id を使うため、上書きせず連番を付ける
+        # （保存順が通し→同一根拠なので、連番なし=通し、__2=同一根拠になる）。
+        suffix = 2
+        while path.exists():
+            path = self.out_dir / f"{stem}__{suffix}.json"
+            suffix += 1
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+
+def _now_utc_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def measure_answer_probe(
@@ -603,14 +796,35 @@ def measure_answer_probe(
     outcome: RouteOutcome,
     *,
     chat_model: str | None,
+    route: str = "",
+    run_index: int = 1,
+    save_answer_fixture: bool = False,
+    fixture_sink: "AnswerFixtureSink | None" = None,
+    use_q1: bool = True,
 ) -> dict[str, Any]:
-    """回答層を本文保存なしで測る。対象は answer 層の no-answer 質問だけ。"""
+    """回答層を本文保存なしで測る。対象は answer 層の no-answer 質問だけ。
+
+    製品の回答経路(``mode=answer``)と同じ最終根拠予算を適用した
+    ``outcome.answer_prompt`` を使う（E0-1）。keyword/hybrid route は検索計画を
+    持たないため、``outcome.answer_prompt_parity_note`` を receipt へ残す。
+
+    ``use_q1=False``（P2評価専用）は、SYSTEM_PROMPTからQ-1（流用禁止ルール）
+    を除いた``SYSTEM_PROMPT_WITHOUT_Q1``を使い、Q-1導入前の状態を再現する。
+    user prompt（``outcome.answer_prompt``、根拠・不足理由を含む）自体は
+    Q-1の有無に関わらず同じものを使う（Q-1はSYSTEM_PROMPTの約束事であり、
+    user promptの構成要素ではないため）。
+    """
     base = {
         "question_id": question.id,
+        "run_id": _run_id(question.id, route, run_index),
         "status": "not_measured",
         "passed": None,
         "retrieval_status": outcome.evidence_status,
+        "answer_retrieval_status": outcome.answer_evidence_status,
         "returned_count": len(outcome.matches),
+        "prompt_parity_note": outcome.answer_prompt_parity_note,
+        "use_q1": use_q1,
+        **_verification_fields(outcome),
     }
     if question.abstain_layer != ABSTAIN_LAYER_ANSWER:
         base["reason"] = "answer 層の対象外"
@@ -622,20 +836,21 @@ def measure_answer_probe(
         base["reason"] = "chat model が利用できない"
         return base
 
-    prompt = build_user_prompt(
-        question.query,
-        outcome.matches,
-        evidence_status=outcome.evidence_status,
-        confidence=outcome.confidence,
-    )
+    prompt = outcome.answer_prompt
+    if not prompt:
+        base.update({"status": STATUS_ERROR, "passed": False, "reason": "answer_prompt が空"})
+        return base
+    system_prompt = SYSTEM_PROMPT if use_q1 else SYSTEM_PROMPT_WITHOUT_Q1
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
+    answer_started = time.perf_counter()
     try:
         with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
-            answer = search.stream_ollama_chat(chat_model, SYSTEM_PROMPT, prompt)
+            answer = search.stream_ollama_chat(chat_model, system_prompt, prompt)
     except Exception as exc:  # noqa: BLE001 - type only is safe for receipt
         base.update({"status": STATUS_ERROR, "passed": False, "error_type": type(exc).__name__})
         return base
+    base["answer_latency_ms"] = round((time.perf_counter() - answer_started) * 1000, 1)
 
     answer_text = str(answer or "")
     transport_error = any(
@@ -649,12 +864,23 @@ def measure_answer_probe(
     forbidden_fact = any(
         _normalize_answer_text(fact) in normalized_answer for fact in question.forbidden_facts
     )
+    diversion_verdict = None
+    if question.forbidden_facts:
+        diversion_verdict = diversion_evaluator.evaluate_diversion(
+            answer_text, question.forbidden_facts
+        )
+    # E0-4/E0b: 利用者判断（2026-09-16、fixture全件一致と実機基準値で新判定器の
+    # 優位性を確認、hybrid run1で変更前判定が見逃した流用を検出した実例あり）に
+    # より、diversion_verdict を passed 判定へ採用する。forbidden_facts が無い
+    # 質問（流用対象外）は従来どおり abstain_phrase だけで判定する。変更前判定
+    # (forbidden_fact 原文一致)は比較のため receipt へ残す。
+    diverted = diversion_verdict is not None and diversion_verdict.verdict == diversion_evaluator.VERDICT_FAIL
     base.update(
         {
             "status": "measured",
             "passed": bool(answer_text.strip())
             and abstain_phrase
-            and not forbidden_fact
+            and not diverted
             and not transport_error,
             "answer_nonempty": bool(answer_text.strip()),
             "abstain_phrase": abstain_phrase,
@@ -662,6 +888,24 @@ def measure_answer_probe(
             "transport_error": transport_error,
         }
     )
+    if diversion_verdict is not None:
+        base["diversion_verdict"] = diversion_verdict.verdict
+        base["diversion_reason"] = diversion_verdict.reason
+        base["diversion_passed"] = diversion_verdict.verdict == diversion_evaluator.VERDICT_PASS
+    if save_answer_fixture and fixture_sink is not None:
+        fixture_sink.save(
+            run_id=base["run_id"],
+            question=question,
+            route=route,
+            prompt=prompt,
+            answer_text=answer_text,
+            chat_model=chat_model,
+            judgement={
+                "forbidden_fact": forbidden_fact,
+                "diversion_verdict": diversion_verdict.verdict if diversion_verdict else None,
+                "diversion_reason": diversion_verdict.reason if diversion_verdict else None,
+            },
+        )
     return base
 
 
@@ -673,23 +917,66 @@ def measure_answer_layer(
     embed_model: str | None = None,
     embed_cache: dict | None = None,
     chat_model: str | None = None,
+    repeat: int = 1,
+    same_evidence: bool = False,
+    save_answer_fixture: bool = False,
+    fixture_sink: "AnswerFixtureSink | None" = None,
+    use_q1: bool = True,
 ) -> dict[str, list[dict]]:
-    """各 route の answer 層対象を1回だけ測る。回答本文は返さない。"""
+    """各 route の answer 層対象を測る。回答本文は返さない。
+
+    E0-1: ``repeat`` に合わせて反復する（既定1で従来どおり）。
+    E0-2: ``same_evidence=False``（既定、通しの比較）は repeat 回とも検索から
+    やり直し、製品の実際の挙動（検索計画の揺れを含む）を比べる。
+    ``same_evidence=True``（同一根拠比較）は検索を1回だけ行い、同じ採用根拠・
+    回答promptから repeat 回生成し、生成だけの揺れを見る。呼び出し側
+    （``run_eval.py``）はこの2種類を別々の receipt キーへ出し、混在させない。
+    ``use_q1=False``（P2評価専用）はQ-1導入前のSYSTEM_PROMPTを使う。
+    """
+    if repeat < 1:
+        raise SpecError("repeat は1以上でなければならない")
     answer_questions = [q for q in spec.questions if q.abstain_layer == ABSTAIN_LAYER_ANSWER]
     probes: dict[str, list[dict]] = {}
     for route in routes:
-        route_probes = []
+        route_probes: list[dict] = []
         for question in answer_questions:
-            outcome = run_route(
-                route,
-                question,
-                chunks=chunks,
-                embed_model=embed_model,
-                embed_cache=embed_cache,
-                chat_model=chat_model,
-                corpus_dir=spec.corpus_dir,
-            )
-            route_probes.append(measure_answer_probe(question, outcome, chat_model=chat_model))
+            if same_evidence:
+                outcome = run_route(
+                    route,
+                    question,
+                    chunks=chunks,
+                    embed_model=embed_model,
+                    embed_cache=embed_cache,
+                    chat_model=chat_model,
+                    corpus_dir=spec.corpus_dir,
+                )
+                outcomes = [outcome] * repeat
+            else:
+                outcomes = [
+                    run_route(
+                        route,
+                        question,
+                        chunks=chunks,
+                        embed_model=embed_model,
+                        embed_cache=embed_cache,
+                        chat_model=chat_model,
+                        corpus_dir=spec.corpus_dir,
+                    )
+                    for _ in range(repeat)
+                ]
+            for run_index, run_outcome in enumerate(outcomes, start=1):
+                route_probes.append(
+                    measure_answer_probe(
+                        question,
+                        run_outcome,
+                        chat_model=chat_model,
+                        route=route,
+                        run_index=run_index,
+                        save_answer_fixture=save_answer_fixture,
+                        fixture_sink=fixture_sink,
+                        use_q1=use_q1,
+                    )
+                )
         probes[route] = route_probes
     return probes
 
@@ -717,6 +1004,11 @@ def measure_answer_quality_probe(
     outcome: RouteOutcome,
     *,
     chat_model: str | None,
+    route: str = "",
+    run_index: int = 1,
+    save_answer_fixture: bool = False,
+    fixture_sink: "AnswerFixtureSink | None" = None,
+    use_q1: bool = True,
 ) -> dict[str, Any]:
     """回答可能な質問の回答を本文保存なしで検査する。
 
@@ -724,13 +1016,20 @@ def measure_answer_quality_probe(
     ``forbidden_facts`` を含まない、期待 source の path を引用する、該当情報なしと
     答えない、接続エラーでない。意味内容の正しさの証明ではなく、特定の例示文言を
     回答へ強制する目的にも使わない（``required_facts`` は短い必要事項に留める）。
+    製品の回答経路と同じ最終根拠予算を適用した ``outcome.answer_prompt`` を使う
+    （E0-1）。``use_q1=False`` はP2評価専用（measure_answer_probeと同じ契約）。
     """
     base = {
         "question_id": question.id,
+        "run_id": _run_id(question.id, route, run_index),
         "status": "not_measured",
         "passed": None,
         "retrieval_status": outcome.evidence_status,
+        "answer_retrieval_status": outcome.answer_evidence_status,
         "returned_count": len(outcome.matches),
+        "prompt_parity_note": outcome.answer_prompt_parity_note,
+        "use_q1": use_q1,
+        **_verification_fields(outcome),
     }
     if not question.answerable or not question.required_facts:
         base["reason"] = "回答品質の対象外（answerable かつ required_facts あり）"
@@ -742,20 +1041,21 @@ def measure_answer_quality_probe(
         base["reason"] = "chat model が利用できない"
         return base
 
-    prompt = build_user_prompt(
-        question.query,
-        outcome.matches,
-        evidence_status=outcome.evidence_status,
-        confidence=outcome.confidence,
-    )
+    prompt = outcome.answer_prompt
+    if not prompt:
+        base.update({"status": STATUS_ERROR, "passed": False, "reason": "answer_prompt が空"})
+        return base
+    system_prompt = SYSTEM_PROMPT if use_q1 else SYSTEM_PROMPT_WITHOUT_Q1
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
+    answer_started = time.perf_counter()
     try:
         with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
-            answer = search.stream_ollama_chat(chat_model, SYSTEM_PROMPT, prompt)
+            answer = search.stream_ollama_chat(chat_model, system_prompt, prompt)
     except Exception as exc:  # noqa: BLE001 - type only is safe for receipt
         base.update({"status": STATUS_ERROR, "passed": False, "error_type": type(exc).__name__})
         return base
+    base["answer_latency_ms"] = round((time.perf_counter() - answer_started) * 1000, 1)
 
     answer_text = str(answer or "")
     transport_error = any(
@@ -785,7 +1085,7 @@ def measure_answer_quality_probe(
             and missing_facts == 0
             and not forbidden_fact
             and cites_expected
-            and not abstained
+            and (not abstained or (question.allow_abstain_phrase and missing_facts == 0))
             and not transport_error,
             "answer_nonempty": nonempty,
             "missing_required_facts": missing_facts,
@@ -795,6 +1095,16 @@ def measure_answer_quality_probe(
             "transport_error": transport_error,
         }
     )
+    if save_answer_fixture and fixture_sink is not None:
+        fixture_sink.save(
+            run_id=base["run_id"],
+            question=question,
+            route=route,
+            prompt=prompt,
+            answer_text=answer_text,
+            chat_model=chat_model,
+            judgement={"forbidden_fact": forbidden_fact, "missing_required_facts": missing_facts},
+        )
     return base
 
 
@@ -806,15 +1116,26 @@ def measure_answer_quality(
     embed_model: str | None = None,
     embed_cache: dict | None = None,
     chat_model: str | None = None,
+    repeat: int = 1,
+    same_evidence: bool = False,
+    save_answer_fixture: bool = False,
+    fixture_sink: "AnswerFixtureSink | None" = None,
+    use_q1: bool = True,
 ) -> dict[str, list[dict]]:
-    """各 route の回答可能な質問を1回ずつ回答生成して検査する。回答本文は返さない。"""
+    """各 route の回答可能な質問の回答を検査する。回答本文は返さない。
+
+    E0-1/E0-2: ``measure_answer_layer`` と同じ repeat・same_evidence 契約。
+    ``use_q1=False``（P2評価専用）はQ-1導入前のSYSTEM_PROMPTを使う。
+    """
+    if repeat < 1:
+        raise SpecError("repeat は1以上でなければならない")
     targets = [q for q in spec.questions if q.answerable and q.required_facts]
     probes: dict[str, list[dict]] = {}
     for route in routes:
-        probes[route] = [
-            measure_answer_quality_probe(
-                question,
-                run_route(
+        route_probes: list[dict] = []
+        for question in targets:
+            if same_evidence:
+                outcome = run_route(
                     route,
                     question,
                     chunks=chunks,
@@ -822,11 +1143,35 @@ def measure_answer_quality(
                     embed_cache=embed_cache,
                     chat_model=chat_model,
                     corpus_dir=spec.corpus_dir,
-                ),
-                chat_model=chat_model,
-            )
-            for question in targets
-        ]
+                )
+                outcomes = [outcome] * repeat
+            else:
+                outcomes = [
+                    run_route(
+                        route,
+                        question,
+                        chunks=chunks,
+                        embed_model=embed_model,
+                        embed_cache=embed_cache,
+                        chat_model=chat_model,
+                        corpus_dir=spec.corpus_dir,
+                    )
+                    for _ in range(repeat)
+                ]
+            for run_index, run_outcome in enumerate(outcomes, start=1):
+                route_probes.append(
+                    measure_answer_quality_probe(
+                        question,
+                        run_outcome,
+                        chat_model=chat_model,
+                        route=route,
+                        run_index=run_index,
+                        save_answer_fixture=save_answer_fixture,
+                        fixture_sink=fixture_sink,
+                        use_q1=use_q1,
+                    )
+                )
+        probes[route] = route_probes
     return probes
 
 
@@ -927,6 +1272,8 @@ class QuestionScore:
     route: str
     status: str
     passed: bool | None
+    # E0-1: 検索・検証・回答を対応付けるための実行単位識別子（質問ID・経路・実行番号）。
+    run_id: str = ""
     retrieval_hit: bool | None = None
     hit_at_1: bool | None = None
     evidence_coverage: float | None = None
@@ -951,6 +1298,11 @@ class QuestionScore:
     returned_count: int = 0
     reason: str = ""
     matches: list[dict] = field(default_factory=list)
+    # P2: 案Aの記録（RouteOutcome と同じ意味。keyword/hybrid は空文字）。
+    pre_verification_status: str = ""
+    verification_status: str = ""
+    verification_latency_ms: float = 0.0
+    verification_failure_reason: str = ""
 
 
 def _ranges_overlap(
@@ -1050,8 +1402,9 @@ def _expansion_expectation_met(question: Question, outcome: RouteOutcome) -> boo
     return not any(m.get("group_partial") for m in expanded)
 
 
-def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
+def score_question(question: Question, outcome: RouteOutcome, *, run_index: int = 1) -> QuestionScore:
     """1質問1 route の採点。skip / error は PASS でも FAIL でもなく `None` とする。"""
+    run_id = _run_id(question.id, outcome.route, run_index)
     if outcome.status != STATUS_COMPLETED:
         return QuestionScore(
             question_id=question.id,
@@ -1059,6 +1412,7 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
             route=outcome.route,
             status=outcome.status,
             passed=None,
+            run_id=run_id,
             reason=outcome.reason,
             latency_ms=round(outcome.latency_ms, 3),
             attempts=outcome.attempts,
@@ -1158,6 +1512,7 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
         route=outcome.route,
         status=outcome.status,
         passed=passed,
+        run_id=run_id,
         retrieval_hit=retrieval_hit,
         hit_at_1=hit_at_1,
         evidence_coverage=None if coverage is None else round(coverage, 4),
@@ -1179,6 +1534,10 @@ def score_question(question: Question, outcome: RouteOutcome) -> QuestionScore:
         attempts=outcome.attempts,
         returned_count=len(returned_paths),
         matches=[redact_match(m) for m in outcome.matches],
+        pre_verification_status=outcome.retrieval_status or outcome.evidence_status,
+        verification_status=outcome.verification_status,
+        verification_latency_ms=round(outcome.verification_latency_ms, 1),
+        verification_failure_reason=outcome.verification_failure_reason,
     )
 
 
@@ -1423,6 +1782,7 @@ def run_evaluation(
                         chat_model=chat_model,
                         corpus_dir=spec.corpus_dir,
                     ),
+                    run_index=run_index,
                 )
                 for question in spec.questions
             ]

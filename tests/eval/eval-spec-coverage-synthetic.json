@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.1",
+  "corpus_dir": "corpus",
+  "notes": "deepモードの条件・例外・期限・参照範囲を測る合成fixture。実在制度の正解や法的判断を表さない。 意味上の支持は人手レビューを要求する。既存P2保留資料を使用済みなのでdeepでは調整群として扱い、新規保留群を別に固定する。",
+  "acceptance": {
+    "min_item_coverage": 1.0,
+    "max_critical_misses": 0,
+    "max_unsupported_citations": 0
+  },
+  "items": [
+    {
+      "id": "C01",
+      "category": "scope",
+      "required_terms": [
+        "正社員",
+        "対象外"
+      ],
+      "required_evidence_terms": [
+        "非正規雇用者"
+      ],
+      "expected_sources": [
+        {
+          "path": "regulations/training-program-rules.md",
+          "line_start": 5,
+          "line_end": 7,
+          "sha256": "47a04b63672b09d5a84f25ce4470bf3185bab0ca0806f1ebf24ab11bfb9a4156"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "正社員が対象であり、非正規雇用者は対象外。"
+      ],
+      "forbidden_patterns": [
+        "正社員.{0,5}(対象外|対象ではない)",
+        "非正規雇用者.{0,5}(が|は)対象(です|である)"
+      ]
+    },
+    {
+      "id": "C02",
+      "category": "exception",
+      "required_terms": [
+        "会社負担",
+        "資格試験",
+        "個人負担"
+      ],
+      "required_evidence_terms": [
+        "所属長",
+        "受講申込書"
+      ],
+      "expected_sources": [
+        {
+          "path": "regulations/training-program-rules.md",
+          "line_start": 17,
+          "line_end": 19,
+          "sha256": "47a04b63672b09d5a84f25ce4470bf3185bab0ca0806f1ebf24ab11bfb9a4156"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "外部研修は事前の所属長承認と受講申込書を要する。",
+        "受講料は会社負担が原則、資格試験の受験料は個人負担。"
+      ],
+      "forbidden_patterns": [
+        "承認.{0,16}(不要|必要ない)",
+        "会社負担.{0,5}(認めず|ではない)"
+      ]
+    },
+    {
+      "id": "C03",
+      "category": "deadline",
+      "required_terms": [
+        "人材開発課",
+        "5営業日前"
+      ],
+      "required_evidence_terms": [
+        "指定様式",
+        "研修開始日"
+      ],
+      "expected_sources": [
+        {
+          "path": "regulations/training-program-rules.md",
+          "line_start": 25,
+          "line_end": 27,
+          "sha256": "47a04b63672b09d5a84f25ce4470bf3185bab0ca0806f1ebf24ab11bfb9a4156"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "研修申込みの窓口は人材開発課。",
+        "指定様式の申込書は研修開始日の5営業日前まで。"
+      ],
+      "forbidden_patterns": [
+        "5営業日前.{0,10}(過ぎても|以降でよい)"
+      ]
+    }
+  ],
+  "split": "development"
+}

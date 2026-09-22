@@ -278,7 +278,7 @@
             "required_facts": [],
             "forbidden_facts": ["所属長の承認", "19時以降"],
             "holdout": true,
-            "notes": "該当なし（近接語）。データ復元手順書は存在するが、外部委託先への依頼手順は記載がない。関連資料と親見出しが検索に当たっても sufficient を宣言しないことを確認する。上限・重みの調整に使わない保留質問。"
+            "notes": "該当なし（近接語）。データ復元手順書は存在するが、外部委託先への依頼手順は記載がない。関連資料と親見出しが検索に当たっても sufficient を宣言しないことを確認する。上限・重みの調整に使わない保留質問。 E0-4（2026-09-16）: 結論節だけで forbidden_facts を照合する案（Q-2a）は、本文中で流用しつつ結論だけ該当情報なしと述べる回答（該当なしと誤手順の併記）を誤ってPASSにするため取り下げた。代わりに回答全体を文単位で見て、流用の断定文を検出する新判定器（`tests/eval/diversion_evaluator.py`）を試作し、`tests/eval/diversion_fixtures.json`のQ16型5分類・F05型5分類の計10件全てで期待判定と一致することを確認した（変更前の forbidden_facts 原文一致判定は10件中8件で不一致）。詳細は`tests/eval/README.md`のE0-4を参照。E0b（2026-09-16、実機gpt-oss:20b/bge-m3、案A・Q-1実装前の基準値）: 根拠ステータスはagentic-lite検索計画込みで5/5回partial。回答はhybrid 5回中4回・agentic-lite 5回中2回で新判定器がdiversion(流用)と判定し、うちhybrid 1回は変更前のforbidden_fact判定が見逃した実例だった（新旧の不一致はこの1件のみ）。この実機データとfixture全件一致を踏まえ、同日利用者判断でmeasure_answer_probeのpassed判定をforbidden_fact原文一致からdiversion_verdictへ置き換えた（変更前判定は比較のためreceiptへ残す）。詳細は`tests/eval/README.md`のE0bを参照。"
         },
         {
             "id": "Q17",

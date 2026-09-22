@@ -390,7 +390,7 @@
             "required_facts": [],
             "forbidden_facts": [],
             "holdout": true,
-            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。"
+            "notes": "該当なし（近接語）。判定規則v3（全経路適用・疑問詞と一般語の除外・強い単一根拠）を確定した後の2026-09-15に作成した保留質問。資料に記載の無い事項を、関連する語を含む資料があっても sufficient と判定しないことを確認する。規則・上限・重みの調整に使わない。 E0b（2026-09-16、実機gpt-oss:20b/bge-m3、案A・Q-1実装前の基準値、この測定に限り forbidden_facts=[\"90日\"] を一時付与）: hybridはevidence_status sufficientのまま5/5回とも新判定器(diversion_evaluator)でPASS（流用なし）。agentic-liteはevidence_status partialで、5回中3回、バックアップ世代の「90日」を作業記録の保管期間として断定する流用が発生（新旧判定一致）。partialの根拠ステータスでも流用が起きることを実機で確認した（Gate reviewのNOTE N-NUMERIC-DIVERSION-EVALUATORへの実測データ）。詳細は`tests/eval/README.md`のE0bを参照。"
         },
         {
             "id": "F06",
