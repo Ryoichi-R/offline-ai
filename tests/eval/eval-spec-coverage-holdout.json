@@ -1,0 +1,177 @@
+{
+  "schema_version": "1.1",
+  "corpus_dir": "corpus",
+  "notes": "deepモードの網羅性評価における新規保留群（D0）。eval-spec-coverage-synthetic.json（既存P2保留資料を流用した調整群）とは語彙・資料を分離し、これまでどの仕様・採点器のforbidden_patterns調整にも使われていない2文書を新規に作成した。複数条・別資料への参照（HD05）、無関係だが似た制度との混同防止（HD04）、長大節（第6条、4,000字超）、例外（HD02）、資料内の相反する記述（HD06）を含む。実在制度の正解や法的判断を表さない。意味上の支持は人手レビューを要求し、coverage_evaluator.pyの機械採点だけではPASSにならない（semantic_review未添付時はNEEDS_REVIEW）。",
+  "acceptance": {
+    "min_item_coverage": 1.0,
+    "max_critical_misses": 0,
+    "max_unsupported_citations": 0
+  },
+  "items": [
+    {
+      "id": "HD01",
+      "category": "scope",
+      "required_terms": ["契約社員", "対象外"],
+      "required_evidence_terms": ["正社員", "月8日以上"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 5,
+          "line_end": 7,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "在宅勤務手当は正社員が対象であり、契約社員・パートタイマー・派遣社員は対象外。"
+      ],
+      "forbidden_patterns": [
+        "契約社員.{0,5}(が|は)対象(です|である|になります)",
+        "契約社員.{0,10}(支給される|支給されます)"
+      ]
+    },
+    {
+      "id": "HD02",
+      "category": "exception",
+      "required_terms": ["社員寮", "住居手当", "支給しない"],
+      "required_evidence_terms": ["社員寮", "住居手当"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 17,
+          "line_end": 19,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "社員寮に居住し住居手当の支給を受けている者には、在宅勤務手当を支給しない。"
+      ],
+      "forbidden_patterns": [
+        "社員寮に居住.{0,15}(支給される|支給されます|対象となる)"
+      ]
+    },
+    {
+      "id": "HD03",
+      "category": "calculation",
+      "required_terms": ["1,500円"],
+      "required_evidence_terms": ["日数分の日額", "1,500円"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 21,
+          "line_end": 23,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        },
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 56,
+          "line_end": 56,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "月の途中から在宅勤務が承認された場合、日数分の日額を積算する。16日開始・5日実施の例では300円×5日=1,500円となり、月額上限を超えないため調整しない。"
+      ],
+      "forbidden_patterns": [
+        "4,800円"
+      ]
+    },
+    {
+      "id": "HD04",
+      "category": "long-section-adjacent-clause",
+      "required_terms": ["研究管理課"],
+      "required_evidence_terms": ["所属長の承認", "研究管理課"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 44,
+          "line_end": 44,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "研究開発部の在宅勤務者が実験機器を自宅で使用する場合は、所属長の承認に加えて研究管理課の承認が必要。"
+      ],
+      "forbidden_patterns": [
+        "(情報システム部|セキュリティ管理者).{0,6}承認"
+      ]
+    },
+    {
+      "id": "HD05",
+      "category": "cross-document",
+      "required_terms": ["日数分の日額", "7営業日"],
+      "required_evidence_terms": ["取消し", "起算して"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 21,
+          "line_end": 23,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        },
+        {
+          "path": "regulations/remote-work-equipment-rules.md",
+          "line_start": 13,
+          "line_end": 15,
+          "sha256": "67f4102f1be6f5e7e980bc32e689ec810e08b8d59a3a9936509cbe91deaca5e2"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "在宅勤務が月の途中で取り消された場合、その月の手当は承認済み日数分の日額を積算して支給する（在宅勤務手当規程 第5条）。貸与機器は別文書の在宅勤務機器貸与規程により、終了日から起算して7営業日以内に返却する。"
+      ],
+      "forbidden_patterns": [
+        "5営業日"
+      ]
+    },
+    {
+      "id": "HD06",
+      "category": "in-source-conflict",
+      "required_terms": ["6,000円", "7,000円"],
+      "required_evidence_terms": ["月額", "改定"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 9,
+          "line_end": 11,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        },
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 76,
+          "line_end": 78,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": true,
+      "expected_statements": [
+        "第2条は月額上限6,000円と定めるが、付則は2026年4月改定で7,000円に変更するとしており、本文だけでは適用関係が明示されず両方を提示する必要がある。"
+      ],
+      "forbidden_patterns": []
+    },
+    {
+      "id": "HD07",
+      "category": "negation-robustness",
+      "required_terms": ["含まれる", "受け付けない"],
+      "required_evidence_terms": ["光熱費", "別途の請求"],
+      "expected_sources": [
+        {
+          "path": "regulations/remote-work-allowance-rules.md",
+          "line_start": 72,
+          "line_end": 72,
+          "sha256": "553966ed0c75765f4e947f6201fcc2010b065731e4e98dcca7227c23d4e8df7c"
+        }
+      ],
+      "critical": false,
+      "expected_statements": [
+        "自宅の電気料金その他の光熱費は在宅勤務手当に含まれ、別途の請求は受け付けない。"
+      ],
+      "forbidden_patterns": [
+        "電気.{0,10}(別途|追加).{0,6}(請求できる|支給される|精算する)"
+      ]
+    }
+  ],
+  "split": "holdout"
+}
