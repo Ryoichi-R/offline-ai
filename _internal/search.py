@@ -41,9 +41,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from prompt_templates import (
+    EVIDENCE_VERIFICATION_SYSTEM,
+    INSUFFICIENCY_REASON_RESERVE_CHARS,
+    SOURCE_INSTRUCTION_IMMUNITY_RESERVE_CHARS,
     KEYWORD_EXTRACTION_SYSTEM,
     SEARCH_PLAN_SYSTEM,
     SYSTEM_PROMPT,
+    build_evidence_verification_prompt,
     build_user_prompt,
     expansion_prompt_reserve_chars,
     extract_keywords_prompt,
@@ -64,6 +68,7 @@ try:
         env_int,
         env_timeout,
         get_rerank_config,
+        validate_mode_timeout_seconds,
     )
 except ValueError as exc:
     if __name__ == "__main__":
@@ -136,6 +141,24 @@ RETRIEVAL_TIMEOUT = env_timeout(
     "OFFLINE_AI_RETRIEVAL_TIMEOUT", 120, max_value=3600
 )
 KEYWORD_EXTRACT_TIMEOUT = 90
+
+# --- 案A: LLM根拠検証（計画 plans/offline-ai-evidence-sufficiency-verification-plan.md）。
+# 採用根拠が質問に答えているかをJSONで判定する補助chat。2026-09-20のP3で利用者判断により
+# 既定ONとした（P2で誤sufficient 11/11→0/11、流用 5/5→1/5、待ち時間は約+3〜8秒）。
+# OFFLINE_AI_EVIDENCE_VERIFY=false で無効化できる。
+EVIDENCE_VERIFY_ENABLED_DEFAULT = True
+# 検証専用の呼び出し上限。全体の残時間から生成予約分を引いた値との小さい方を採る。
+EVIDENCE_VERIFY_TIMEOUT = env_timeout(
+    "OFFLINE_AI_EVIDENCE_VERIFY_TIMEOUT", 15, max_value=120
+)
+# 検証を開始する残余予算の下限。これを下回れば実行せず skipped_budget とする。
+EVIDENCE_VERIFY_MIN_BUDGET = env_timeout(
+    "OFFLINE_AI_EVIDENCE_VERIFY_MIN_BUDGET", 3, max_value=60
+)
+# 全体残時間から検証予算を逆算する際に確保する、回答生成に必要な既定予約秒数。
+EVIDENCE_VERIFY_GENERATION_RESERVE = env_timeout(
+    "OFFLINE_AI_EVIDENCE_VERIFY_GENERATION_RESERVE", 30, max_value=300
+)
 EMBED_SIM_THRESHOLD = 0.3
 SEMANTIC_SUPPORT_THRESHOLD = 0.55
 LEXICAL_ANCHOR_MIN_CHARS = 4
@@ -232,6 +255,10 @@ def _agentic_lite_enabled() -> bool:
     return _env_bool("OFFLINE_AI_AGENTIC_LITE", True)
 
 
+def _evidence_verify_enabled() -> bool:
+    return _env_bool("OFFLINE_AI_EVIDENCE_VERIFY", EVIDENCE_VERIFY_ENABLED_DEFAULT)
+
+
 # load_embed_cache() の memo（mtime/size キー）を無効化する退避路。既定は有効。
 EMBED_CACHE_MEMO_ENABLED = _env_bool("OFFLINE_AI_EMBED_CACHE_MEMO", True)
 
@@ -288,6 +315,17 @@ class RetrievalResult:
     # 候補→支持判定・件数制限→展開→最終採用の段階追跡（本文を含まない）。
     # ``{"attempts": [...], "final": {...}}``。通常ログへは出力しない。
     trace: dict = field(default_factory=dict)
+    # 案A（LLM根拠検証、既定OFF）: 検索の強さ（検証前の evidence_status）。
+    # ``evidence_status`` は検証結果で partial へ格下げされ得るため、検索側の
+    # 元の状態を区別して残す。空文字なら evidence_status と同一（未分離）。
+    retrieval_status: str = ""
+    # verified / failed / skipped_disabled / skipped_not_applicable / skipped_budget
+    verification_status: str = "skipped_not_applicable"
+    # verified の場合の {"support", "reason_code", "conditions"}。それ以外は None。
+    answer_support: dict | None = None
+    verification_latency_ms: float = 0.0
+    # failed の場合の分類（EVIDENCE_VERIFY_FAILURE_*）。それ以外は空文字。
+    verification_failure_reason: str = ""
 
 
 def normalize_source_path(path: str | Path) -> str:
@@ -3507,6 +3545,175 @@ def create_search_plan(query: str, model: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 案A: LLM根拠検証（既定OFF）
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_VERIFY_SUPPORT_VALUES = {
+    "fully_supported",
+    "partially_supported",
+    "unsupported",
+    "unknown",
+}
+_EVIDENCE_VERIFY_REASON_CODES = {
+    "answer_found",
+    "related_only",
+    "different_subject",
+    "missing_detail",
+    "unclear",
+}
+
+
+# 案Aの検証失敗の理由（本文を含まない分類）。receipt・traceで原因を区別する。
+EVIDENCE_VERIFY_FAILURE_TRANSPORT = "transport"
+EVIDENCE_VERIFY_FAILURE_TIMEOUT = "timeout"
+EVIDENCE_VERIFY_FAILURE_JSON_PARSE = "json_parse"
+EVIDENCE_VERIFY_FAILURE_SCHEMA = "schema"
+EVIDENCE_VERIFY_FAILURE_CONTRADICTION = "contradiction"
+
+
+class EvidenceVerificationError(ValueError):
+    """検証JSONの構造・矛盾チェック不合格。呼び出し側は ``failed`` として扱う。
+
+    ``reason`` は失敗の分類（``EVIDENCE_VERIFY_FAILURE_*``）。2026-09-18のP2で
+    ``failed`` の一語だけでは原因（timeout・JSON不正・契約違反）を区別できず、
+    手動再現が必要だったため追加した。
+    """
+
+    def __init__(self, message: str, *, reason: str = EVIDENCE_VERIFY_FAILURE_SCHEMA):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _validate_evidence_verification_json(data: object) -> dict:
+    """案Aの出力契約を厳格に検証する。矛盾する組み合わせは不正として拒否する。
+
+    - ``support`` は4値のいずれか、``reason_code`` は5値のいずれか。
+    - ``conditions`` は ``[{"condition": str, "supported": bool}]``。
+      ``supported`` が真偽値以外（文字列"false"等）なら不正。
+    - 矛盾する組み合わせ（``fully_supported``と``different_subject``、
+      ``unsupported``と``answer_found``、条件に不支持があるのに
+      ``fully_supported``）はJSON不正として扱う。
+    """
+    if not isinstance(data, dict):
+        raise EvidenceVerificationError("トップレベルがオブジェクトでない")
+    support = data.get("support")
+    if support not in _EVIDENCE_VERIFY_SUPPORT_VALUES:
+        raise EvidenceVerificationError(f"support が不正: {support!r}")
+    reason_code = data.get("reason_code")
+    if reason_code not in _EVIDENCE_VERIFY_REASON_CODES:
+        raise EvidenceVerificationError(f"reason_code が不正: {reason_code!r}")
+    conditions_raw = data.get("conditions", [])
+    if not isinstance(conditions_raw, list):
+        raise EvidenceVerificationError("conditions が配列でない")
+    conditions: list[dict] = []
+    for entry in conditions_raw:
+        if not isinstance(entry, dict) or "condition" not in entry or "supported" not in entry:
+            raise EvidenceVerificationError(f"conditions の要素が不正: {entry!r}")
+        supported = entry["supported"]
+        if not isinstance(supported, bool):
+            raise EvidenceVerificationError(
+                f"conditions.supported が真偽値でない: {supported!r}"
+            )
+        conditions.append({"condition": str(entry["condition"]), "supported": supported})
+
+    if support == "fully_supported" and reason_code == "different_subject":
+        raise EvidenceVerificationError(
+            "矛盾: fully_supported と different_subject", reason=EVIDENCE_VERIFY_FAILURE_CONTRADICTION
+        )
+    if support == "unsupported" and reason_code == "answer_found":
+        raise EvidenceVerificationError(
+            "矛盾: unsupported と answer_found", reason=EVIDENCE_VERIFY_FAILURE_CONTRADICTION
+        )
+    if support == "fully_supported" and any(not c["supported"] for c in conditions):
+        raise EvidenceVerificationError(
+            "矛盾: 条件に不支持があるのに fully_supported", reason=EVIDENCE_VERIFY_FAILURE_CONTRADICTION
+        )
+    return {"support": support, "reason_code": reason_code, "conditions": conditions}
+
+
+def _evidence_verify_budget(remaining_seconds) -> float | None:
+    """検証に使える秒数を計算する。
+
+    ``remaining_seconds`` は呼び出し元の全体残り秒数を返すコールバック。
+    ``None``（キャンセル・タイムアウト概念のないCLI等）なら無制限として扱い、
+    検証専用上限（``EVIDENCE_VERIFY_TIMEOUT``）だけが上限になる。
+    """
+    if remaining_seconds is None:
+        return None
+    try:
+        total_remaining = float(remaining_seconds())
+    except Exception:
+        return None
+    return max(0.0, total_remaining - EVIDENCE_VERIFY_GENERATION_RESERVE)
+
+
+def verify_evidence_support(
+    query: str,
+    matches: list[dict],
+    model: str,
+    *,
+    cancel_check=None,
+    timeout: float,
+) -> dict:
+    """採用根拠が質問に答えているかをLLMへ判定させる（案A）。
+
+    戻り値は ``{"support", "reason_code", "conditions"}``（検証成功時）。
+    失敗時は ``EvidenceVerificationError`` を送出する。利用者キャンセル・
+    タイムアウト（``cancel_check`` が投げる例外）はここで捕捉せず、
+    そのまま呼び出し元へ伝播させる（検証の失敗として扱わない契約）。
+
+    検索計画（``create_search_plan``）と同じ ``num_ctx``・``num_batch``・
+    ``num_gpu``・``keep_alive``・``think=False`` を使い、モデルの再ロードを
+    起こさない。
+    """
+    if cancel_check:
+        cancel_check()
+    prompt = build_evidence_verification_prompt(query, matches)
+    url = f"{OLLAMA_HOST}/api/chat"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": EVIDENCE_VERIFICATION_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "think": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": build_chat_options(temperature=0),
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        timed_out = isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "reason", None), TimeoutError
+        )
+        raise EvidenceVerificationError(
+            f"transport: {type(exc).__name__}",
+            reason=EVIDENCE_VERIFY_FAILURE_TIMEOUT
+            if timed_out
+            else EVIDENCE_VERIFY_FAILURE_TRANSPORT,
+        ) from exc
+
+    if cancel_check:
+        cancel_check()
+
+    raw_text = str(data.get("message", {}).get("content", ""))
+    parsed = _parse_json_object(raw_text)
+    if parsed is None:
+        raise EvidenceVerificationError(
+            "json_parse_failed", reason=EVIDENCE_VERIFY_FAILURE_JSON_PARSE
+        )
+    return _validate_evidence_verification_json(parsed)
+
+
 def _limit_chunks_per_file(
     matches: list[dict], max_per_file: int = MAX_CHUNKS_PER_FILE
 ) -> list[dict]:
@@ -3551,6 +3758,13 @@ def _estimate_prompt_shell_chars(
     # 根拠ごとの展開由来・部分展開の表示は根拠を空にした shell 見積りに現れないため、
     # 件数上限分の保守的な固定値を予約する（予算と表示状態の循環依存を避ける）。
     reserve = expansion_prompt_reserve_chars(EVIDENCE_OUTPUT_MAX_ITEMS)
+    # 資料内指示文への耐性文言は根拠がある場合だけ現れ、shell 見積りに出ない。
+    reserve += SOURCE_INSTRUCTION_IMMUNITY_RESERVE_CHARS
+    # 案A（既定OFF）: 検証結果（不足理由）はこの見積り時点でまだ確定しないため、
+    # 有効時だけ Q-1 の不足理由表示分の保守的な固定予約を追加する。既定OFFでは
+    # この分岐に入らず、既存の見積りを変えない。
+    if _evidence_verify_enabled():
+        reserve += INSUFFICIENCY_REASON_RESERVE_CHARS
     return len(SYSTEM_PROMPT) + len(shell) + reserve
 
 
@@ -3948,6 +4162,7 @@ def _run_single_retrieval(
     source_chunks: list[dict] | None = None,
     *,
     precomputed_embed_matches: list[dict] | None = None,
+    candidate_limit: int | None = None,
 ) -> list[dict]:
     """1クエリ分の keyword+embedding 検索を実行する。
 
@@ -3955,7 +4170,7 @@ def _run_single_retrieval(
     ``embedding_search`` を呼ばずそれを使う。渡されなければ従来どおり単一
     クエリの ``embedding_search`` を呼ぶ（CLI / 既存テスト互換の経路）。
     """
-    candidate_limit = (
+    effective_limit = candidate_limit or (
         RERANK_CONFIG.top_n
         if RERANK_CONFIG.mode != "off"
         else RETRIEVAL_CANDIDATE_LIMIT
@@ -3965,7 +4180,7 @@ def _run_single_retrieval(
         keyword_matches = keyword_search_chunks(
             query,
             keyword_text,
-            top_k=candidate_limit,
+            top_k=effective_limit,
             chunks=source_chunks,
         )
     else:
@@ -3982,11 +4197,11 @@ def _run_single_retrieval(
                 else build_or_update_embed_index(embed_model, source_chunks)
             )
             embed_matches = embedding_search(
-                query, embed_model, cache, top_k=candidate_limit
+                query, embed_model, cache, top_k=effective_limit
             )
         except Exception as e:
             logger.warning("Embedding search failed: %s", e)
-    return merge_results(keyword_matches, embed_matches, max_results=candidate_limit)
+    return merge_results(keyword_matches, embed_matches, max_results=effective_limit)
 
 
 class _RerankCancellation(Exception):
@@ -5045,11 +5260,17 @@ def run_retrieval_pipeline(
     emit_status=None,
     cancel_check=None,
     mode: str = "answer",
+    remaining_seconds=None,
 ) -> RetrievalResult:
     """CLI/Web 共通の bounded retrieval pipeline。
 
     ``mode=search`` は検索計画用・回答用の chat を一切呼ばず、決定的な
     query だけで一回検索する。既定の ``answer`` は従来の経路を維持する。
+
+    ``remaining_seconds``: 呼び出し元（Web の ``CancellationToken.remaining``
+    等）が持つ全体の残り秒数を返すコールバック。案Aの検証予算の逆算に使う。
+    ``None``（CLI等、キャンセル・タイムアウト概念が無い経路）なら無制限として
+    扱う。
     """
 
     if mode not in {"answer", "search"}:
@@ -5294,6 +5515,8 @@ def run_retrieval_pipeline(
             route_reason=route_reason,
             warnings=list(dict.fromkeys(warnings)),
             trace={"attempts": attempt_traces, "final": attempt_traces[-1] if attempt_traces else {}},
+            retrieval_status=final_status,
+            verification_status="skipped_not_applicable",
         )
 
     # 予算逆算が無効なら shell 見積り（build_user_prompt の追加呼び出し）を行わない。
@@ -5320,12 +5543,79 @@ def run_retrieval_pipeline(
         char_limit=evidence_char_limit,
         trace=final_trace,
     )
+
+    # --- 案A: LLM根拠検証（既定OFF、OFFLINE_AI_EVIDENCE_VERIFY） ---
+    # 回答promptに実際に載る根拠(matches, char_limit適用後)だけを検証する。
+    retrieval_status = final_status
+    verification_status = "skipped_not_applicable"
+    answer_support: dict | None = None
+    verification_latency_ms = 0.0
+    verification_failure_reason = ""
+    insufficiency_reason: dict | None = None
+
+    if final_status in ("sufficient", "partial"):
+        if not _evidence_verify_enabled():
+            verification_status = "skipped_disabled"
+        else:
+            budget = _evidence_verify_budget(remaining_seconds)
+            if budget is not None and budget < EVIDENCE_VERIFY_MIN_BUDGET:
+                verification_status = "skipped_budget"
+            else:
+                verify_timeout = (
+                    EVIDENCE_VERIFY_TIMEOUT
+                    if budget is None
+                    else min(EVIDENCE_VERIFY_TIMEOUT, budget)
+                )
+                verify_started = time.perf_counter()
+                try:
+                    answer_support = verify_evidence_support(
+                        query,
+                        matches,
+                        model,
+                        cancel_check=check_cancel,
+                        timeout=verify_timeout,
+                    )
+                except EvidenceVerificationError as exc:
+                    # 検証専用のtimeout・接続失敗・JSON不正・矛盾拒否は failed
+                    # として回答を継続する（利用者キャンセル・全体タイムアウト
+                    # は check_cancel が別の例外型で送出し、ここでは捕捉せず
+                    # そのまま上位へ伝播させ、回答生成を開始しない）。
+                    verification_status = "failed"
+                    verification_failure_reason = exc.reason
+                else:
+                    verification_status = "verified"
+                verification_latency_ms = (time.perf_counter() - verify_started) * 1000
+
+    if verification_status == "verified" and answer_support is not None:
+        support = answer_support["support"]
+        # sufficient は verified かつ fully_supported の場合だけ維持する。
+        # partial は検証結果によらず維持し、格上げ（partial→sufficient）は
+        # 行わない（非目標: 検証結果によるsufficientへの格上げ）。
+        if final_status == "sufficient" and support != "fully_supported":
+            final_status = "partial"
+        if support in ("partially_supported", "unsupported", "unknown"):
+            insufficiency_reason = {
+                "support": support,
+                "reason_code": answer_support["reason_code"],
+                "unsupported_conditions": [
+                    c["condition"] for c in answer_support["conditions"] if not c["supported"]
+                ],
+            }
+
+    final_trace["verification"] = {
+        "verification_status": verification_status,
+        "failure_reason": verification_failure_reason,
+        "answer_support": answer_support,
+        "latency_ms": round(verification_latency_ms, 1),
+    }
+
     user_prompt = build_user_prompt(
         query,
         matches,
         attempts=attempt_dicts,
         evidence_status=final_status,
         confidence=final_confidence,
+        insufficiency_reason=insufficiency_reason,
     )
     return RetrievalResult(
         query=query,
@@ -5341,6 +5631,11 @@ def run_retrieval_pipeline(
         route_reason=route_reason,
         warnings=list(dict.fromkeys(warnings)),
         trace={"attempts": attempt_traces, "final": final_trace},
+        retrieval_status=retrieval_status,
+        verification_status=verification_status,
+        answer_support=answer_support,
+        verification_latency_ms=round(verification_latency_ms, 1),
+        verification_failure_reason=verification_failure_reason,
     )
 
 
@@ -5377,14 +5672,39 @@ def build_chat_payload(
     return body
 
 
+VERIFICATION_DOWNGRADE_NOTE = (
+    "根拠検証: 採用根拠は質問に十分答えていないと判定したため、"
+    "根拠ステータスを sufficient から partial にしました"
+)
+
+
+def verification_note(retrieval) -> str:
+    """検証で根拠ステータスを格下げした場合だけ、利用者向けの短い注記を返す。
+
+    2026-09-20のP3で利用者判断により表示を追加した（それまではCLIに
+    「検索試行: sufficient」の直後に「根拠一覧（状態: partial）」と出て理由が分からなかった）。
+    外部の evidenceStatus の意味は変えない。
+    """
+    if (
+        getattr(retrieval, "verification_status", "") == "verified"
+        and getattr(retrieval, "retrieval_status", "") == "sufficient"
+        and getattr(retrieval, "evidence_status", "") == "partial"
+    ):
+        return VERIFICATION_DOWNGRADE_NOTE
+    return ""
+
+
 def build_evidence_summary(
     matches: list[dict],
     *,
     evidence_status: str,
     confidence: float,
+    note: str = "",
 ) -> str:
     """CLI向けに採用根拠を決定論的な一覧へ整形する。"""
     lines = [f"根拠一覧（状態: {evidence_status}、信頼度: {confidence:.2f}）"]
+    if note:
+        lines.append(f"  {note}")
     if not matches:
         lines.append("  根拠チャンクはありません。")
         return "\n".join(lines)
@@ -5618,14 +5938,84 @@ def main():
         action="store_true",
         help="thinkingデルタをコンソールへ表示する（既定: 非表示）",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("answer", "search", "deep"),
+        default="answer",
+        help="answer=回答、search=資料一覧、deep=節単位の深掘り調査",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        "--search-timeout",
+        dest="timeout_seconds",
+        type=int,
+        default=None,
+        help="検索全体の時間上限（deepは300〜1800秒、それ以外は300〜600秒）",
+    )
     args = parser.parse_args()
 
     query = resolve_query(query_file=args.query_file, query_positional=args.query)
-    model = detect_model()
     reasoning = _resolve_reasoning(args.reasoning)
 
+    if args.mode == "deep":
+        from deep_research import (
+            DEEP_TIMEOUT_DEFAULT,
+            DEEP_TIMEOUT_MIN,
+            DEEP_TIMEOUT_MAX,
+            run_deep_research,
+            detect_deep_model,
+            validate_deep_timeout_seconds,
+        )
+
+        try:
+            timeout_seconds = (
+                validate_deep_timeout_seconds(args.timeout_seconds)
+                if args.timeout_seconds is not None
+                else DEEP_TIMEOUT_DEFAULT
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        started = time.monotonic()
+        model = detect_deep_model()
+
+        def deep_cancel_check() -> None:
+            if time.monotonic() - started >= timeout_seconds:
+                raise TimeoutError("deep timeout")
+
+        print(f"モデル: {model}")
+        print(f"クエリ: {query}")
+        print(f"モード: deep（上限 {timeout_seconds} 秒、範囲 {DEEP_TIMEOUT_MIN}〜{DEEP_TIMEOUT_MAX} 秒）")
+        print()
+        try:
+            result = run_deep_research(
+                query,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                emit_progress=lambda event: print(
+                    f"[{event.get('stage')}] {event.get('message', '')} "
+                    f"残り{event.get('remainingSeconds', 0)}秒"
+                ),
+                cancel_check=deep_cancel_check,
+                absolute_deadline=started + timeout_seconds,
+            )
+        except KeyboardInterrupt:
+            print("中断しました。", file=sys.stderr)
+            raise SystemExit(130) from None
+        print(f"状態: {result.status} / 終了理由: {result.stop_reason}")
+        print(f"根拠: {len(result.evidence)}件、読み取り単位: {result.diagnostics.get('units', 0)}件")
+        print()
+        print(result.answer or "確認済みの根拠がありません。")
+        return
+
+    model = "" if args.mode == "search" else detect_model()
+
+    if args.timeout_seconds is not None:
+        timeout_seconds = validate_mode_timeout_seconds(args.timeout_seconds, args.mode)
+    else:
+        timeout_seconds = None
+
     # モデル可用性チェック
-    model_status = _is_model_available(model)
+    model_status = _is_model_available(model) if model else ModelStatus.AVAILABLE
     if model_status == ModelStatus.UNAVAILABLE:
         print(
             f"[ERROR] モデル '{model}' が見つかりません。オフラインパッケージの install-offline.bat を再実行してください。",
@@ -5638,9 +6028,12 @@ def main():
             file=sys.stderr,
         )
 
-    print(f"モデル: {model}")
+    print(f"モデル: {model or '(未使用)'}")
     print(f"クエリ: {query}")
+    print(f"モード: {args.mode}")
     print(f"リーズニング: {reasoning}")
+    if timeout_seconds is not None:
+        print(f"時間上限: {timeout_seconds} 秒")
     print(
         f"コンテキスト: {NUM_CTX} tokens, バッチ: {NUM_BATCH}, GPU layers: {'all' if NUM_GPU == -1 else NUM_GPU}"
     )
@@ -5665,6 +6058,21 @@ def main():
         )
 
     try:
+        if args.mode == "search":
+            retrieval = run_retrieval_pipeline(
+                query,
+                model="",
+                reasoning="off",
+                emit_status=lambda text: print(text),
+                mode="search",
+            )
+            print(f"最終マッチ: {len(retrieval.matches)} 件")
+            print(build_evidence_summary(
+                retrieval.matches,
+                evidence_status=retrieval.evidence_status,
+                confidence=retrieval.confidence,
+            ))
+            return
         retrieval = run_retrieval_pipeline(
             query,
             model=model,
@@ -5690,6 +6098,7 @@ def main():
             retrieval.matches,
             evidence_status=retrieval.evidence_status,
             confidence=retrieval.confidence,
+            note=verification_note(retrieval),
         )
     )
     print()

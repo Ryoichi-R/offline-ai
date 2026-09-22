@@ -189,6 +189,11 @@ SEARCH_TIMEOUT_MIN = 300
 SEARCH_TIMEOUT_MAX = 600
 SEARCH_TIMEOUT_DEFAULT = 300
 
+# deep 調査は通常検索と別の時間契約を持つ。通常モードの範囲は変更しない。
+DEEP_SEARCH_TIMEOUT_MIN = 300
+DEEP_SEARCH_TIMEOUT_MAX = 1800
+DEEP_SEARCH_TIMEOUT_DEFAULT = 1800
+
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
 
 
@@ -216,6 +221,26 @@ def validate_search_timeout_seconds(value: object) -> int:
             f"{SEARCH_TIMEOUT_MAX} seconds"
         )
     return normalized
+
+
+def validate_mode_timeout_seconds(value: object, mode: str) -> int:
+    """検索モードごとの全体時間を検証する。"""
+    if mode == "deep":
+        if isinstance(value, bool):
+            raise ValueError("deep timeout must be an integer")
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not re.fullmatch(r"[+-]?\d+", stripped):
+                raise ValueError("deep timeout must be an integer")
+            value = int(stripped)
+        if not isinstance(value, int):
+            raise ValueError("deep timeout must be an integer")
+        if value < DEEP_SEARCH_TIMEOUT_MIN or value > DEEP_SEARCH_TIMEOUT_MAX:
+            raise ValueError(
+                f"deep timeout must be between {DEEP_SEARCH_TIMEOUT_MIN} and {DEEP_SEARCH_TIMEOUT_MAX} seconds"
+            )
+        return value
+    return validate_search_timeout_seconds(value)
 
 
 def env_bool(name: str, default: bool) -> bool:

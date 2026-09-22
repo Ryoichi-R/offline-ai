@@ -293,6 +293,7 @@ body {
             <select class="mode-select" id="searchModeSelect" aria-label="検索モード">
                 <option value="answer" selected>回答を作る</option>
                 <option value="search">資料を探す</option>
+                <option value="deep">深掘り調査（最大30分）</option>
             </select>
             <select class="reasoning-select" id="reasoningSelect">
                 <option value="">推論: 非表示</option>
@@ -360,6 +361,7 @@ const state = {
     activeQuery: "",
     activeReasoning: "off",
     activeTimeoutSeconds: 0,
+    activeRequestId: "",
     resultMeta: null,
     resultEvidence: null,
     resultCompletedAt: null,
@@ -369,8 +371,61 @@ const state = {
     healthPollTimer: null,
     healthPollInterval: 15000,
     timeoutSynced: false,
+    deepTimeoutSynced: false,
+    deepTimeoutDefault: 1800,
+    deepTimeoutMin: 300,
+    deepTimeoutMax: 1800,
     budgetTimer: null,
 };
+
+// --- activeSearchStorage ---
+// ページのフルリロードは activeRequestId 等のJS上の状態を消すため、進行中の
+// 検索だけをタブ単位でsessionStorageへ書き残す。サーバー側のJobTableは
+// 同一request_id・同一fingerprint（session_id/query/reasoning/timeout/mode）の
+// 再購読を完了結果のバッファ込みでサポート済みなので、クライアントはこの
+// 記述を復元して同じ条件でSSEへ再接続するだけでよい。本文・根拠は保存しない。
+const ACTIVE_SEARCH_STORAGE_KEY = "offlineai.activeSearch";
+
+function persistActiveSearch() {
+    try {
+        sessionStorage.setItem(ACTIVE_SEARCH_STORAGE_KEY, JSON.stringify({
+            requestId: state.activeRequestId,
+            mode: state.activeMode,
+            query: state.activeQuery,
+            reasoning: state.activeReasoning,
+            timeoutSeconds: state.activeTimeoutSeconds,
+        }));
+    } catch {
+        // private browsing 等でstorageが使えなくても検索自体は継続する。
+    }
+}
+
+function clearActiveSearch() {
+    try {
+        sessionStorage.removeItem(ACTIVE_SEARCH_STORAGE_KEY);
+    } catch {
+        // no-op
+    }
+}
+
+function loadPersistedSearch() {
+    try {
+        const raw = sessionStorage.getItem(ACTIVE_SEARCH_STORAGE_KEY);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (
+            !data || typeof data !== "object"
+            || !["answer", "search", "deep"].includes(data.mode)
+            || typeof data.query !== "string" || !data.query.trim()
+            || typeof data.requestId !== "string" || !data.requestId
+            || typeof data.reasoning !== "string"
+            || !Number.isFinite(data.timeoutSeconds)
+        ) return null;
+        return data;
+    } catch {
+        return null;
+    }
+}
 
 // --- budgetCountdown ---
 // 全体残り時間表示のカウントダウン計算。SSE `budget` で受け取ったサーバー確定値
@@ -626,6 +681,7 @@ const api = {
         state.searchAbort = ctrl;
 
         const params = new URLSearchParams({ q: query, mode });
+        if (state.activeRequestId) params.set("request_id", state.activeRequestId);
         if (reasoning) params.set("reasoning", reasoning);
         if (Number.isFinite(timeoutSeconds)) params.set("timeout_seconds", String(timeoutSeconds));
 
@@ -668,6 +724,18 @@ const api = {
             });
 
         return ctrl;
+    },
+
+    async cancelSearch(requestId) {
+        const res = await fetch("/api/search/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: requestId }),
+            keepalive: true,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        return data;
     },
 
 };
@@ -772,6 +840,18 @@ const ui = {
         this.updateSearchModeUI();
         pagePresence.start();
         this.pollHealth();
+        this.resumeActiveSearch();
+    },
+
+    // ページリロード直後、前回のsessionStorageに進行中の検索が残っていれば
+    // 同じrequest_id・検索条件でSSEへ再購読する。JobTableが完了結果を
+    // バッファしているため、既に終わっていた場合はその結果を、まだ実行中
+    // なら現在の進捗を受け取れる。存在しない・条件不一致（別のtabやサーバー
+    // 再起動でjob_tableが失われた場合等）はエラー表示のうえ状態を破棄する。
+    resumeActiveSearch() {
+        const saved = loadPersistedSearch();
+        if (!saved || state.searching) return;
+        this.startSearch(saved);
     },
 
     renderPageCloseHint({ enabled, serverGone }) {
@@ -826,6 +906,12 @@ const ui = {
                 this.els.searchTimeoutInput.max = String(h.searchTimeoutMax);
                 this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
                 state.timeoutSynced = true;
+            }
+            if (Number.isFinite(h.deepSearchTimeoutMin) && Number.isFinite(h.deepSearchTimeoutMax)) {
+                state.deepTimeoutMin = h.deepSearchTimeoutMin;
+                state.deepTimeoutMax = h.deepSearchTimeoutMax;
+                state.deepTimeoutDefault = h.deepSearchTimeoutDefault || h.deepSearchTimeoutMax;
+                state.deepTimeoutSynced = true;
             }
 
             this.els.statusDot.className = "status-dot " + h.status;
@@ -951,40 +1037,72 @@ const ui = {
     },
 
     updateSearchModeUI() {
-        const mode = this.els.searchModeSelect.value === "search" ? "search" : "answer";
+        const selected = this.els.searchModeSelect.value;
+        const mode = ["answer", "search", "deep"].includes(selected) ? selected : "answer";
         const searchOnly = mode === "search";
-        this.els.reasoningSelect.disabled = searchOnly || state.searching;
+        const deep = mode === "deep";
+        this.els.reasoningSelect.disabled = searchOnly || deep || state.searching;
+        if (deep) {
+            this.els.searchTimeoutInput.min = String(state.deepTimeoutMin);
+            this.els.searchTimeoutInput.max = String(state.deepTimeoutMax);
+            if (!state.searching && (!state.activeTimeoutSeconds || state.activeMode !== "deep")) {
+                this.els.searchTimeoutInput.value = String(state.deepTimeoutDefault);
+            }
+        } else {
+            this.els.searchTimeoutInput.min = "300";
+            this.els.searchTimeoutInput.max = "600";
+            if (!state.searching && (!state.activeTimeoutSeconds || state.activeMode === "deep")) {
+                this.els.searchTimeoutInput.value = "300";
+            }
+        }
         this.els.searchModeHint.textContent = searchOnly
             ? "回答生成は行いません。検索用テキストの根拠だけを表示します。"
-            : "回答を生成し、根拠を表示します。";
+            : deep
+                ? "ローカル資料を節単位で読み直し、条件・例外・参照先を根拠付きで整理します。"
+                : "回答を生成し、根拠を表示します。";
     },
 
-    startSearch() {
-        const query = this.els.searchInput.value.trim();
+    startSearch(resume = null) {
+        const query = resume ? resume.query : this.els.searchInput.value.trim();
         if (!query) return;
-        const mode = this.els.searchModeSelect.value === "search" ? "search" : "answer";
-        const featureAvailable = mode === "search" ? state.features.retrieval : state.features.search;
-        if (!featureAvailable) {
-            this.els.searchError.textContent = mode === "search"
-                ? "ローカル検索機能が利用できません。"
-                : "回答検索機能が利用できません。Ollama が起動しているか確認してください。";
-            this.els.searchError.hidden = false;
-            return;
+        const selectedMode = resume ? resume.mode : this.els.searchModeSelect.value;
+        const mode = ["answer", "search", "deep"].includes(selectedMode) ? selectedMode : "answer";
+        if (!resume) {
+            const featureAvailable = mode === "search" ? state.features.retrieval : state.features.search;
+            if (!featureAvailable) {
+                this.els.searchError.textContent = mode === "search"
+                    ? "ローカル検索機能が利用できません。"
+                    : "回答検索機能が利用できません。Ollama が起動しているか確認してください。";
+                this.els.searchError.hidden = false;
+                return;
+            }
         }
 
         const searchId = ++state.searchSequence;
         state.activeSearchId = searchId;
+        state.activeRequestId = resume
+            ? resume.requestId
+            : (crypto.randomUUID ? crypto.randomUUID() : `req-${Date.now()}-${searchId}`);
         state.searching = true;
         state.rawSearchText = "";
         state.rawThinkingText = "";
         state.activeMode = mode;
         state.activeQuery = query;
-        state.activeReasoning = mode === "search" ? "off" : (this.els.reasoningSelect.value || "off");
-        state.activeTimeoutSeconds = parseInt(this.els.searchTimeoutInput.value, 10);
+        state.activeReasoning = resume
+            ? resume.reasoning
+            : (mode === "search" ? "off" : (this.els.reasoningSelect.value || "off"));
+        state.activeTimeoutSeconds = resume ? resume.timeoutSeconds
+            : parseInt(this.els.searchTimeoutInput.value, 10);
         state.resultMeta = null;
         state.resultEvidence = null;
         state.resultCompletedAt = null;
         state.resultAnswerEmpty = false;
+        if (resume) {
+            this.els.searchInput.value = query;
+            this.els.searchModeSelect.value = mode;
+            if (mode !== "search") this.els.reasoningSelect.value = state.activeReasoning;
+            this.els.searchTimeoutInput.value = String(state.activeTimeoutSeconds);
+        }
         this.els.searchBtn.hidden = true;
         this.els.cancelSearchBtn.hidden = false;
         this.els.searchResult.innerHTML = "";
@@ -1008,10 +1126,15 @@ const ui = {
         this.els.searchTimeoutInput.disabled = true;
         this.updateSearchModeUI();
         this.clearBudgetTimer();
+        persistActiveSearch();
+        if (resume) {
+            this.els.searchStatus.textContent = "進行中の調査に再接続しています…";
+            this.els.searchStatus.hidden = false;
+        }
 
-        const reasoning = mode === "search" ? "off" : this.els.reasoningSelect.value;
-        // 開始時点の入力値を確定する。検索中は入力を無効化しているため以後は変わらない。
-        const timeoutSeconds = parseInt(this.els.searchTimeoutInput.value, 10);
+        // 開始時点の値を確定する。検索中は入力を無効化しているため以後は変わらない。
+        const reasoning = state.activeReasoning;
+        const timeoutSeconds = state.activeTimeoutSeconds;
         let renderTimer = null;
         let thinkingRenderTimer = null;
         let thinkingClosed = false;
@@ -1025,6 +1148,7 @@ const ui = {
         const finishSearch = () => {
             if (state.activeSearchId !== searchId || !state.searching) return;
             state.searching = false;
+            clearActiveSearch();
             if (state.searchAbort) state.searchAbort = null;
             this.els.searchBtn.hidden = false;
             this.els.cancelSearchBtn.hidden = true;
@@ -1062,6 +1186,12 @@ const ui = {
                 } else if (ev.type === "evidence") {
                     state.resultEvidence = JSON.parse(JSON.stringify(ev));
                     this.renderEvidence(ev);
+                } else if (ev.type === "deep_progress") {
+                    const remaining = Number.isFinite(ev.remainingSeconds) ? ` 残り${ev.remainingSeconds}秒` : "";
+                    const counts = ` 資料${ev.documents || 0}件・読取${ev.units || 0}単位`;
+                    const source = ev.path ? ` / ${ev.path} ${ev.heading || ""}` : "";
+                    this.els.searchStatus.textContent = `${ev.message || "深掘り調査中"}${counts}${remaining}${source}`;
+                    this.els.searchStatus.hidden = false;
                 } else if (ev.type === "thinking") {
                     this.els.searchStatus.hidden = true;
                     this.els.searchThinking.hidden = false;
@@ -1097,6 +1227,11 @@ const ui = {
                     this.els.searchWarning.hidden = false;
                 } else if (ev.type === "done") {
                     this.els.searchStatus.hidden = true;
+                    if (state.activeMode === "deep") {
+                        const labels = {completed: "指定した調査範囲の処理完了", partial: "部分結果（未確認事項あり）", failed: "調査失敗"};
+                        this.els.searchWarning.textContent = `${labels[ev.status] || "状態未確認"} / ${ev.stopReason || "理由未確認"}`;
+                        this.els.searchWarning.hidden = false;
+                    }
                     closeThinking();
                     this.clearBudgetTimer();
                     // final render
@@ -1228,7 +1363,8 @@ const ui = {
         const route = ev.route ? ` / route ${ev.route}` : "";
         this.els.searchEvidenceSummary.textContent = `根拠 ${items.length}件（${ev.evidenceStatus || "不明"} / 信頼度 ${confidence}${route}）`;
         const warnings = Array.isArray(ev.warnings) ? ev.warnings : [];
-        this.els.searchEvidenceWarnings.textContent = warnings.length ? `検索時の注意:\n${warnings.map((warning) => `- ${warning}`).join("\n")}` : "";
+        const notes = ev.verificationNote ? [String(ev.verificationNote), ...warnings] : warnings;
+        this.els.searchEvidenceWarnings.textContent = notes.length ? `検索時の注意:\n${notes.map((warning) => `- ${warning}`).join("\n")}` : "";
         this.els.searchEvidence.hidden = false;
     },
 
@@ -1322,7 +1458,11 @@ const ui = {
         const evidence = state.resultEvidence;
         const startedAt = meta.startedAt || "";
         const completedAt = state.resultCompletedAt;
-        const modeLabel = meta.mode === "search" ? "資料を探す（回答生成なし）" : "回答を作る";
+        const modeLabel = meta.mode === "search"
+            ? "資料を探す（回答生成なし）"
+            : meta.mode === "deep"
+                ? `深掘り調査（${meta.stopReason || "確定"}）`
+                : "回答を作る";
         const lines = [
             "# offline-ai 検索結果",
             "",
@@ -1369,12 +1509,19 @@ const ui = {
             `- route: ${this._markdownMeta(evidence.route)}`,
             `- indexState: ${this._markdownMeta(evidence.indexState)}`,
             `- 根拠ステータス: ${this._markdownMeta(evidence.evidenceStatus)}`,
+            `- 根拠検証: ${this._markdownMeta(evidence.verificationNote || "格下げなし")}`,
             `- 根拠信頼度: ${this._markdownMeta(evidence.confidence)}`,
             `- 注意: ${this._markdownMeta((evidence.warnings || []).join(" / ")) || "なし"}`,
             "",
             "保存対象には質問・回答・根拠の抜粋が含まれます。",
             "",
         );
+        if (meta.mode === "deep" && Array.isArray(evidence.deepLedger)) {
+            lines.push("", "### 調査台帳", "");
+            evidence.deepLedger.forEach((entry) => {
+                lines.push(`- ${this._markdownMeta(entry.path || "調査全体")} / ${this._markdownMeta(entry.start_line || "")}〜${this._markdownMeta(entry.end_line || "")} / ${this._markdownMeta(entry.reason)}`);
+            });
+        }
         const requestId = String(meta.requestId || "unknown").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 12) || "result";
         const timestamp = new Date(startedAt || Date.now()).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
         const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
@@ -1390,6 +1537,15 @@ const ui = {
     },
 
     cancelSearch() {
+        const requestId = state.activeRequestId;
+        if (requestId) {
+            api.cancelSearch(requestId).catch((err) => {
+                if (state.searching) {
+                    this.els.searchError.textContent = `サーバー側の中止受付に失敗しました: ${err.message}`;
+                    this.els.searchError.hidden = false;
+                }
+            });
+        }
         if (state.searchAbort) {
             state.searchAbort.abort();
             state.searchAbort = null;

@@ -24,7 +24,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from config import OLLAMA_HOST
+from config import OLLAMA_HOST, DEEP_SEARCH_TIMEOUT_DEFAULT
 from source_view import EvidenceRegistry, EvidenceViewError  # noqa: F401 - web_server re-exports this service boundary error
 
 logger = logging.getLogger("offlineai.services")
@@ -32,7 +32,7 @@ logger = logging.getLogger("offlineai.services")
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-VALID_SEARCH_MODES = {"answer", "search"}
+VALID_SEARCH_MODES = {"answer", "search", "deep"}
 
 
 def _utc_now_iso() -> str:
@@ -48,6 +48,15 @@ def create_evidence_registry(source_root: Path | None = None) -> EvidenceRegistr
 def view_evidence(registry: EvidenceRegistry, evidence_id: object, session_id: str) -> dict:
     """根拠 registry から安全な閲覧結果を取得するサービス境界。"""
     return registry.view(evidence_id, session_id=session_id)
+
+
+def _verification_note(retrieval) -> str:
+    """検証で根拠ステータスを格下げした場合の注記。search を読めなければ空文字。"""
+    try:
+        from search import verification_note
+    except Exception:
+        return ""
+    return verification_note(retrieval)
 
 
 def build_evidence_event(
@@ -116,12 +125,65 @@ def build_evidence_event(
     return {
         "type": "evidence",
         "evidenceStatus": str(retrieval.evidence_status),
+        "verificationNote": _verification_note(retrieval),
         "confidence": float(retrieval.confidence),
         "route": str(getattr(retrieval, "route", "keyword")),
         "indexState": str(getattr(retrieval, "index_state", "missing")),
         "routeReason": route_reason,
         "items": items,
         "warnings": list(dict.fromkeys(warnings))[:9],
+    }
+
+
+def build_deep_evidence_event(
+    result,
+    *,
+    evidence_registry: EvidenceRegistry | None = None,
+    session_id: str = "",
+) -> dict:
+    """deep結果を既存の根拠表示契約へ変換する。本文は500字まで表示する。"""
+    items = []
+    for evidence in list(getattr(result, "evidence", [])):
+        path = str(evidence.get("path") or "")
+        source_sha256 = str(evidence.get("source_sha256") or "")
+        item = {
+            "path": path,
+            "sourceTitle": path,
+            "heading": str(evidence.get("heading") or ""),
+            "startLine": evidence.get("start_line"),
+            "endLine": evidence.get("end_line"),
+            "snippet": str(evidence.get("excerpt") or "")[:500],
+            "sourceSha256": source_sha256,
+            "evidenceId": str(evidence.get("evidence_id") or ""),
+            "deepStatus": str(evidence.get("verification_status") or ""),
+            "viewable": False,
+        }
+        if evidence_registry is not None:
+            evidence_id = evidence_registry.register(
+                session_id=session_id,
+                relative_path=path,
+                start_line=item["startLine"],
+                end_line=item["endLine"],
+                source_sha256=source_sha256,
+            )
+            if evidence_id:
+                item["evidenceId"] = evidence_id
+                item["viewable"] = True
+            else:
+                item["viewReason"] = "hashまたは行番号を確認できないため閲覧できません"
+        items.append(item)
+    return {
+        "type": "evidence",
+        "evidenceStatus": str(getattr(result, "status", "partial")),
+        "verificationNote": "deepは原文行範囲とSHA-256を照合した根拠だけを表示します",
+        "confidence": 1.0 if items else 0.0,
+        "route": "deep",
+        "indexState": "deep",
+        "routeReason": str(getattr(result, "stop_reason", "")),
+        "items": items,
+        "warnings": list(getattr(result, "unconfirmed", [])),
+        "deepLedger": list(getattr(result, "ledger", [])),
+        "deepDiagnostics": dict(getattr(result, "diagnostics", {}) or {}),
     }
 
 def _get_ollama_host() -> str:
@@ -231,7 +293,7 @@ class JobEntry:
 
     __slots__ = ("state", "cancel_token", "subscriber_queues",
                  "created_at", "completed_at", "fingerprint",
-                 "_event_buffer", "_lock")
+                  "_event_buffer", "_lock", "released")
 
     def __init__(self, cancel_token: CancellationToken, fingerprint=None):
         self.state: str = "running"
@@ -242,10 +304,12 @@ class JobEntry:
         self.completed_at: float | None = None
         self._event_buffer: list[dict] = []
         self._lock = threading.Lock()
+        self.released = False
 
     def add_subscriber(self) -> queue.Queue:
         """購読者キューを追加し、バッファ済みイベントを replay する。"""
-        q: queue.Queue = queue.Queue()
+        deep = bool(self.fingerprint and len(self.fingerprint) >= 5 and self.fingerprint[4] == "deep")
+        q: queue.Queue = queue.Queue(maxsize=64 if deep else 0)
         with self._lock:
             for event in self._event_buffer:
                 q.put(event)
@@ -266,9 +330,30 @@ class JobEntry:
         終了イベント (done / error) で状態遷移し、購読者リストをクリアする。
         """
         with self._lock:
+            if self.state != "running":
+                return
+            deep = bool(self.fingerprint and len(self.fingerprint) >= 5 and self.fingerprint[4] == "deep")
+            if deep:
+                if event.get("type") in {"deep_progress", "status", "budget"}:
+                    self._event_buffer[:] = [e for e in self._event_buffer if e.get("type") != event.get("type")]
+                proposed = self._event_buffer + [event]
+                if len(proposed) > 32 or len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) > 1_000_000:
+                    self.cancel_token.cancel()
+                    event = {"type": "error", "code": "result_too_large", "message": "結果の保持上限に達しました"}
+                    # Reserve space for the terminal error even if the previous event filled the budget.
+                    self._event_buffer.clear()
             self._event_buffer.append(event)
             for q in self.subscriber_queues:
-                q.put(event)
+                if deep and q.full():
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    for retained in self._event_buffer:
+                        q.put_nowait(retained)
+                else:
+                    q.put(event)
             event_type = event.get("type")
             if event_type == "done":
                 self.state = "completed"
@@ -321,7 +406,8 @@ class JobTable:
     # --- 公開 API ---
 
     def submit(self, request_id: str,
-               cancel_token: CancellationToken, *, fingerprint=None) -> tuple[JobEntry, bool]:
+               cancel_token: CancellationToken, *, fingerprint=None,
+               mode: str | None = None) -> tuple[JobEntry, bool]:
         """ジョブを登録する。
 
         Returns:
@@ -335,6 +421,14 @@ class JobTable:
                 if fingerprint is not None and entry.fingerprint != fingerprint:
                     raise RequestConflictError("request_id is already bound to another search")
                 return entry, False
+            if mode == "deep" and any(
+                entry.state == "running"
+                and entry.fingerprint
+                and len(entry.fingerprint) >= 5
+                and entry.fingerprint[4] == "deep"
+                for entry in self._jobs.values()
+            ):
+                raise RuntimeError("deep_busy")
             if self._running_count >= self._max_concurrent:
                 raise RuntimeError("server_busy")
             entry = JobEntry(cancel_token, fingerprint=fingerprint)
@@ -345,7 +439,10 @@ class JobTable:
     def finish(self, request_id: str):
         """ワーカー完了時に running カウントを減らす。"""
         with self._lock:
-            self._running_count = max(0, self._running_count - 1)
+            entry = self._jobs.get(request_id)
+            if entry is not None and not entry.released:
+                entry.released = True
+                self._running_count = max(0, self._running_count - 1)
 
     def get(self, request_id: str) -> JobEntry | None:
         with self._lock:
@@ -355,6 +452,17 @@ class JobTable:
     def running_count(self) -> int:
         with self._lock:
             return self._running_count
+
+    def has_running_mode(self, mode: str) -> bool:
+        """指定モードのジョブが実行中かを原子的に確認する。"""
+        with self._lock:
+            return any(
+                entry.state == "running"
+                and entry.fingerprint
+                and len(entry.fingerprint) >= 5
+                and entry.fingerprint[4] == mode
+                for entry in self._jobs.values()
+            )
 
     # --- TTL クリーンアップ ---
 
@@ -410,6 +518,11 @@ try:
         GENERATION_STALL_TIMEOUT,
         run_retrieval_pipeline,
     )
+    from deep_research import (
+        DEEP_TIMEOUT_DEFAULT,
+        run_deep_research,
+        detect_deep_model,
+    )
 
     _search_available = True
 except Exception as e:
@@ -418,6 +531,7 @@ except Exception as e:
     # web_server.py が無条件に import する定数のフォールバック
     # （search.py 側の既定値と揃える）。
     GENERATION_STALL_TIMEOUT = 60
+    DEEP_TIMEOUT_DEFAULT = DEEP_SEARCH_TIMEOUT_DEFAULT
 
     class PromptBudgetError(RuntimeError):
         """search.py を読めない場合のフォールバック（例外節の名前解決用）。"""
@@ -559,11 +673,13 @@ ERROR_CODES = {
     "evidence_too_large": 413,
     "evidence_not_found": 404,
     "evidence_unavailable": 500,
+    "job_not_found": 404,
     "forbidden_origin": 403,
     "server_busy": 503,
     "service_unavailable": None,  # SSE only
     "timeout": None,              # SSE only
     "cancelled": None,            # SSE only
+    "deep_failed": None,          # SSE only
     "internal_error": 500,
 }
 
@@ -666,8 +782,75 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
             event_queue.put({"type": "status", "text": "モデルを検出しています..."})
             model = detect_model()
             log_structured(request_id, phase="detect_model", model=model)
+        elif mode == "deep":
+            event_queue.put({"type": "status", "text": "深掘り調査用モデルを検出しています..."})
+            model = detect_deep_model()
+            log_structured(request_id, phase="detect_model", model=model, mode=mode)
 
         cancel_token.check()
+
+        if mode == "deep":
+            def emit_deep_progress(event: dict) -> None:
+                cancel_token.touch()
+                event_queue.put(event)
+
+            deep_result = run_deep_research(
+                query,
+                model=model or "",
+                source_root=SCRIPT_DIR.parent / "skill-source",
+                timeout_seconds=int(cancel_token.timeout_seconds),
+                emit_progress=emit_deep_progress,
+                cancel_check=cancel_token.check,
+                absolute_deadline=cancel_token.deadline,
+            )
+            cancel_token.touch()
+            event_queue.put({
+                "type": "result_meta",
+                "requestId": request_id,
+                "mode": "deep",
+                "startedAt": started_at or _utc_now_iso(),
+                "chatModel": model,
+                "embeddingModel": None,
+                "reasoning": "off",
+                "deepStatus": deep_result.status,
+                "stopReason": deep_result.stop_reason,
+            })
+            event_queue.put(build_deep_evidence_event(
+                deep_result,
+                evidence_registry=evidence_registry,
+                session_id=session_id,
+            ))
+            if deep_result.answer:
+                event_queue.put({"type": "chunk", "text": deep_result.answer})
+            if deep_result.status == "cancelled":
+                event_queue.put({
+                    "type": "error",
+                    "code": "cancelled",
+                    "message": "深掘り調査を中止しました",
+                })
+            elif deep_result.status == "failed" and not deep_result.evidence:
+                event_queue.put({
+                    "type": "error",
+                    "code": "deep_failed",
+                    "message": "深掘り調査を確定できませんでした",
+                })
+            else:
+                event_queue.put({
+                    "type": "done",
+                    "completedAt": _utc_now_iso(),
+                    "status": deep_result.status,
+                    "stopReason": deep_result.stop_reason,
+                })
+            log_structured(
+                request_id,
+                phase="complete",
+                mode="deep",
+                status=deep_result.status,
+                stop_reason=deep_result.stop_reason,
+                evidence_count=len(deep_result.evidence),
+                units=deep_result.diagnostics.get("units", 0),
+            )
+            return
 
         # 2. 共通 retrieval pipeline
         # Retrieval has its own child budget.  It can never extend the
@@ -696,6 +879,9 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
         parameters = inspect.signature(run_retrieval_pipeline).parameters
         if "mode" in parameters:
             pipeline_kwargs["mode"] = mode
+        if "remaining_seconds" in parameters:
+            # 案A（LLM根拠検証）の予算逆算用。request全体の残り秒数を渡す。
+            pipeline_kwargs["remaining_seconds"] = cancel_token.remaining
         retrieval = run_retrieval_pipeline(query, **pipeline_kwargs)
         log_structured(
             request_id,
@@ -703,6 +889,10 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
             match_count=len(retrieval.matches),
             evidence_status=retrieval.evidence_status,
             confidence=retrieval.confidence,
+            verification_status=str(getattr(retrieval, "verification_status", "")),
+            verification_failure_reason=str(
+                getattr(retrieval, "verification_failure_reason", "")
+            ),
         )
         cancel_token.touch()
         effective_reasoning = reasoning if reasoning in ("low", "medium", "high") else "off"

@@ -181,6 +181,53 @@ def node_by_heading_line(nodes: list[HeadingNode], heading_line: int) -> Heading
     return None
 
 
+def node_for_line(nodes: list[HeadingNode], line_no: int) -> HeadingNode | None:
+    """本文行を最も内側のATX節へ割り当てる。
+
+    ``node_by_heading_line`` は見出し行の完全一致専用であるため、本文ヒット
+    の所属節を求めるdeep調査や参照範囲の構築ではこちらを使う。行番号は
+    既存APIと同じく1-indexedで、同じ行を含む候補のうち見出しが最も後ろの
+    ノードを返す。
+    """
+    containing = [
+        node
+        for node in nodes
+        if node.heading_line <= line_no <= max(node.section_end_line, node.heading_line)
+    ]
+    return max(containing, key=lambda node: node.heading_line) if containing else None
+
+
+def section_range_for_line(
+    nodes: list[HeadingNode],
+    line_no: int,
+    *,
+    include_heading: bool = True,
+    preserve_parent_intro: bool = True,
+) -> tuple[int, int, str]:
+    """本文ヒットを含む節の実在行範囲と見出し名を返す。
+
+    子を持つ親節の導入本文にヒットした場合は、最初の子節の直前で範囲を
+    閉じる。これにより親の但書・適用条件を残しながら、無関係な兄弟節を
+    読み込まない。見出しより前の本文は ``(1, first_heading - 1, "")``、
+    見出しがない資料は呼び出し側で本文全体を扱えるよう ``(1, 0, "")`` を
+    返す。
+    """
+    if not nodes:
+        return 1, 0, ""
+    node = node_for_line(nodes, line_no)
+    if node is None:
+        first_heading = min(item.heading_line for item in nodes)
+        return 1, first_heading - 1, ""
+
+    start = node.heading_line if include_heading else node.body_start_line
+    end = node.section_end_line
+    if preserve_parent_intro and node.children_indices:
+        first_child = nodes[node.children_indices[0]]
+        if line_no < first_child.heading_line:
+            end = first_child.heading_line - 1
+    return start, end, node.heading_text
+
+
 def direct_child_ranges(nodes: list[HeadingNode], node: HeadingNode) -> list[tuple[int, int]]:
     """親の直接の子見出しごとに、見出し行から自身の節の終端（孫を含む）までの
     範囲を返す。

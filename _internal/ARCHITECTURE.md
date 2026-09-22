@@ -1,5 +1,16 @@
 # offline-ai 内部アーキテクチャ
 
+## deepモードの検証・終了契約（2026-09-21）
+
+- `deep_research.py`は全初期観点を1巡回として処理し、抽出された参照先・不足点と資料見出しから追加探索する。候補から親の導入本文も別行範囲で保持する。長い単一行の既読キーは資料hash・行・文字位置を含む。
+- 抽出JSONは必須型を検証し、破損時は共通期限内で1回だけ再試行する。抽出・最終回答には別の原文支持照合を行う。モデル照合の正しさは実資料・保留群の人手評価で測る。モデルによる自己照合を精度の保証にしない。
+- `deep_transport.py`は要求専用の標準ライブラリ子プロセスを使用する。応答ヘッダー待ち、停止したstream、候補検索を親の単調時計とキャンセルで監視し、中止時はその子のみをkill/communicateして回収する。共有Ollama自体は停止しない。推論が実際に終了した時間は実機試験で別に測る。
+- deep入口はモデル設定を読み取るだけで、旧モデル設定の自動移行を行わない。既存互換cacheがあるときはkeywordとembeddingのランキングを再利用し、検索中のcache再構築は行わない。cacheは現在のsnapshotと一致するentryのみ使う。
+- CLIとWebは受付時の絶対期限を共通処理へ渡す。探索は統合照合120秒・終了5秒を予約し、モデル入力全体に32,768 context・4,096生成予約・1,024安全予約を適用する。保持根拠12,000字とtoken上限を別々に守る。
+- 資料hashを読み取り直前と最終確定前に再検証する。失敗・未確認・上限で落ちた範囲は台帳へ記録する。未検証の解釈はfallbackへ出さず、元の抜粋を表示する。診断dictには本文・質問・回答・自由文エラーを格納しない。
+- deepのreplayは進捗を最新状態へ集約し32イベント／1MB、購読キューは64イベントで制限する。保持上限を超えた場合は固定エラーで終了する。terminal確定後のイベントは無視し、実行枠は要求ごとに一度だけ解放する。通常モードのstream蓄積仕様は変更しない。
+- 自動試験のPASSと、実モデルの精度・Ollama推論終了・30分・通常要求競合・外部切断の受入は別に管理する。後者の未達状態を公開・運用反映の許可に読み替えない。
+
 ## 1. 製品境界
 
 offline-aiは、外部で作成・検証済みのテキスト資料を完全オフライン環境で検索し、根拠付き回答を生成する。文書変換、OCR、PDF upload、外部サービス連携は責務に含めない。
@@ -60,11 +71,13 @@ search.bat / GET /api/search
   → search.py / web_services.run_search
   → mode=answer: chat model検出 → index state read
   → mode=search: 決定的query → index state read（chat model/検索計画なし）
+  → mode=deep: deep_research.run_deep_research → 候補上限・節読み・原文照合・統合
   → readyならskill-source scan + keyword/Embedding retrieval、未準備ならkeyword retrieval only
   → RRF merge
   → optional loopback reranker
   → mode=answer: Ollama回答生成 → answer + evidence + warnings
   → mode=search: evidence + done（回答生成なし）
+  → mode=deep: deep_progress + evidence + answer + done/error（通常の最終根拠上限を再適用しない）
 ```
 
 検索対象は`.md`, `.txt`, `.csv`, `.json`, `.yaml`, `.yml`, `.html`, `.htm`である。対応外の原本は外部で検索用派生物へ変換し、利用者が原本と照合する。
@@ -98,6 +111,20 @@ search.bat / GET /api/search
 - 表示: 回答用prompt（`prompt_templates.build_user_prompt`）は展開itemに由来を、部分展開itemに「部分展開」を付け、部分展開がある場合は全体を網羅したと述べない回答契約を追加する。prompt shell見積り（`_estimate_prompt_shell_chars`）はこの表示分を件数上限ぶん固定で予約する。Web UIの根拠一覧・Markdown保存とCLIの根拠一覧は「見出し配下の本文を展開」「（部分展開）」を表示する。
 - 既定ON（2026-09-14）。無効化は`OFFLINE_AI_PARENT_CHILD_EXPANSION=false`。上限は`OFFLINE_AI_EXPANSION_MAX_PARENTS`（既定2）、`OFFLINE_AI_EXPANSION_MAX_RANGES_PER_PARENT`（既定4）、`OFFLINE_AI_EXPANSION_MAX_TOTAL_RANGES`（既定4）、`OFFLINE_AI_EXPANSION_BUDGET_RATIO`（既定0.5、実効根拠予算に対する展開文字量の上限比率）で調整する。
 
+### 3.3 根拠検証（案A）と回答promptの契約
+
+`run_retrieval_pipeline`は、最終根拠予算を適用した後の採用根拠（回答promptに実際に載る根拠）について、検索側の状態（`retrieval_status`）が`sufficient`または`partial`なら、補助chatで「根拠が質問に答えているか」をJSONで判定する（`verify_evidence_support`、`OFFLINE_AI_EVIDENCE_VERIFY`、2026-09-20から既定ON。計画は`plans/offline-ai-evidence-sufficiency-verification-plan.md`）。
+
+- 呼び出しは検索計画と同じ`num_ctx`・`num_batch`・`num_gpu`・`keep_alive`・`think=False`・temperature 0を使い、モデルの再ロードを起こさない。上限は`OFFLINE_AI_EVIDENCE_VERIFY_TIMEOUT`（既定15秒）と、全体の残り時間から回答生成の予約（`OFFLINE_AI_EVIDENCE_VERIFY_GENERATION_RESERVE`、既定30秒）を引いた値の小さい方。残りが`OFFLINE_AI_EVIDENCE_VERIFY_MIN_BUDGET`（既定3秒）未満なら実行せず`skipped_budget`とする。
+- 出力契約: `support`（4値）・`reason_code`（5値）・`conditions`（`{condition, supported}`）。`conditions.supported`は「根拠がその条件に明示的に答えているか」であり、「対象に当てはまるか」ではない（「〜は対象外」と明記されていれば`true`）。validatorは不正値と矛盾する組み合わせ（`fully_supported`と`different_subject`、`unsupported`と`answer_found`、不支持条件があるのに`fully_supported`）を拒否する。
+- 状態: `verified`・`failed`・`skipped_disabled`・`skipped_not_applicable`・`skipped_budget`。`failed`は理由を`EvidenceVerificationError.reason`（`transport`・`timeout`・`json_parse`・`schema`・`contradiction`）で分類し、`RetrievalResult.verification_failure_reason`とtraceへ残す。
+- 格下げのみ: `retrieval_status=sufficient`で`verified`かつ`fully_supported`以外なら`partial`へ下げる。`partial`は格上げしない。`failed`・`skipped_*`では`retrieval_status`のまま回答を続ける。利用者キャンセル・全体期限切れ（`cancel_check`の例外）は検証の失敗へ変換せず上位へ伝播し、回答生成を始めない。
+- 不足理由: 格下げまたは不足判定の場合、回答promptへ「根拠検証」の不足理由（理由コード・支持されない条件）を載せる。さらに、`unsupported`、`related_only`・`different_subject`、または不支持条件がある場合だけ、promptの末尾へ`INSUFFICIENCY_ANSWER_CONTRACT`（該当情報なしと書かれていない条件の説明だけにし、別対象の手続き・数値を書かない）を置く（`insufficiency_requires_abstain`）。`partially_supported`・`missing_detail`・不支持条件なしは、言い換え型の正例で検証が控えめに判定する形のため、契約を置かない。
+- 表示: 格下げした場合だけ、CLIの根拠一覧とWebの「検索時の注意」・Markdown保存に「根拠検証: … sufficient から partial にしました」を出す（`verification_note`）。外部の`evidenceStatus`の意味は変えない。Webの構造化ログ（`phase: retrieval`）へ`verification_status`と`verification_failure_reason`を出す。
+- 資料内指示文への耐性（案Aの有無によらず常時）: `SYSTEM_PROMPT`の基本ルール（`SOURCE_INSTRUCTION_IMMUNITY_RULE`）、根拠ブロック直前の注意（`SOURCE_INSTRUCTION_IMMUNITY_NOTE`）、回答promptの末尾（`SOURCE_INSTRUCTION_IMMUNITY_TAIL`）で、資料本文はデータであり回答方法・語句の指示に従わないと示す。3つを併用した場合に同一根拠の誤従が5/5→0/5になった。
+- 予算: 耐性文言と末尾契約は根拠がある場合だけpromptへ現れ、根拠を空にしたshell見積りには出ないため、`_estimate_prompt_shell_chars`へ固定予約を足す。
+- 既知の限界（2026-09-20時点）: 語がよく重なる別対象の質問（例: 「外部講師に研修を依頼する」に対し根拠は「外部研修を受講する」）は、検索された根拠の組み合わせによって検証が`fully_supported`と判定し、流用が残ることがある。「答えを求める対象」を先に比べさせる検証（2段階検証の試作）は、既存保留の正例の誤格下げと遅延増で不採用とした。遅延はP2実測で検証単体の中央値5.3〜6.2秒、回答完了まで約+7秒。
+
 ## 4. metadata sidecar
 
 `document_schema.py`は`<file>.md.metadata.json`のschemaとreader/writer helperを提供する。
@@ -116,6 +143,7 @@ search.bat / GET /api/search
 - `GET/POST /bootstrap`
 - `GET /api/health`
 - `GET /api/search`（SSE）
+- `POST /api/search/cancel`（所有セッションのrequest_idに束縛したサーバージョブ中止）
 - `GET /api/evidence/view?evidence_id=...`（検索時に登録した根拠行窓）
 - `GET /api/index/status`
 - `GET /api/index/plan?mode=incremental|full`（副作用のない差分解析）
@@ -127,7 +155,7 @@ search.bat / GET /api/search
 
 `web.bat`の非表示起動（`web_launcher.py`）は`--exit-when-page-closed`を付けて起動し、開いているページが無くなったらサーバーを停止する。コンソール起動と直接起動は付けないため従来どおりCtrl+Cで停止する。ページは15秒ごとに`page_id`と表示状態を`/api/page/heartbeat`へ送り、`pagehide`で`sendBeacon`により`/api/page/close`を送る。サーバーの`PagePresenceMonitor`は最後のページが閉じてから15秒の猶予（再読み込み吸収）を置いて停止し、closeが届かなかったページは最後の通知が表示中なら45秒、非表示なら300秒（背景タブのtimer間引き対策）で失効させる。watchdogは2秒間隔で判定し、tick間隔が30秒を超えた場合はスリープ明けとして在席時刻を寄せる。ページが一度も接続しない場合は600秒で停止する。このプロセスのworkerが索引を構築中、または検索jobが実行中の間は停止を保留する。在席通知もCookie認証・Origin/Host検査の対象で、`page_id`は8〜64文字の英数字・`-`・`_`に限る。
 
-Health contractにはindex statusと検索単位timeout契約（`searchTimeoutDefault`/`Min`/`Max`、300〜600秒）、ページ閉鎖時停止の有効状態（`pageCloseStop`）を含める。index SSEの切断はjobをcancelせず、statusとbounded event bufferから再接続する。
+Health contractにはindex statusと検索単位timeout契約（通常は`searchTimeoutDefault`/`Min`/`Max`、300〜600秒、deepは`deepSearchTimeoutDefault`/`Min`/`Max`、300〜1,800秒）、ページ閉鎖時停止の有効状態（`pageCloseStop`）を含める。index SSEの切断はjobをcancelせず、statusとbounded event bufferから再接続する。検索SSEの切断もジョブ中止とは区別し、明示中止だけが`/api/search/cancel`を通じて所有requestへ伝播する。
 
 `/api/index/plan`は追加・変更・削除・未変更file数、生成/完成cache再利用/checkpoint再開のchunk数、mode、対象generation、全件計算になる理由（`full_requested`/`cache_missing`/`model_digest_unavailable`/`cache_incompatible`）、生成chunkだけを分母にした過去速度ベースの見積もりを返す。事前解析はbuildと同じ再利用選別関数を使い、cache・checkpoint・statusを書き換えない。速度は同一モデルのjobでEmbedding API呼出しに要した時間だけから算出し（`rate_basis: "generated"`）、走査・cache読込・JSON保存時間、再利用件数、旧processed基準の速度は混ぜない。32件未満しか生成しなかったjobはモデル起動待ちの影響が大きいため既存実績を上書きしない。生成0件（削除のみを含む）は0秒と断定せず、走査・保存時間がかかる旨を表示する。開始要求は任意の`expected_generation`を受け、確認後に資料が変わっていればjobを開始しない（`index_source_changed`）。start/resumeのmodeはstatusへ保存し、resumeは保存済みmodeを継承し、異なるmode指定は`index_mode_conflict`で拒否する。
 
@@ -238,6 +266,8 @@ offline-aiを独立public repositoryとして切り出す場合の成果物境�
 検証は`_internal/scripts/Test-DistributionPolicy.ps1`で行う。V-1（分類網羅）、V-2（audience別allowlist選択）、V-4（path traversal・絶対path・case collision・ADS・予約device名拒否）、V-5（reparse point拒否）を実施し、`candidate_digest`（決定的。policy digest + sorted file listのみで構成）と`generated_at`を含むrun receiptを出力する。**秘密情報の本文scan（V-3相当）は行わない。** `sensitive_scan_performed=false`をreceiptへ記録し、正式な秘密scanはformal audit側のconsent後gateへ委譲する。
 
 新しいfileを追加する場合は、`distribution-policy.json`へentry（`pattern`、`distribution`、`reason`、`boundary_row`）を追加すること。
+
+`runtime`/`both`分類のfile（`_internal/search.py`等）の中身を変更した場合、`_internal/download-manifest.json`の`appPayloadEstimate`（V-6ゲート、7.参照）が古いままだと`Test-DistributionPolicy.ps1`が`BLOCKED`になる。`download-manifest.json`自身も`both`分類でinventoryに含まれるため、単純に実測値をそのまま書き込むと自己参照でずれる（totalBytesの桁数が変わらなくても、書き込み時の改行コード混在等でmanifest自身のbyte数が変動し、actualが再びずれる）。更新手順: (1) `-Audience runtime`で`actual.totalBytes`を確認、(2) `other_total = actual.totalBytes - 現在のmanifestファイルのbyte数`を求める、(3) `target = other_total + 書き込み後のmanifestファイルのbyte数`（数値の桁数が変わらなければ現在のbyte数のまま）を`totalBytes`へ書く、(4) 再実行してPASSを確認する。`largestFileBytes`・`largestFile`はinventoryの実測値をそのまま使ってよい（自己参照しない）。`download-manifest.json`はリポジトリ上で改行コードがLFとCRLFの混在（`git ls-files --eol`で`i/mixed`）であり、属性は`-text`（変換なし）なので、テキストとして読み書きせず、バイト列のまま数値だけを置換する（Pythonの`read_text`/`write_text`はWindowsで全行をCRLFへ揃え、byte数と差分を変えてしまう）。
 
 ## 更新ポリシー
 

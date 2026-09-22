@@ -51,9 +51,13 @@ import io
 
 try:
     from config import (
+        DEEP_SEARCH_TIMEOUT_DEFAULT,
+        DEEP_SEARCH_TIMEOUT_MAX,
+        DEEP_SEARCH_TIMEOUT_MIN,
         SEARCH_TIMEOUT_DEFAULT,
         SEARCH_TIMEOUT_MAX,
         SEARCH_TIMEOUT_MIN,
+        validate_mode_timeout_seconds,
         validate_search_timeout_seconds,
     )
     from web_services import (
@@ -264,7 +268,7 @@ def _build_error_response(code: str, message: str) -> bytes:
 # 検索単位timeout（Phase 7: 利用者timeout設定・全体残り時間表示）
 # ---------------------------------------------------------------------------
 
-def _parse_search_timeout_param(values: list[str], default: int) -> int:
+def _parse_search_timeout_param(values: list[str], default: int, mode: str = "answer") -> int:
     """`timeout_seconds` クエリパラメータを解釈する。
 
     省略時はサーバー既定 ``default`` を使う（後方互換）。重複指定・契約外の
@@ -274,7 +278,7 @@ def _parse_search_timeout_param(values: list[str], default: int) -> int:
         return default
     if len(values) > 1:
         raise ValueError("timeout_seconds must not be repeated")
-    return validate_search_timeout_seconds(values[0])
+    return validate_mode_timeout_seconds(values[0], mode)
 
 
 def _build_budget_event(cancel_token: CancellationToken) -> dict:
@@ -305,6 +309,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass,
                  max_connections=10, session_token="",
                  search_timeout=DEFAULT_SEARCH_TIMEOUT,
+                 deep_search_timeout=DEEP_SEARCH_TIMEOUT_DEFAULT,
                  bind_port=8080,
                  evidence_registry=None,
                  page_presence=None):
@@ -314,6 +319,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self.bootstrap_token_used = False
         self._token_lock = threading.Lock()
         self.search_timeout = search_timeout
+        self.deep_search_timeout = deep_search_timeout
         self.bind_port = bind_port
         self.active_tokens: list[CancellationToken] = []
         self._tokens_lock = threading.Lock()
@@ -806,6 +812,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_index_start(resume=True)
         elif path == "/api/index/cancel":
             self._handle_index_cancel()
+        elif path == "/api/search/cancel":
+            self._handle_search_cancel()
         elif path == "/api/page/heartbeat":
             self._handle_page_presence(closing=False)
         elif path == "/api/page/close":
@@ -828,6 +836,9 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         result["searchTimeoutDefault"] = self.server.search_timeout
         result["searchTimeoutMin"] = SEARCH_TIMEOUT_MIN
         result["searchTimeoutMax"] = SEARCH_TIMEOUT_MAX
+        result["deepSearchTimeoutDefault"] = self.server.deep_search_timeout
+        result["deepSearchTimeoutMin"] = DEEP_SEARCH_TIMEOUT_MIN
+        result["deepSearchTimeoutMax"] = DEEP_SEARCH_TIMEOUT_MAX
         result["pageCloseStop"] = self.server.page_presence is not None
         self._send_json(result)
 
@@ -951,6 +962,36 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         job_id = payload.get("job_id")
         self._send_json(self.server.index_coordinator.cancel(str(job_id) if job_id else None))
 
+    def _handle_search_cancel(self):
+        """所有権を検証して、サーバー側の検索ジョブへ中止を伝播する。"""
+        session_id = self._get_auth_session_id()
+        if not session_id:
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        try:
+            payload = self._read_json_body(max_bytes=1024)
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error_json("invalid_query", "cancel payload is invalid")
+            return
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            self._send_error_json("invalid_query", "request_id is required")
+            return
+        entry = self.server.job_table.get(request_id)
+        if entry is None:
+            self._send_error_json("job_not_found", "検索ジョブが見つかりません")
+            return
+        fingerprint = entry.fingerprint
+        if not fingerprint or fingerprint[0] != session_id:
+            self._send_error_json("unauthorized", "この検索ジョブを中止する権限がありません")
+            return
+        entry.cancel_token.cancel()
+        self._send_json({
+            "requestId": request_id,
+            "cancelled": True,
+            "state": entry.state,
+        })
+
     def _handle_evidence_view(self, parsed):
         session_id = self._get_auth_session_id()
         if not session_id:
@@ -1005,13 +1046,23 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            timeout_default = (
+                self.server.deep_search_timeout
+                if mode == "deep"
+                else self.server.search_timeout
+            )
             timeout_seconds = _parse_search_timeout_param(
-                params.get("timeout_seconds", []), self.server.search_timeout
+                params.get("timeout_seconds", []), timeout_default, mode
             )
         except ValueError:
+            timeout_label = (
+                f"深掘りタイムアウトは{DEEP_SEARCH_TIMEOUT_MIN}〜{DEEP_SEARCH_TIMEOUT_MAX}秒"
+                if mode == "deep"
+                else f"検索タイムアウトは{SEARCH_TIMEOUT_MIN}〜{SEARCH_TIMEOUT_MAX}秒"
+            )
             self._send_error_json(
                 "invalid_timeout",
-                f"検索タイムアウトは{SEARCH_TIMEOUT_MIN}〜{SEARCH_TIMEOUT_MAX}秒の整数で、"
+                f"{timeout_label}の整数で、"
                 "重複指定はできません",
             )
             return
@@ -1023,7 +1074,7 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         try:
             fingerprint = (session_id, query, reasoning, timeout_seconds, mode)
             entry, is_new = self.server.job_table.submit(
-                request_id, cancel_token, fingerprint=fingerprint
+                request_id, cancel_token, fingerprint=fingerprint, mode=mode
             )
         except RequestConflictError:
             self._send_error_json(
