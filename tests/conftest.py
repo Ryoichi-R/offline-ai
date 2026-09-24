@@ -7,3 +7,6 @@ sys.path.insert(0, str(INTERNAL_DIR))
 
 EVAL_DIR = OFFLINE_AI_ROOT / "tests" / "eval"
 sys.path.insert(0, str(EVAL_DIR))
+
+SUPPORT_DIR = OFFLINE_AI_ROOT / "tests" / "support"
+sys.path.insert(0, str(SUPPORT_DIR))

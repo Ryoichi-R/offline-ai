@@ -30,7 +30,7 @@ def test_markdown_ui_uses_content_dependent_fence_and_does_not_save_view_ids():
     assert "const longest = runs.reduce" in html
     assert 'this._markdownTextBlock("検索時の抜粋", item.snippet)' in html
     save_start = html.index("    saveMarkdown()")
-    save_end = html.index("    cancelSearch()", save_start)
+    save_end = html.index("    async cancelSearch()", save_start)
     assert "item.evidenceId" not in html[save_start:save_end]
     assert "document.body.appendChild(anchor)" in html
 
@@ -57,7 +57,7 @@ def test_evidence_list_and_markdown_mark_expanded_and_partial_evidence():
     render_end = html.index("\n    },", render_start)
     assert "if (item.groupId) metaParts.push(this._expansionLabel(item));" in html[render_start:render_end]
     save_start = html.index("    saveMarkdown()")
-    save_end = html.index("    cancelSearch()", save_start)
+    save_end = html.index("    async cancelSearch()", save_start)
     assert 'item.groupId ? this._expansionLabel(item) : ""' in html[save_start:save_end]
 
 

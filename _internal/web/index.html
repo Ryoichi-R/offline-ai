@@ -306,6 +306,7 @@ body {
                    title="検索タイムアウト（秒）" aria-label="検索タイムアウト（秒）">
             <button class="btn btn-primary" id="searchBtn">検索</button>
             <button class="btn btn-danger" id="cancelSearchBtn" hidden>中止</button>
+            <button class="btn btn-secondary" id="reconnectSearchBtn" hidden>再接続</button>
             </div>
             <p class="mode-hint" id="searchModeHint">回答を生成し、根拠を表示します。</p>
         </div>
@@ -347,6 +348,8 @@ body {
 // --- state ---
 const state = {
     searching: false,
+    searchDisconnected: false,
+    cancelPending: false,
     searchAbort: null,
     searchSequence: 0,
     activeSearchId: 0,
@@ -365,6 +368,7 @@ const state = {
     resultMeta: null,
     resultEvidence: null,
     resultCompletedAt: null,
+    resultReceivedAt: null,
     resultAnswerEmpty: false,
     evidenceFocusElement: null,
     evidenceViewSequence: 0,
@@ -395,8 +399,9 @@ function persistActiveSearch() {
             reasoning: state.activeReasoning,
             timeoutSeconds: state.activeTimeoutSeconds,
         }));
+        return true;
     } catch {
-        // private browsing 等でstorageが使えなくても検索自体は継続する。
+        return false;
     }
 }
 
@@ -446,6 +451,90 @@ const budgetCountdown = {
     },
 };
 // --- budgetCountdown: END ---
+
+// 深掘りの診断(サーバーの単調時計による全体経過・段階別時間・処理件数)を
+// 画面と保存Markdownで同じ文言にする。数値の許可項目だけを読み、本文は扱わない。
+// --- deepDiagnosticsFormat: BEGIN (pure, DOM非依存 — testで抽出evalされる) ---
+const deepDiagnosticsFormat = {
+    STAGE_LABELS: {
+        planning: "計画",
+        search: "検索",
+        read: "読取（抽出・照合）",
+        integrate: "統合（最終回答・照合）",
+    },
+    FINAL_RESULT_LABELS: {
+        accepted: "合格",
+        rejected_citations: "根拠IDの不備で不合格",
+        rejected_support: "根拠に支持されず不合格",
+        rejected_limitations: "根拠の限定の欠けで不合格",
+        verification_incomplete: "照合を完了できず",
+        not_generated: "回答未生成",
+    },
+    _seconds(value) {
+        const n = Number(value);
+        return Number.isFinite(n) && n >= 0 ? `${n.toFixed(1)}秒` : "不明";
+    },
+    lines(diag) {
+        if (!diag || typeof diag !== "object") return [];
+        const out = [];
+        if (diag.elapsed_seconds !== undefined) {
+            const limit = Number.isFinite(Number(diag.timeout_seconds)) ? ` / 上限${Number(diag.timeout_seconds)}秒` : "";
+            out.push(`全体経過（サーバー計測）: ${this._seconds(diag.elapsed_seconds)}${limit}`);
+        }
+        const stages = diag.stage_seconds && typeof diag.stage_seconds === "object" ? diag.stage_seconds : null;
+        if (stages) {
+            const known = Object.keys(this.STAGE_LABELS).filter((key) => key in stages);
+            const other = Object.keys(stages).filter((key) => !(key in this.STAGE_LABELS)).sort();
+            const parts = [...known, ...other].map((key) => `${this.STAGE_LABELS[key] || key} ${this._seconds(stages[key])}`);
+            if (parts.length) out.push(`段階別時間: ${parts.join(" / ")}`);
+        }
+        const counts = [
+            ["巡回", diag.rounds],
+            ["資料", diag.documents],
+            ["読取単位", diag.units],
+            ["根拠", diag.evidence_count],
+        ].filter(([, value]) => Number.isFinite(Number(value)));
+        if (counts.length) out.push(`処理件数: ${counts.map(([label, value]) => `${label} ${Number(value)}`).join(" / ")}`);
+        const finalAnswer = diag.final_answer && typeof diag.final_answer === "object" ? diag.final_answer : null;
+        const attempts = finalAnswer && Array.isArray(finalAnswer.attempts) ? finalAnswer.attempts : [];
+        if (attempts.length) {
+            const last = attempts[attempts.length - 1] || {};
+            const n = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+            const sum = (key) => attempts.reduce((total, item) => total + n(item && item[key]), 0);
+            const result = this.FINAL_RESULT_LABELS[finalAnswer.result] || "不明";
+            out.push(
+                `最終回答の検査: ${result} / 試行${attempts.length}回 / 根拠IDなしの行 ${n(last.uncited_lines)}`
+                + ` / 不明な根拠ID ${n(last.unknown_id_lines)} / 除いた未確認欄 ${sum("dropped_unconfirmed_lines")}行`
+                + ` / 表記を直した引用 ${sum("normalized_citations")}件`
+                + ` / 限定の欠け ${n(last.limitation_lines)}行`
+                + (n(finalAnswer.repaired_lines) ? ` / 原文に置き換えた行 ${n(finalAnswer.repaired_lines)}` : "")
+                + (n(last.enumeration_gaps) ? ` / 列挙の欠け ${n(last.enumeration_gaps)}項目` : "")
+                + (n(finalAnswer.added_items) ? ` / 原文から補った列挙項目 ${n(finalAnswer.added_items)}` : "")
+                + (n(finalAnswer.duplicate_lines) ? ` / 重複を除いた行 ${n(finalAnswer.duplicate_lines)}` : "")
+            );
+            const checks = finalAnswer.line_checks && typeof finalAnswer.line_checks === "object" ? finalAnswer.line_checks : null;
+            if (checks) {
+                out.push(
+                    `1行ずつの照合: 照合 ${n(checks.checked)}行 / 支持されない ${n(checks.unsupported)}行`
+                    + `（原文に置換 ${n(checks.replaced)}・削除 ${n(checks.dropped)}`
+                    + (n(checks.off_question) ? `、うち質問外の背景 ${n(checks.off_question)}` : "")
+                    + `） / 未照合 ${n(checks.unchecked)}行`
+                );
+            }
+        }
+        const irrelevant = Array.isArray(diag.irrelevant_ranges) ? diag.irrelevant_ranges : [];
+        if (irrelevant.length) {
+            const shown = irrelevant.slice(0, 5).map((item) => {
+                const path = String((item && item.path) || "").split("/").pop();
+                return `${path} L${Number(item && item.start_line) || "?"}-${Number(item && item.end_line) || "?"}`;
+            });
+            const rest = irrelevant.length > shown.length ? ` ほか${irrelevant.length - shown.length}件` : "";
+            out.push(`読んだが質問と関係なしと判定した節: ${irrelevant.length}件（${shown.join(" / ")}${rest}）`);
+        }
+        return out;
+    },
+};
+// --- deepDiagnosticsFormat: END ---
 
 // --- markdown renderer ---
 const md = {
@@ -682,6 +771,7 @@ const api = {
 
         const params = new URLSearchParams({ q: query, mode });
         if (state.activeRequestId) params.set("request_id", state.activeRequestId);
+        if (callbacks.resumeOnly) params.set("resume_only", "1");
         if (reasoning) params.set("reasoning", reasoning);
         if (Number.isFinite(timeoutSeconds)) params.set("timeout_seconds", String(timeoutSeconds));
 
@@ -689,7 +779,9 @@ const api = {
             .then(async (res) => {
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
-                    callbacks.onError(err.error?.message || `HTTP ${res.status}`);
+                    callbacks.onError(err.error?.message || `HTTP ${res.status}`, {
+                        terminal: res.status >= 400 && res.status < 500 && ![408, 429].includes(res.status),
+                    });
                     return;
                 }
                 const reader = res.body.getReader();
@@ -814,6 +906,7 @@ const ui = {
             searchTimeoutInput: document.getElementById("searchTimeoutInput"),
             searchBtn: document.getElementById("searchBtn"),
             cancelSearchBtn: document.getElementById("cancelSearchBtn"),
+            reconnectSearchBtn: document.getElementById("reconnectSearchBtn"),
             searchStatus: document.getElementById("searchStatus"),
             searchBudget: document.getElementById("searchBudget"),
             searchThinking: document.getElementById("searchThinking"),
@@ -846,12 +939,19 @@ const ui = {
     // ページリロード直後、前回のsessionStorageに進行中の検索が残っていれば
     // 同じrequest_id・検索条件でSSEへ再購読する。JobTableが完了結果を
     // バッファしているため、既に終わっていた場合はその結果を、まだ実行中
-    // なら現在の進捗を受け取れる。存在しない・条件不一致（別のtabやサーバー
+    // なら現在の進捗を受け取れる。resume_onlyで新規job作成は禁止する。
+    // 存在しない・条件不一致（別のtabやサーバー
     // 再起動でjob_tableが失われた場合等）はエラー表示のうえ状態を破棄する。
     resumeActiveSearch() {
         const saved = loadPersistedSearch();
-        if (!saved || state.searching) return;
-        this.startSearch(saved);
+        if (state.cancelPending || (state.searching && !state.searchDisconnected)) return;
+        // Storage-disabled tabs can still reconnect while this document lives.
+        const resume = saved || (state.searchDisconnected ? {
+            requestId: state.activeRequestId, query: state.activeQuery,
+            mode: state.activeMode, reasoning: state.activeReasoning,
+            timeoutSeconds: state.activeTimeoutSeconds,
+        } : null);
+        if (resume) this.startSearch(resume);
     },
 
     renderPageCloseHint({ enabled, serverGone }) {
@@ -875,6 +975,7 @@ const ui = {
         // Search
         this.els.searchBtn.addEventListener("click", () => this.startSearch());
         this.els.cancelSearchBtn.addEventListener("click", () => this.cancelSearch());
+        this.els.reconnectSearchBtn.addEventListener("click", () => this.resumeActiveSearch());
         this.els.searchModeSelect.addEventListener("change", () => this.updateSearchModeUI());
         this.els.evidenceViewerCloseBtn.addEventListener("click", () => this.closeEvidenceViewer());
         this.els.saveMarkdownBtn.addEventListener("click", () => this.saveMarkdown());
@@ -904,7 +1005,7 @@ const ui = {
             if (!state.timeoutSynced && Number.isFinite(h.searchTimeoutMin) && Number.isFinite(h.searchTimeoutMax)) {
                 this.els.searchTimeoutInput.min = String(h.searchTimeoutMin);
                 this.els.searchTimeoutInput.max = String(h.searchTimeoutMax);
-                this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
+                if (!state.searching) this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
                 state.timeoutSynced = true;
             }
             if (Number.isFinite(h.deepSearchTimeoutMin) && Number.isFinite(h.deepSearchTimeoutMax)) {
@@ -1063,6 +1164,9 @@ const ui = {
     },
 
     startSearch(resume = null) {
+        if (state.cancelPending || (state.searching && (!resume || !state.searchDisconnected))) return;
+        // Invalidate old callbacks before aborting an earlier subscription.
+        if (state.searchAbort) state.searchAbort.abort();
         const query = resume ? resume.query : this.els.searchInput.value.trim();
         if (!query) return;
         const selectedMode = resume ? resume.mode : this.els.searchModeSelect.value;
@@ -1084,6 +1188,7 @@ const ui = {
             ? resume.requestId
             : (crypto.randomUUID ? crypto.randomUUID() : `req-${Date.now()}-${searchId}`);
         state.searching = true;
+        state.searchDisconnected = false;
         state.rawSearchText = "";
         state.rawThinkingText = "";
         state.activeMode = mode;
@@ -1096,6 +1201,7 @@ const ui = {
         state.resultMeta = null;
         state.resultEvidence = null;
         state.resultCompletedAt = null;
+        state.resultReceivedAt = null;
         state.resultAnswerEmpty = false;
         if (resume) {
             this.els.searchInput.value = query;
@@ -1105,6 +1211,8 @@ const ui = {
         }
         this.els.searchBtn.hidden = true;
         this.els.cancelSearchBtn.hidden = false;
+        this.els.cancelSearchBtn.disabled = false;
+        this.els.reconnectSearchBtn.hidden = true;
         this.els.searchResult.innerHTML = "";
         this.els.searchResult.classList.remove("raw");
         this.els.searchError.hidden = true;
@@ -1126,7 +1234,10 @@ const ui = {
         this.els.searchTimeoutInput.disabled = true;
         this.updateSearchModeUI();
         this.clearBudgetTimer();
-        persistActiveSearch();
+        if (!persistActiveSearch()) {
+            this.els.searchWarning.textContent = "このブラウザでは再接続情報を保存できません。調査中の再読み込みを避けてください。";
+            this.els.searchWarning.hidden = false;
+        }
         if (resume) {
             this.els.searchStatus.textContent = "進行中の調査に再接続しています…";
             this.els.searchStatus.hidden = false;
@@ -1148,6 +1259,10 @@ const ui = {
         const finishSearch = () => {
             if (state.activeSearchId !== searchId || !state.searching) return;
             state.searching = false;
+            state.searchDisconnected = false;
+            state.cancelPending = false;
+            this.els.cancelSearchBtn.disabled = false;
+            this.els.reconnectSearchBtn.hidden = true;
             clearActiveSearch();
             if (state.searchAbort) state.searchAbort = null;
             this.els.searchBtn.hidden = false;
@@ -1166,12 +1281,22 @@ const ui = {
             }
             // 検索中止めていたポーリングを完了後に1回だけ即時再取得する
             if (state.healthPollTimer) clearTimeout(state.healthPollTimer);
-            this.pollHealthUpdate();
+            this.pollHealthUpdate?.();
             state.finishSearch = null;
         };
         state.finishSearch = finishSearch;
+        const suspendSearch = () => {
+            if (state.activeSearchId !== searchId || !state.searching) return;
+            state.searchDisconnected = true;
+            this.clearBudgetTimer();
+            this.els.searchStatus.textContent = "接続が途切れました。調査は続いている可能性があります。「再接続」で状態を確認できます。";
+            this.els.searchStatus.hidden = false;
+            this.els.reconnectSearchBtn.hidden = false;
+            // Keep request identity and inputs locked; EOF is not a terminal result.
+        };
 
         api.searchSSE(query, mode, reasoning, timeoutSeconds, {
+            resumeOnly: Boolean(resume),
             onEvent: (ev) => {
                 // 遅い旧SSEのfinally/onEndやreconnect replayが、次の検索の
                 // DOMと操作状態を上書きしない。
@@ -1229,7 +1354,8 @@ const ui = {
                     this.els.searchStatus.hidden = true;
                     if (state.activeMode === "deep") {
                         const labels = {completed: "指定した調査範囲の処理完了", partial: "部分結果（未確認事項あり）", failed: "調査失敗"};
-                        this.els.searchWarning.textContent = `${labels[ev.status] || "状態未確認"} / ${ev.stopReason || "理由未確認"}`;
+                        const reason = ev.stopReasonMessage || ev.stopReason || "理由未確認";
+                        this.els.searchWarning.textContent = `${labels[ev.status] || "状態未確認"} / ${reason}`;
                         this.els.searchWarning.hidden = false;
                     }
                     closeThinking();
@@ -1241,7 +1367,11 @@ const ui = {
                         this.els.searchThinkingSummary.textContent = `思考 (${state.rawThinkingText.length} 文字)`;
                         this.els.searchThinkingText.textContent = state.rawThinkingText;
                     }
-                    state.resultCompletedAt = ev.completedAt || new Date().toISOString();
+                    // サーバー側の完了時刻とUI受信時刻を混同しない(2026-09-23調査の指摘5:
+                    // 保存時刻差295秒に対し体感約3分だった原因を、以前はcompletedAt欠落時に
+                    // 受信時刻へフォールバックしていたため切り分けできなかった)。
+                    state.resultCompletedAt = ev.completedAt || "";
+                    state.resultReceivedAt = new Date().toISOString();
                     if (state.activeMode === "search") {
                         this.els.searchResult.textContent = state.resultEvidence?.items?.length
                             ? "検索が完了しました。根拠一覧を確認してください。"
@@ -1260,25 +1390,32 @@ const ui = {
                     state.resultMeta = null;
                     state.resultEvidence = null;
                     state.resultCompletedAt = null;
+                    state.resultReceivedAt = null;
                     this.els.saveMarkdownBtn.hidden = true;
                     finishSearch();
                 }
             },
-            onError: (msg) => {
-                if (state.activeSearchId !== searchId) return;
+            onError: (msg, details = {}) => {
+                if (state.activeSearchId !== searchId || !state.searching) return;
                 this.els.searchError.textContent = msg;
                 this.els.searchError.hidden = false;
                 state.resultMeta = null;
                 state.resultEvidence = null;
                 state.resultCompletedAt = null;
+                state.resultReceivedAt = null;
                 this.els.saveMarkdownBtn.hidden = true;
                 this.clearBudgetTimer();
-                finishSearch();
+                if (details.terminal) {
+                    this.els.searchStatus.hidden = true;
+                    finishSearch();
+                } else {
+                    suspendSearch();
+                }
             },
             onEnd: () => {
                 if (state.activeSearchId !== searchId) return;
                 this.clearBudgetTimer();
-                finishSearch();
+                suspendSearch();
             },
         });
     },
@@ -1359,11 +1496,16 @@ const ui = {
             }
             this.els.searchEvidenceList.appendChild(row);
         }
-        const confidence = Number.isFinite(Number(ev.confidence)) ? Number(ev.confidence).toFixed(2) : "-";
         const route = ev.route ? ` / route ${ev.route}` : "";
-        this.els.searchEvidenceSummary.textContent = `根拠 ${items.length}件（${ev.evidenceStatus || "不明"} / 信頼度 ${confidence}${route}）`;
+        // deepは固定confidence(1.0/0.0)を送らない(根拠の有無としか対応せず回答品質ではないため)。
+        // answerState/answerStateMessageで回答の生成・検証状態を表す。
+        const statusPart = ev.route === "deep"
+            ? `回答状態 ${ev.answerStateMessage || ev.answerState || "不明"}`
+            : `信頼度 ${Number.isFinite(Number(ev.confidence)) ? Number(ev.confidence).toFixed(2) : "-"}`;
+        this.els.searchEvidenceSummary.textContent = `根拠 ${items.length}件（${ev.evidenceStatus || "不明"} / ${statusPart}${route}）`;
         const warnings = Array.isArray(ev.warnings) ? ev.warnings : [];
-        const notes = ev.verificationNote ? [String(ev.verificationNote), ...warnings] : warnings;
+        const diagnostics = ev.route === "deep" ? deepDiagnosticsFormat.lines(ev.deepDiagnostics) : [];
+        const notes = [...(ev.verificationNote ? [String(ev.verificationNote)] : []), ...diagnostics, ...warnings];
         this.els.searchEvidenceWarnings.textContent = notes.length ? `検索時の注意:\n${notes.map((warning) => `- ${warning}`).join("\n")}` : "";
         this.els.searchEvidence.hidden = false;
     },
@@ -1417,8 +1559,10 @@ const ui = {
     },
 
     updateSaveButton() {
+        // 保存可否はUI受信時刻(常に設定される)で判定する。サーバーのcompletedAtは
+        // 欠落し得るが、それは表示上「未確定」と明記するに留め、保存自体は妨げない。
         const canSave = Boolean(
-            state.resultMeta && state.resultEvidence && state.resultCompletedAt && !state.resultAnswerEmpty
+            state.resultMeta && state.resultEvidence && state.resultReceivedAt && !state.resultAnswerEmpty
         );
         this.els.saveMarkdownBtn.hidden = !canSave;
     },
@@ -1453,23 +1597,29 @@ const ui = {
     },
 
     saveMarkdown() {
-        if (!state.resultMeta || !state.resultEvidence || !state.resultCompletedAt || state.resultAnswerEmpty) return;
+        if (!state.resultMeta || !state.resultEvidence || !state.resultReceivedAt || state.resultAnswerEmpty) return;
         const meta = state.resultMeta;
         const evidence = state.resultEvidence;
         const startedAt = meta.startedAt || "";
+        // サーバー確定のcompletedAtとUI受信時刻は別物として残す(2026-09-23調査の
+        // 指摘5: 従来はcompletedAt欠落時に受信時刻へ暗黙フォールバックしており、
+        // 保存された時刻差の原因を切り分けられなかった)。
         const completedAt = state.resultCompletedAt;
+        const receivedAt = state.resultReceivedAt;
         const modeLabel = meta.mode === "search"
             ? "資料を探す（回答生成なし）"
             : meta.mode === "deep"
-                ? `深掘り調査（${meta.stopReason || "確定"}）`
+                ? `深掘り調査（${meta.stopReasonMessage || meta.stopReason || "確定"}）`
                 : "回答を作る";
         const lines = [
             "# offline-ai 検索結果",
             "",
             `- 実行開始（UTC）: ${this._markdownMeta(startedAt)}`,
             `- 実行開始（JST）: ${this._markdownMeta(this._formatJst(startedAt))}`,
-            `- 実行完了（UTC）: ${this._markdownMeta(completedAt)}`,
-            `- 実行完了（JST）: ${this._markdownMeta(this._formatJst(completedAt))}`,
+            `- 実行完了（UTC、サーバー確定）: ${completedAt ? this._markdownMeta(completedAt) : "未確定"}`,
+            `- 実行完了（JST、サーバー確定）: ${completedAt ? this._markdownMeta(this._formatJst(completedAt)) : "未確定"}`,
+            `- UI受信時刻（UTC、参考値・サーバー完了時刻ではない）: ${this._markdownMeta(receivedAt)}`,
+            `- UI受信時刻（JST、参考値・サーバー完了時刻ではない）: ${this._markdownMeta(this._formatJst(receivedAt))}`,
             `- モード: ${this._markdownMeta(modeLabel)}`,
             "",
             this._markdownTextBlock("質問", state.activeQuery),
@@ -1510,8 +1660,14 @@ const ui = {
             `- indexState: ${this._markdownMeta(evidence.indexState)}`,
             `- 根拠ステータス: ${this._markdownMeta(evidence.evidenceStatus)}`,
             `- 根拠検証: ${this._markdownMeta(evidence.verificationNote || "格下げなし")}`,
-            `- 根拠信頼度: ${this._markdownMeta(evidence.confidence)}`,
-            `- 注意: ${this._markdownMeta((evidence.warnings || []).join(" / ")) || "なし"}`,
+            meta.mode === "deep"
+                ? `- 回答状態: ${this._markdownMeta(evidence.answerStateMessage || evidence.answerState || "不明")}`
+                : `- 根拠信頼度: ${this._markdownMeta(evidence.confidence)}`,
+            `- 調査終了理由: ${this._markdownMeta(evidence.routeReasonMessage || evidence.routeReason || "未確認")}`,
+            ...(meta.mode === "deep"
+                ? deepDiagnosticsFormat.lines(evidence.deepDiagnostics).map((line) => `- ${this._markdownMeta(line)}`)
+                : []),
+            `- 注意:${this._markdownMeta((evidence.warnings || []).join(" / ")) || "なし"}`,
             "",
             "保存対象には質問・回答・根拠の抜粋が含まれます。",
             "",
@@ -1536,22 +1692,31 @@ const ui = {
         this.els.saveMarkdownHint.textContent = "ダウンロードを開始しました。質問・回答・根拠の抜粋が含まれます。";
     },
 
-    cancelSearch() {
+    async cancelSearch() {
+        if (!state.searching || state.cancelPending) return;
         const requestId = state.activeRequestId;
-        if (requestId) {
-            api.cancelSearch(requestId).catch((err) => {
-                if (state.searching) {
-                    this.els.searchError.textContent = `サーバー側の中止受付に失敗しました: ${err.message}`;
-                    this.els.searchError.hidden = false;
-                }
-            });
+        const searchId = state.activeSearchId;
+        state.cancelPending = true;
+        this.els.cancelSearchBtn.disabled = true;
+        try {
+            await api.cancelSearch(requestId);
+            if (state.activeSearchId !== searchId || !state.searching) return;
+            // Clear resume identity only after the server acknowledged cancellation.
+            if (state.searchAbort) state.searchAbort.abort();
+            this.clearBudgetTimer();
+            if (state.finishSearch) state.finishSearch();
+            this.els.searchStatus.textContent = "中止を受け付けました。";
+            this.els.searchStatus.hidden = false;
+        } catch {
+            if (state.activeSearchId !== searchId || !state.searching) return;
+            this.els.searchError.textContent = "中止受付を確認できませんでした。再接続または中止を再試行してください。";
+            this.els.searchError.hidden = false;
+        } finally {
+            if (state.activeSearchId === searchId) {
+                state.cancelPending = false;
+                this.els.cancelSearchBtn.disabled = false;
+            }
         }
-        if (state.searchAbort) {
-            state.searchAbort.abort();
-            state.searchAbort = null;
-        }
-        this.clearBudgetTimer();
-        if (state.finishSearch) state.finishSearch();
     },
 
 };

@@ -118,7 +118,7 @@ Describe "distribution-policy coverage on the real offline-ai tree" {
         $catalog = Get-Content -LiteralPath (Join-Path $script:OfflineAiRoot '_internal\download-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $gate = Test-OfflineAiAppPayloadEstimate -Inventory $inventory -Expected $catalog.appPayloadEstimate
         $gate.passed | Should -BeTrue
-        $gate.actual.fileCount | Should -Be 37
+        $gate.actual.fileCount | Should -Be 40
     }
 
     It "fails closed when an unregistered file is added" {

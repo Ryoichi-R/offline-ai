@@ -8,10 +8,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 import deep_research as deep
+import deep_candidate_selection
 import deep_transport
 import coverage_evaluator as evaluator
 import web_services
 from test_coverage_evaluator import _result, SPEC
+from deep_fakes import patch_retrieval
 
 
 VERDICT = {
@@ -28,7 +30,10 @@ def backend(monkeypatch, *, extract=None, answer="対象である。[E1]", verdi
     def retrieve(query, chunks, **kwargs):
         kwargs["cancel_check"]()
         calls.append(query)
-        return [{**c, "source_sha256": c["file_sha256"]} for c in chunks]
+        ranked = [{**c, "source_sha256": c["file_sha256"]} for c in chunks]
+        return deep_candidate_selection.select_candidates(
+            ranked, source_chunks=chunks
+        )
 
     def model(name, system, user, **kwargs):
         if system == deep.DEEP_VERIFY_SYSTEM:
@@ -45,7 +50,7 @@ def backend(monkeypatch, *, extract=None, answer="対象である。[E1]", verdi
             "references": [],
         }
 
-    monkeypatch.setattr(deep, "_retrieve_candidates", retrieve)
+    patch_retrieval(monkeypatch, deep, retrieve)
     monkeypatch.setattr(deep, "_call_ollama_json", model)
     monkeypatch.setattr(deep, "_call_ollama_text", lambda *a, **k: answer)
     return calls
@@ -70,11 +75,16 @@ def test_long_line_survives_pipeline_and_metadata_budget(tmp_path, monkeypatch):
 
 def test_parent_scope_preserved_separately(tmp_path, monkeypatch):
     backend(monkeypatch)
-    monkeypatch.setattr(
-        deep,
-        "_retrieve_candidates",
-        lambda q, chunks, **k: [{"path": "source.md", "start_line": 4, "end_line": 4}],
-    )
+    def retrieve_parent(q, chunks, **kwargs):
+        candidate = dict(chunks[0])
+        candidate["start_line"] = 4
+        candidate["end_line"] = 4
+        return deep_candidate_selection.select_candidates(
+            [{**candidate, "source_sha256": candidate["file_sha256"]}],
+            source_chunks=chunks,
+        )
+
+    patch_retrieval(monkeypatch, deep, retrieve_parent)
     result = research(tmp_path, "# 制度\n親の適用除外。\n## 個別\n対象である。")
     assert {(e["start_line"], e["end_line"]) for e in result.evidence} == {
         (1, 2),
@@ -94,7 +104,7 @@ def test_evidence_overflow_is_partial_and_recorded(tmp_path, monkeypatch):
 def test_real_retrieval_worker_uses_requested_synthetic_snapshot(tmp_path, monkeypatch):
     retrieval = deep._retrieve_candidates
     backend(monkeypatch)
-    monkeypatch.setattr(deep, "_retrieve_candidates", retrieval)
+    patch_retrieval(monkeypatch, deep, retrieval)
     result = research(tmp_path)
     assert result.evidence
     assert {e["path"] for e in result.evidence} == {"source.md"}
@@ -343,6 +353,34 @@ def test_progress_and_slow_subscriber_buffers_bounded():
     assert entry.add_subscriber().get_nowait()["units"] == 1999
 
 
+def test_deep_public_replay_payload_compacts_large_ledger_and_warnings():
+    result = deep.DeepResearchResult(
+        status="partial",
+        stop_reason="time_budget",
+        unconfirmed=[f"unconfirmed-{i}" for i in range(1000)],
+        ledger=[
+            {"path": f"skill-source/doc-{i}.md", "reason": "time_budget", "status": "unconfirmed"}
+            for i in range(1000)
+        ],
+        diagnostics={"ledger_counts": {"time_budget": 1000}},
+    )
+
+    event = web_services.build_deep_evidence_event(result)
+
+    assert len(json.dumps(event, ensure_ascii=False).encode("utf-8")) < 1_000_000
+    assert event["deepLedgerTruncated"] is True
+    assert event["deepWarningsTruncated"] is True
+    assert event["deepLedger"][-1]["reason"] == "replay_truncated"
+    assert event["warnings"][-1].endswith("件省略しました")
+
+
+def test_deep_public_answer_is_utf8_bounded_for_replay():
+    bounded = web_services._truncate_deep_text("あ" * 1000, max_bytes=128)
+
+    assert len(bounded.encode("utf-8")) <= 128
+    assert bounded.endswith("[回答本文は再接続用保持上限のため省略されました]")
+
+
 def test_oversized_replay_fails_with_bounded_terminal_state():
     entry = web_services.JobEntry(
         web_services.CancellationToken(300), fingerprint=("s", "q", "off", 300, "deep")
@@ -410,3 +448,185 @@ def test_cancel_unresponsive_http_reaps_worker(monkeypatch, phase):
         server.shutdown()
         server.server_close()
         worker.join(2)
+
+
+# --- 回答状態(answer_state)の分離: 2026-09-23調査の指摘4 ---------------------
+# web_services側の固定confidence(1.0/0.0)は根拠の有無しか表さず回答品質の
+# 指標ではなかった。generated/verification_failed/not_generatedを分離する。
+
+
+def test_answer_state_is_generated_when_integration_and_verification_succeed(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    result = research(tmp_path)
+    assert result.answer_state == deep.ANSWER_STATE_GENERATED
+    assert result.answer.startswith("対象である")
+
+
+def test_answer_state_is_verification_failed_when_final_verdict_rejects(tmp_path, monkeypatch):
+    def verdict(user):
+        # セクション単位の検証(claimsはdict)は通し、最終統合の検証(claimsは
+        # 文字列の回答案)だけ不支持にして、統合後の照合失敗経路を狙う。
+        parsed = json.loads(user)
+        if isinstance(parsed.get("claims"), str):
+            return {**VERDICT, "supported": False}
+        return dict(VERDICT)
+
+    backend(monkeypatch, verdict=verdict)
+    result = research(tmp_path)
+    assert result.answer_state == deep.ANSWER_STATE_VERIFICATION_FAILED
+    assert "原文抜粋" in result.answer
+    # 根拠IDの検査は通過しており、不合格理由は支持照合として区別して残る。
+    assert any("根拠に支持されないと照合" in item for item in result.unconfirmed)
+    assert not any("根拠IDが不足または不正" in item for item in result.unconfirmed)
+
+
+def test_answer_state_is_not_generated_when_final_model_call_fails(tmp_path, monkeypatch):
+    """最終回答のモデル呼び出し自体が失敗した場合は、検証失敗ではなく未生成とする。"""
+    backend(monkeypatch)
+
+    def failing_final(*args, **kwargs):
+        raise OSError("model unavailable")
+
+    monkeypatch.setattr(deep, "_call_ollama_text", failing_final)
+    result = research(tmp_path)
+    assert result.answer_state == deep.ANSWER_STATE_NOT_GENERATED
+    assert result.evidence
+    assert "原文抜粋" in result.answer
+    assert any("最終回答を生成できず" in item for item in result.unconfirmed)
+
+
+def _two_section_source(tmp_path):
+    (tmp_path / "source.md").write_text("# A\n対象である。\n# B\n対象でもある。\n", encoding="utf-8")
+    return deep.run_deep_research("対象", model="fake", source_root=tmp_path, timeout_seconds=300)
+
+
+@pytest.mark.parametrize(
+    "call_error",
+    [TimeoutError("deep worker deadline"), deep_transport.DeepWorkerError(code="timeout"), deep_transport.DeepWorkerError(code="stall")],
+    ids=["worker-deadline", "worker-timeout", "worker-stall"],
+)
+def test_call_timeout_during_exploration_still_integrates_verified_evidence(tmp_path, monkeypatch, call_error):
+    """2026-09-23の実資料受入(300秒中175秒で回答未生成): 探索中の呼出には
+    「残り時間−統合予約」がtimeoutとして渡るため、その呼出のtimeoutは探索の
+    予定終了である。照合済み根拠があれば統合へ進むこと。"""
+    backend(monkeypatch)
+    base_json = deep._call_ollama_json
+    calls = {"json": 0, "text": 0}
+
+    def json_call(*args, **kwargs):
+        calls["json"] += 1
+        if calls["json"] == 3:  # 1節目の抽出・照合は成功、2節目の抽出だけ呼出timeout
+            raise call_error
+        return base_json(*args, **kwargs)
+
+    def text_call(*args, **kwargs):
+        calls["text"] += 1
+        return "対象である。[E1]"
+
+    monkeypatch.setattr(deep, "_call_ollama_json", json_call)
+    monkeypatch.setattr(deep, "_call_ollama_text", text_call)
+
+    result = _two_section_source(tmp_path)
+
+    assert calls["text"] == 1
+    assert result.answer_state == deep.ANSWER_STATE_GENERATED
+    assert result.answer.startswith("対象である")
+    assert result.status == "partial"
+    assert result.stop_reason == "time_budget"
+    assert "time_budget:  — モデル呼出が時間内に終わらず探索を終了" in result.unconfirmed
+
+
+def test_cancel_during_exploration_is_not_treated_as_call_timeout(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    calls = {"text": 0}
+
+    def cancelled(*args, **kwargs):
+        raise deep_transport.DeepWorkerError(code="cancelled")
+
+    def text_call(*args, **kwargs):
+        calls["text"] += 1
+        return "対象である。[E1]"
+
+    monkeypatch.setattr(deep, "_call_ollama_json", cancelled)
+    monkeypatch.setattr(deep, "_call_ollama_text", text_call)
+
+    result = _two_section_source(tmp_path)
+
+    assert result.status == "cancelled"
+    assert calls["text"] == 0
+
+
+def test_run_deadline_during_exploration_is_not_treated_as_call_timeout(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    calls = {"text": 0}
+
+    def expired(*args, **kwargs):
+        raise deep.DeepBudgetExpired("deep research time budget expired")
+
+    def text_call(*args, **kwargs):
+        calls["text"] += 1
+        return "対象である。[E1]"
+
+    monkeypatch.setattr(deep, "_call_ollama_json", expired)
+    monkeypatch.setattr(deep, "_call_ollama_text", text_call)
+
+    result = _two_section_source(tmp_path)
+
+    assert result.stop_reason == "time_budget"
+    assert result.answer_state == deep.ANSWER_STATE_NOT_GENERATED
+    assert calls["text"] == 0
+
+
+def test_answer_state_is_verification_failed_when_final_citations_are_invalid(tmp_path, monkeypatch):
+    """回答は返ったが根拠ID検査に通らない場合は検証失敗とする。"""
+    backend(monkeypatch, answer="根拠のない断定。")
+    result = research(tmp_path)
+    assert result.answer_state == deep.ANSWER_STATE_VERIFICATION_FAILED
+    assert any("根拠IDが不足または不正" in item for item in result.unconfirmed)
+    assert not any("支持されないと照合" in item for item in result.unconfirmed)
+
+
+def test_answer_state_is_not_generated_when_no_evidence_is_verified(tmp_path, monkeypatch):
+    backend(
+        monkeypatch,
+        extract=lambda user: {
+            "subject": "無関係",
+            "scope": "無関係",
+            "relevance": "irrelevant",
+            "conditions": [],
+            "exceptions": [],
+            "references": [],
+        },
+    )
+    result = research(tmp_path)
+    assert result.answer_state == deep.ANSWER_STATE_NOT_GENERATED
+    assert result.evidence == []
+
+
+def test_build_deep_evidence_event_reports_answer_state_instead_of_fixed_confidence():
+    result = deep.DeepResearchResult(
+        status="completed",
+        stop_reason="scope_processed",
+        answer="対象である。[E1]",
+        answer_state=deep.ANSWER_STATE_GENERATED,
+        evidence=[{"path": "a.md", "evidence_id": "E1"}],
+    )
+    event = web_services.build_deep_evidence_event(result)
+    # 固定confidence(1.0 if items else 0.0)は回答品質の指標ではなかったため廃止する。
+    assert event["confidence"] is None
+    assert event["answerState"] == deep.ANSWER_STATE_GENERATED
+    assert "検証を通過" in event["answerStateMessage"] or "生成済み" in event["answerStateMessage"]
+
+
+def test_build_deep_evidence_event_keeps_important_warnings_over_bulk_ones():
+    """2026-09-23調査(指摘3): 表示上限で切り詰めると、後発のmodel_errorが
+    大量のcandidate_limitに埋もれて脱落し得た。重要な単発理由を残す。"""
+    unconfirmed = [f"candidate_limit: doc-{i}.md L1-2" for i in range(300)]
+    unconfirmed.append("model_error: important.md — 追加観点の確認に失敗")
+    result = deep.DeepResearchResult(
+        status="partial",
+        stop_reason="time_budget",
+        unconfirmed=unconfirmed,
+    )
+    event = web_services.build_deep_evidence_event(result)
+    assert any("model_error" in w for w in event["warnings"])

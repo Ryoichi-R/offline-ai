@@ -66,6 +66,7 @@ try:
         ERROR_CODES,
         GENERATION_STALL_TIMEOUT,
         JobTable,
+        JobNotFoundError,
         PagePresenceMonitor,
         RequestConflictError,
         _BroadcastQueue,
@@ -1033,6 +1034,15 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             return
         else:
             mode = mode_values[0]
+        resume_values = params.get("resume_only", [])
+        if resume_values and resume_values != ["1"]:
+            self._send_error_json("invalid_query", "再接続指定が不正です")
+            return
+        resume_only = bool(resume_values)
+        if resume_only and (len(params.get("request_id", [])) != 1
+                            or not params["request_id"][0].strip()):
+            self._send_error_json("invalid_query", "再接続には検索IDが必要です")
+            return
         request_id = (params.get("request_id", [""])[0].strip()
                       or self.headers.get("X-Request-ID", "").strip()
                       or generate_request_id())
@@ -1074,8 +1084,15 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         try:
             fingerprint = (session_id, query, reasoning, timeout_seconds, mode)
             entry, is_new = self.server.job_table.submit(
-                request_id, cancel_token, fingerprint=fingerprint, mode=mode
+                request_id, cancel_token, fingerprint=fingerprint, mode=mode,
+                resume_only=resume_only,
             )
+        except JobNotFoundError:
+            self._send_error_json(
+                "job_not_found",
+                "再接続先の調査が見つかりません。保持期限切れ、またはサーバーが再起動した可能性があります。自動で新しい調査は開始しません。",
+            )
+            return
         except RequestConflictError:
             self._send_error_json(
                 "request_conflict",

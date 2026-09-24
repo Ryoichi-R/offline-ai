@@ -34,6 +34,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 VALID_SEARCH_MODES = {"answer", "search", "deep"}
 
+# Deep replay is deliberately bounded so a reconnect cannot retain an
+# unbounded amount of model/user-material output. Public deep payloads are
+# compacted before they enter this buffer; these limits remain a final safety
+# boundary for unexpected payload growth.
+DEEP_REPLAY_MAX_EVENTS = 32
+DEEP_REPLAY_MAX_BYTES = 1_000_000
+DEEP_PUBLIC_LEDGER_MAX = 256
+DEEP_PUBLIC_WARNING_MAX = 256
+DEEP_PUBLIC_TEXT_MAX_BYTES = 600_000
+
+# 回答生成状態の利用者向け文言。confidence固定表示(1.0/0.0)は根拠の有無しか
+# 表さず、回答未生成調査(2026-09-23)の指摘4のとおり回答品質の指標ではない
+# ため、deepではconfidenceを送らずこちらへ置き換える。
+DEEP_ANSWER_STATE_MESSAGES = {
+    "generated": "回答生成済み（原文照合を通過）",
+    "verification_failed": "検証に失敗したため原文抜粋を表示",
+    "not_generated": "回答は生成されず原文抜粋を表示",
+}
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
@@ -141,7 +160,12 @@ def build_deep_evidence_event(
     evidence_registry: EvidenceRegistry | None = None,
     session_id: str = "",
 ) -> dict:
-    """deep結果を既存の根拠表示契約へ変換する。本文は500字まで表示する。"""
+    """deep結果を既存の根拠表示契約へ変換する。
+
+    未確認事項と調査台帳は、長い実資料で一気に膨らむ可能性がある。
+    SSEの再接続バッファへ渡す公開イベントは、利用者が再接続後に
+    確認できる範囲を保ったまま、個別文字列と件数を制限する。
+    """
     items = []
     for evidence in list(getattr(result, "evidence", [])):
         path = str(evidence.get("path") or "")
@@ -172,19 +196,97 @@ def build_deep_evidence_event(
             else:
                 item["viewReason"] = "hashまたは行番号を確認できないため閲覧できません"
         items.append(item)
-    return {
+    stop_reason = str(getattr(result, "stop_reason", ""))
+    raw_warnings = [
+        str(value).strip()[:500]
+        for value in getattr(result, "unconfirmed", [])
+        if str(value).strip()
+    ]
+    reason_message = stop_reason_message(stop_reason)
+    if reason_message and reason_message not in raw_warnings:
+        raw_warnings.insert(0, reason_message)
+    # Bulk, per-candidate reasons (candidate_limit等) can vastly outnumber the
+    # single important entries (model_error等) that a large-corpus run
+    # produces. Sort those to the back so truncation drops repetitive bulk
+    # entries first, not the one model_error a run hit (2026-09-23
+    # investigation, finding 3: important failures were lost past the
+    # display cap).
+    bulk_prefixes = tuple(f"{reason}:" for reason in DEEP_BULK_UNCONFIRMED_REASONS)
+    important = [w for w in raw_warnings if not w.startswith(bulk_prefixes)]
+    bulk = [w for w in raw_warnings if w.startswith(bulk_prefixes)]
+    raw_warnings = important + bulk
+    warnings_truncated = len(raw_warnings) > DEEP_PUBLIC_WARNING_MAX
+    if warnings_truncated:
+        omitted = len(raw_warnings) - DEEP_PUBLIC_WARNING_MAX
+        raw_warnings = raw_warnings[: DEEP_PUBLIC_WARNING_MAX - 1]
+        raw_warnings.append(f"未確認事項は表示上限のため{omitted}件省略しました")
+
+    raw_ledger = list(getattr(result, "ledger", []))
+    # As with warnings: per-candidate bulk entries go last so the display cap
+    # keeps single entries such as "irrelevant" (read but judged unrelated).
+    raw_ledger = [
+        e for e in raw_ledger if not (isinstance(e, dict) and e.get("reason") in DEEP_BULK_UNCONFIRMED_REASONS)
+    ] + [
+        e for e in raw_ledger if isinstance(e, dict) and e.get("reason") in DEEP_BULK_UNCONFIRMED_REASONS
+    ]
+    ledger_truncated = len(raw_ledger) > DEEP_PUBLIC_LEDGER_MAX
+    public_ledger = []
+    for entry in raw_ledger[:DEEP_PUBLIC_LEDGER_MAX]:
+        if not isinstance(entry, dict):
+            continue
+        public_entry = {}
+        for key, value in entry.items():
+            if isinstance(value, str):
+                public_entry[key] = value[:500]
+            elif value is None or isinstance(value, (bool, int, float)):
+                public_entry[key] = value
+        public_ledger.append(public_entry)
+    if ledger_truncated:
+        public_ledger.append(
+            {
+                "path": "",
+                "status": "unconfirmed",
+                "reason": "replay_truncated",
+                "detail": f"調査台帳は表示上限のため{len(raw_ledger) - DEEP_PUBLIC_LEDGER_MAX}件省略しました",
+            }
+        )
+
+    answer_state = str(getattr(result, "answer_state", ANSWER_STATE_NOT_GENERATED))
+    event = {
         "type": "evidence",
         "evidenceStatus": str(getattr(result, "status", "partial")),
         "verificationNote": "deepは原文行範囲とSHA-256を照合した根拠だけを表示します",
-        "confidence": 1.0 if items else 0.0,
+        # confidenceは根拠の有無だけを表す値(1.0/0.0)を返していたため廃止する。
+        # 回答が実際に生成・検証されたかは answerState / answerStateMessage を見る。
+        "confidence": None,
+        "answerState": answer_state,
+        "answerStateMessage": DEEP_ANSWER_STATE_MESSAGES.get(answer_state, ""),
         "route": "deep",
         "indexState": "deep",
-        "routeReason": str(getattr(result, "stop_reason", "")),
+        "routeReason": stop_reason,
+        "routeReasonMessage": reason_message,
         "items": items,
-        "warnings": list(getattr(result, "unconfirmed", [])),
-        "deepLedger": list(getattr(result, "ledger", [])),
+        "warnings": raw_warnings,
+        "deepLedger": public_ledger,
         "deepDiagnostics": dict(getattr(result, "diagnostics", {}) or {}),
     }
+    if warnings_truncated:
+        event["deepWarningsTruncated"] = True
+    if ledger_truncated:
+        event["deepLedgerTruncated"] = True
+    return event
+
+
+def _truncate_deep_text(value: object, *, max_bytes: int = DEEP_PUBLIC_TEXT_MAX_BYTES) -> str:
+    """Keep a public deep answer below the replay payload safety limit."""
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    marker = "\n\n[回答本文は再接続用保持上限のため省略されました]"
+    marker_bytes = marker.encode("utf-8")
+    keep = max(0, max_bytes - len(marker_bytes))
+    return encoded[:keep].decode("utf-8", errors="ignore") + marker
 
 def _get_ollama_host() -> str:
     """Return the shared loopback-only Ollama API base URL."""
@@ -337,7 +439,7 @@ class JobEntry:
                 if event.get("type") in {"deep_progress", "status", "budget"}:
                     self._event_buffer[:] = [e for e in self._event_buffer if e.get("type") != event.get("type")]
                 proposed = self._event_buffer + [event]
-                if len(proposed) > 32 or len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) > 1_000_000:
+                if len(proposed) > DEEP_REPLAY_MAX_EVENTS or len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) > DEEP_REPLAY_MAX_BYTES:
                     self.cancel_token.cancel()
                     event = {"type": "error", "code": "result_too_large", "message": "結果の保持上限に達しました"}
                     # Reserve space for the terminal error even if the previous event filled the budget.
@@ -407,7 +509,8 @@ class JobTable:
 
     def submit(self, request_id: str,
                cancel_token: CancellationToken, *, fingerprint=None,
-               mode: str | None = None) -> tuple[JobEntry, bool]:
+               mode: str | None = None,
+               resume_only: bool = False) -> tuple[JobEntry, bool]:
         """ジョブを登録する。
 
         Returns:
@@ -421,6 +524,8 @@ class JobTable:
                 if fingerprint is not None and entry.fingerprint != fingerprint:
                     raise RequestConflictError("request_id is already bound to another search")
                 return entry, False
+            if resume_only:
+                raise JobNotFoundError("search job is no longer available")
             if mode == "deep" and any(
                 entry.state == "running"
                 and entry.fingerprint
@@ -494,6 +599,10 @@ class JobTable:
                 entry.cancel_token.cancel()
 
 
+class JobNotFoundError(RuntimeError):
+    """Resume must never create a replacement job after expiry or restart."""
+
+
 class RequestConflictError(RuntimeError):
     """同じ request_id を異なる検索条件へ再利用した。"""
 
@@ -519,9 +628,16 @@ try:
         run_retrieval_pipeline,
     )
     from deep_research import (
+        CANDIDATE_TRANSFER_LIMIT_CODE,
+        CANDIDATE_TRANSFER_LIMIT_MESSAGE,
+        DEEP_BULK_UNCONFIRMED_REASONS,
         DEEP_TIMEOUT_DEFAULT,
+        ANSWER_STATE_GENERATED,
+        ANSWER_STATE_VERIFICATION_FAILED,
+        ANSWER_STATE_NOT_GENERATED,
         run_deep_research,
         detect_deep_model,
+        stop_reason_message,
     )
 
     _search_available = True
@@ -532,6 +648,19 @@ except Exception as e:
     # （search.py 側の既定値と揃える）。
     GENERATION_STALL_TIMEOUT = 60
     DEEP_TIMEOUT_DEFAULT = DEEP_SEARCH_TIMEOUT_DEFAULT
+    CANDIDATE_TRANSFER_LIMIT_CODE = "candidate_transfer_limit"
+    CANDIDATE_TRANSFER_LIMIT_MESSAGE = (
+        "検索候補の内部転送容量を超えたため、調査を継続できませんでした"
+    )
+    DEEP_BULK_UNCONFIRMED_REASONS = frozenset(
+        {"candidate_limit", "document_limit", "unit_limit", "viewpoint_limit", "context_budget"}
+    )
+    ANSWER_STATE_GENERATED = "generated"
+    ANSWER_STATE_VERIFICATION_FAILED = "verification_failed"
+    ANSWER_STATE_NOT_GENERATED = "not_generated"
+
+    def stop_reason_message(reason: str) -> str:
+        return CANDIDATE_TRANSFER_LIMIT_MESSAGE if reason == CANDIDATE_TRANSFER_LIMIT_CODE else ""
 
     class PromptBudgetError(RuntimeError):
         """search.py を読めない場合のフォールバック（例外節の名前解決用）。"""
@@ -680,6 +809,7 @@ ERROR_CODES = {
     "timeout": None,              # SSE only
     "cancelled": None,            # SSE only
     "deep_failed": None,          # SSE only
+    "candidate_transfer_limit": None,  # SSE only
     "internal_error": 500,
 }
 
@@ -814,6 +944,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 "reasoning": "off",
                 "deepStatus": deep_result.status,
                 "stopReason": deep_result.stop_reason,
+                "stopReasonMessage": stop_reason_message(deep_result.stop_reason),
             })
             event_queue.put(build_deep_evidence_event(
                 deep_result,
@@ -821,7 +952,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 session_id=session_id,
             ))
             if deep_result.answer:
-                event_queue.put({"type": "chunk", "text": deep_result.answer})
+                event_queue.put({"type": "chunk", "text": _truncate_deep_text(deep_result.answer)})
             if deep_result.status == "cancelled":
                 event_queue.put({
                     "type": "error",
@@ -829,10 +960,16 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                     "message": "深掘り調査を中止しました",
                 })
             elif deep_result.status == "failed" and not deep_result.evidence:
+                error_code = (
+                    deep_result.stop_reason
+                    if deep_result.stop_reason == CANDIDATE_TRANSFER_LIMIT_CODE
+                    else "deep_failed"
+                )
                 event_queue.put({
                     "type": "error",
-                    "code": "deep_failed",
-                    "message": "深掘り調査を確定できませんでした",
+                    "code": error_code,
+                    "message": stop_reason_message(deep_result.stop_reason)
+                    or "深掘り調査を確定できませんでした",
                 })
             else:
                 event_queue.put({
@@ -840,6 +977,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                     "completedAt": _utc_now_iso(),
                     "status": deep_result.status,
                     "stopReason": deep_result.stop_reason,
+                    "stopReasonMessage": stop_reason_message(deep_result.stop_reason),
                 })
             log_structured(
                 request_id,

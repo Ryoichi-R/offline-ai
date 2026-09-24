@@ -20,6 +20,7 @@
     { "pattern": "install-offline.bat", "distribution": "both", "reason": "install launcher。再インストール・修復時に再実行され得る", "boundary_row": "runtime-app-payload" },
     { "pattern": "download-package.bat", "distribution": "public-source", "reason": "developer/publisher向けpackage構築launcher。完全offline runtimeでは実行対象外", "boundary_row": "public-source-artifact" },
 
+    { "pattern": "_internal/deep_candidate_selection.py", "distribution": "both", "reason": "deep候補転送契約・選別runtime実装", "boundary_row": "runtime-app-payload" },
     { "pattern": "_internal/*.py", "distribution": "both", "reason": "検索・回答生成runtime実装", "boundary_row": "runtime-app-payload" },
     { "pattern": "_internal/ARCHITECTURE.md", "distribution": "public-source", "reason": "開発者向け内部設計文書。利用者向けruntimeには不要", "boundary_row": "public-source-artifact" },
     { "pattern": "_internal/OfflineAi.Common.psm1", "distribution": "both", "reason": "package/installer共有helper", "boundary_row": "runtime-app-payload" },

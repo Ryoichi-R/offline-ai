@@ -5964,6 +5964,7 @@ def main():
             DEEP_TIMEOUT_MAX,
             run_deep_research,
             detect_deep_model,
+            stop_reason_message,
             validate_deep_timeout_seconds,
         )
 
@@ -6001,7 +6002,9 @@ def main():
         except KeyboardInterrupt:
             print("中断しました。", file=sys.stderr)
             raise SystemExit(130) from None
-        print(f"状態: {result.status} / 終了理由: {result.stop_reason}")
+        reason_message = stop_reason_message(result.stop_reason)
+        reason = result.stop_reason + (f"（{reason_message}）" if reason_message else "")
+        print(f"状態: {result.status} / 終了理由: {reason}")
         print(f"根拠: {len(result.evidence)}件、読み取り単位: {result.diagnostics.get('units', 0)}件")
         print()
         print(result.answer or "確認済みの根拠がありません。")
