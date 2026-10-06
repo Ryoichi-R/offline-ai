@@ -16,11 +16,11 @@
         "ollamaSource": "https://ollama.com/download/windows"
     },
     "appPayloadEstimate": {
-        "totalBytes": 972906,
+        "totalBytes": 973291,
         "largestFileBytes": 248149,
         "largestFile": "_internal/search.py",
         "fileCount": 40,
-    "reviewedAt": "2026-09-20",
+    "reviewedAt": "2026-10-06",
         "method": "distribution-policy runtime/both inventory"
     },
     "modelAdoptionGate": {

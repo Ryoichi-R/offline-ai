@@ -154,7 +154,9 @@ class _FinalAnswerRejected(ValueError):
 class DeepBudget:
     timeout_seconds: float
     cancel_check: Callable[[], None] | None = None
-    started_at: float = field(default_factory=time.monotonic)
+    # Resolve time.monotonic at call time (not at class definition) so every
+    # budget reading uses the same clock source, including patched test clocks.
+    started_at: float = field(default_factory=lambda: time.monotonic())
     rounds: int = 0
     documents: set[str] = field(default_factory=set)
     units: int = 0
@@ -168,7 +170,7 @@ class DeepBudget:
     # save can disagree with.
     stage_seconds: dict[str, float] = field(default_factory=dict)
     _current_stage: str = "planning"
-    _stage_started_at: float = field(default_factory=time.monotonic)
+    _stage_started_at: float = field(default_factory=lambda: time.monotonic())
 
     @property
     def deadline(self) -> float:
