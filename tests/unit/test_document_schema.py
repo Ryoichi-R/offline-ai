@@ -123,3 +123,22 @@ def test_load_metadata_sidecar_rejects_invalid_nested_objects(tmp_path, pages):
     )
 
     assert document_schema.load_metadata_sidecar(md) is None
+
+
+def test_load_metadata_sidecar_treats_unrepresentable_sidecar_name_as_absent(tmp_path, monkeypatch):
+    """`.metadata.json`を付けると名前長上限を超える資料でも、本文読取を失敗にしない。"""
+    import errno
+    from pathlib import Path
+
+    md = tmp_path / "sample.md"
+    md.write_text("# 規程\n本文", encoding="utf-8")
+    original_exists = Path.exists
+
+    def exists_with_name_limit(self, *args, **kwargs):
+        if self.name.endswith(".metadata.json"):
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(self))
+        return original_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists_with_name_limit)
+
+    assert document_schema.load_metadata_sidecar(md) is None
