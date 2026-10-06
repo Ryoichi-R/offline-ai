@@ -165,7 +165,13 @@ def write_metadata_sidecar(markdown_path: Path, metadata: dict[str, Any]) -> Pat
 
 def load_metadata_sidecar(markdown_path: Path) -> dict[str, Any] | None:
     for candidate in sidecar_candidates(markdown_path):
-        if not candidate.exists():
+        try:
+            if not candidate.exists():
+                continue
+        except OSError:
+            # A sidecar name that the filesystem cannot represent (for example
+            # ENAMETOOLONG once ".metadata.json" is appended) cannot exist, so
+            # treat it as "no sidecar" instead of failing the source document.
             continue
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
