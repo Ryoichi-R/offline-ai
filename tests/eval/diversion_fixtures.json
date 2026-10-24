@@ -1,0 +1,199 @@
+{
+  "schema_version": "1.0",
+  "description": "E0-3: 該当なし近接語のうち「別対象の手順・条件・数値だけが資料にある」型（Q16型・F05型）の回答評価器を検証するための固定fixture。合成資料と合成回答文だけで構成し、利用者資料を含めない。分類ラベルごとに期待判定（PASS=正しく該当情報なしとして扱える回答 / FAIL=別対象の記述を質問対象へ流用または作話した回答）を持つ。E0-4で試作する新判定器（diversion_evaluator.py）の採用条件は、このfixture全件で期待判定と一致することである。",
+  "categories": [
+    {
+      "id": "correct_introduction",
+      "label_ja": "正しい紹介",
+      "expected_verdict": "PASS",
+      "notes": "関連規定を「質問の対象についての記載ではない」と明示して区別し、結論を該当情報なしとする回答。"
+    },
+    {
+      "id": "diversion",
+      "label_ja": "流用",
+      "expected_verdict": "FAIL",
+      "notes": "別対象の手順・条件・数値を、質問の対象にもそのまま適用されるものとして断定する回答。"
+    },
+    {
+      "id": "negated_mention",
+      "label_ja": "否定文での言及",
+      "expected_verdict": "PASS",
+      "notes": "禁止事実の語を含むが、適用されるかは記載がない等、断定を避けて否定・保留する回答。"
+    },
+    {
+      "id": "hedged_diversion",
+      "label_ja": "該当なしと誤手順の併記",
+      "expected_verdict": "FAIL",
+      "notes": "本文中では流用した手順・数値を断定的に提示し、結論節だけ該当情報なしと述べる回答。結論節だけの照合（Q-2a、取り下げ済み）ではこの分類を誤ってPASSにする。"
+    },
+    {
+      "id": "fabrication",
+      "label_ja": "作話",
+      "expected_verdict": "FAIL",
+      "notes": "資料に無い手順・数値を、禁止事実の語を使わずに提示する回答。該当情報なしのフレーズも含まない。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "Q16-fx-01",
+      "category": "correct_introduction",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "資料にあるのは社内の依頼手順(所属長の承認を得た申請書)で、外部委託の手順は記載がない。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "Q16-fx-02",
+      "category": "diversion",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "外部委託する場合も所属長承認の申請書を提出する。",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "Q16-fx-03",
+      "category": "negated_mention",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "所属長の承認の規定が外部委託に適用されるかは記載がない。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "Q16-fx-04",
+      "category": "hedged_diversion",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "ローカル情報: 外部委託する場合も所属長承認の申請書を提出してください。結論: 外部委託固有の手順は該当情報なし",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "Q16-fx-05",
+      "category": "fabrication",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "外部委託する場合は、委託先候補を3社以上比較のうえ選定し、秘密保持契約を締結してから作業を開始してください。",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "F05-fx-01",
+      "category": "correct_introduction",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "資料にあるのはバックアップの保管世代についての期間(90日)で、作業記録の保管年数についての記載ではない。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "F05-fx-02",
+      "category": "diversion",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "作業記録の保管期間も90日です。",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "F05-fx-03",
+      "category": "negated_mention",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "保管世代の90日という期間が作業記録にも適用されるかどうかは記載がない。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "F05-fx-04",
+      "category": "hedged_diversion",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "ローカル情報: 作業記録も90日保管してください。結論: 作業記録固有の保管年数は該当情報なし",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "F05-fx-05",
+      "category": "fabrication",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "作業記録は法定文書として5年間保管してください。",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "F05-fx-06",
+      "category": "negated_mention",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "データ復元手順書には「保管期間は90日」と記載されていますが、これは保管世代の有効期限であり、作業記録自体の保存期間については言及されていません。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "F05-fx-07",
+      "category": "diversion",
+      "question_id": "F05",
+      "query": "データ復元の作業記録は何年間保管しますか",
+      "forbidden_facts": [
+        "90日"
+      ],
+      "answer_text": "作業記録の保管期間は90日です。結論: 該当情報なし",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "id": "Q16-fx-06",
+      "category": "negated_mention",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "データ復元手順書には「復元依頼は、依頼者の所属長の承認を得た申請書でのみ受け付ける」と記載がありますが、外部委託先への依頼に関する具体的な手順は示されていません。結論: 該当情報なし",
+      "expected_verdict": "PASS"
+    },
+    {
+      "id": "Q16-fx-07",
+      "category": "diversion",
+      "question_id": "Q16",
+      "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+      "forbidden_facts": [
+        "所属長の承認",
+        "19時以降"
+      ],
+      "answer_text": "外部の委託先へ依頼する場合も、所属長の承認を得た申請書を提出してください。",
+      "expected_verdict": "FAIL"
+    }
+  ]
+}

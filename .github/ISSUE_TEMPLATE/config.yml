@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+    - name: サポート窓口
+      url: https://github.com/Ryoichi-R/offline-ai/issues
+      about: 一般的な質問・問い合わせはIssuesを利用してください。バグ報告はこのissue templateを使用してください。
+    - name: 脆弱性の報告
+      url: https://github.com/Ryoichi-R/offline-ai/security/advisories/new
+      about: セキュリティ上の脆弱性は公開issueへ書かず、非公開報告フォームを利用してください。

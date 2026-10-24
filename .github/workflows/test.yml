@@ -1,0 +1,58 @@
+name: test
+
+on:
+    push:
+        branches: [main, 'codex/**']
+    pull_request:
+        branches: [main, 'codex/**']
+    workflow_dispatch: {}
+
+# fork由来PRを含め、secretsは一切参照しない。
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    python-test:
+        name: pytest (Python ${{ matrix.python-version }})
+        runs-on: windows-latest
+        timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                python-version: ['3.11', '3.12']
+        steps:
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - name: Set up Python
+              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+              with:
+                  python-version: ${{ matrix.python-version }}
+            - name: Install pytest (pinned)
+              run: python -m pip install --quiet "pytest==9.0.2"
+            - name: Run pytest
+              run: python -m pytest -q
+
+    pester-test:
+        name: Pester
+        runs-on: windows-latest
+        timeout-minutes: 15
+        steps:
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - name: Install Pester (pinned)
+              shell: pwsh
+              run: |
+                  Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+            - name: Run Pester
+              shell: pwsh
+              run: |
+                  Import-Module Pester -RequiredVersion 5.7.1
+                  $config = New-PesterConfiguration
+                  $config.Run.Path = @('tests/unit', 'tests/integration')
+                  $config.Run.Exit = $true
+                  $config.Output.Verbosity = 'Detailed'
+                  Invoke-Pester -Configuration $config

@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# --- dependency declaration ---------------------------------------------
+# runtime dependencies: 0件（Python標準ライブラリのみ）。宣言はCONTRIBUTING.mdと
+# _internal/ARCHITECTURE.mdに記載し、[project]は作成しない（VERSIONとの二重管理を避ける）。
+#
+# development / test dependencies:
+#   対応range（互換性の宣言）: pytest>=8,<10
+#   再現用固定version（このworkspaceのbootstrapが導入する厳密版）: pytest==9.0.2
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]

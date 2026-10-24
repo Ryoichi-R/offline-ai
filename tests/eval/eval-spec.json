@@ -1,0 +1,304 @@
+{
+    "schema_version": "1.0",
+    "corpus_dir": "corpus",
+    "notes": "offline-ai マスタープラン Phase 2 の固定評価仕様。corpus は合成された非機密 fixture であり、利用者資料を一切含まない。",
+    "acceptance": {
+        "min_retrieval_hit_rate": 0.9,
+        "min_evidence_coverage": 0.8,
+        "min_evidence_precision": 0.5,
+        "min_evidence_line_overlap": 0.8,
+        "max_forbidden_source_hits": 0,
+        "min_abstain_accuracy": 1.0
+    },
+    "questions": [
+        {
+            "id": "Q01",
+            "category": "regulation-table",
+            "query": "国内出張で一般社員の日当は1日あたりいくらですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第2条 日当",
+                    "line_start": 9,
+                    "line_end": 20
+                }
+            ],
+            "required_facts": ["2,500円"],
+            "forbidden_facts": ["3,500円", "3,000円"],
+            "notes": "表からの行選択。役職区分を取り違えると誤答になる。"
+        },
+        {
+            "id": "Q02",
+            "category": "regulation-table",
+            "query": "東京23区に宿泊する場合の宿泊費上限はいくらですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/travel-expense-rules.md",
+                    "heading": "第3条 宿泊費",
+                    "line_start": 21,
+                    "line_end": 31
+                }
+            ],
+            "required_facts": ["14,000円"],
+            "forbidden_facts": ["11,000円"],
+            "notes": "同一文書内の別の表を参照する必要がある。第2条の表を根拠にすると誤答。"
+        },
+        {
+            "id": "Q03",
+            "category": "long-document",
+            "query": "入社初日に持参する書類と物品を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "1.1 持ち物",
+                    "line_start": 7,
+                    "line_end": 15
+                }
+            ],
+            "forbidden_sources": [
+                "guides/onboarding-handbook.md.metadata.json"
+            ],
+            "required_facts": ["本人確認書類", "年金手帳", "印鑑"],
+            "forbidden_facts": ["住民票"],
+            "notes": "長文中の1節を特定する。metadata sidecar 自体が根拠として返る場合は defect とする。"
+        },
+        {
+            "id": "Q04",
+            "category": "synonym",
+            "query": "備品の貸出手続きはどうすればよいですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第1条 貸与の申請",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["貸与申請書", "所属長"],
+            "forbidden_facts": [],
+            "notes": "質問語「貸出」に対し、文書側の表記は「貸与」。表層一致では届かない類似語ケース。"
+        },
+        {
+            "id": "Q05",
+            "category": "multi-document",
+            "query": "ノートPCの貸与期間と、期間満了後の返却期限を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "regulations/equipment-loan-rules.md",
+                    "heading": "第2条 貸与期間",
+                    "line_start": 9,
+                    "line_end": 14
+                },
+                {
+                    "path": "regulations/equipment-return-rules.md",
+                    "heading": "第1条 返却期限",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["12か月", "5営業日"],
+            "forbidden_facts": [],
+            "notes": "2文書の突き合わせ。片方だけでは coverage 0.5 にしかならない。"
+        },
+        {
+            "id": "Q06",
+            "category": "csv-table",
+            "query": "本社に設置されているモニタ24インチの数量は何台ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "data/office-equipment-inventory.csv",
+                    "heading": "",
+                    "line_start": 1,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": ["55"],
+            "forbidden_facts": ["14"],
+            "notes": "CSV の行選択。拠点列を無視すると大阪支社の値を拾って誤答する。"
+        },
+        {
+            "id": "Q07",
+            "category": "sidecar-metadata",
+            "query": "試用期間中の評価は何回、いつ行いますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/onboarding-handbook.md",
+                    "heading": "3.2 試用期間の評価",
+                    "line_start": 40,
+                    "line_end": 43
+                }
+            ],
+            "forbidden_sources": [
+                "guides/onboarding-handbook.md.metadata.json"
+            ],
+            "required_facts": ["2回", "1か月目", "3か月目"],
+            "forbidden_facts": [],
+            "notes": "sidecar がある文書。根拠へ page / parser などの metadata が付与されることを併せて確認する。"
+        },
+        {
+            "id": "Q08",
+            "category": "plain-text-no-sidecar",
+            "query": "パスワードリセットの本人確認について決まったことは何ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "notes/support-meeting-notes.txt",
+                    "heading": "",
+                    "line_start": 5,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": ["所属長"],
+            "forbidden_facts": [],
+            "notes": "sidecar なしのプレーンテキスト。metadata が無くても検索できることを確認する。"
+        },
+        {
+            "id": "Q09",
+            "category": "no-answer",
+            "query": "育児休業給付金の給付率は何パーセントですか",
+            "answerable": false,
+            "abstain_layer": "retrieval",
+            "required_facts": [],
+            "forbidden_facts": ["50", "67"],
+            "notes": "corpus に一切記載がない。retrieval 層で evidence_status = insufficient を返せることが要件。"
+        },
+        {
+            "id": "Q10",
+            "category": "no-answer-near-miss",
+            "query": "海外出張の日当はいくらですか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": ["3,500円", "3,000円", "2,500円"],
+            "notes": "国内出張旅費規程は存在するが海外は明示的に対象外。関連文書があるため根拠自体は取得される。retrieval 層の要件は sufficient と宣言しないことに限られ、「該当情報なし」の確定判定は生成プロンプト契約側で行う（回答生成なしでは NOT_MEASURED）。"
+        },
+        {
+            "id": "Q11",
+            "category": "parent-child-expansion",
+            "query": "初動対応で最初に取るべき行動を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "1.1 検知時の確認事項",
+                    "line_start": 7,
+                    "line_end": 15
+                }
+            ],
+            "required_facts": ["影響範囲", "発生時刻", "類似障害"],
+            "forbidden_facts": [],
+            "require_expected_lines": true,
+            "notes": "見出しだけの親チャンク（第1章 初動対応）だけが検索に当たり、配下の具体的な確認事項本文（1.1）はkeyword候補にすら入らない親子展開の再現ケース。親子展開OFFでは line overlap = 0（既知の取得漏れ）、ONでは親経由の展開で1.1本文が根拠へ残ることを確認する。require_expected_lines により、1.1の行範囲と必要事項が最終根拠に残らなければ質問単位・route判定ともFAILとする。"
+        },
+        {
+            "id": "Q12",
+            "category": "parent-child-expansion",
+            "query": "エスカレーションが必要になる影響利用者数の基準は何人ですか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "1.2 エスカレーション基準",
+                    "line_start": 17,
+                    "line_end": 19
+                }
+            ],
+            "required_facts": ["100名"],
+            "forbidden_facts": [],
+            "notes": "同一親（第1章 初動対応）配下の別の子節だが、質問語彙が本文と直接重なるためkeywordで単独ヒットする対照ケース。親子展開ON/OFFの両方でline overlapが1.0を維持し、展開が既存の直接ヒット経路を壊さないことを確認する。"
+        },
+        {
+            "id": "Q13",
+            "category": "parent-child-expansion",
+            "query": "障害の事後報告書はいつまでに提出する必要がありますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/incident-response-procedure.md",
+                    "heading": "3.1 報告書の提出期限",
+                    "line_start": 33,
+                    "line_end": 35
+                }
+            ],
+            "required_facts": ["3営業日"],
+            "forbidden_facts": [],
+            "notes": "別の親（第3章 事後報告）配下の子節で、質問語彙が本文と直接重なりkeywordで単独ヒットする対照ケース。第1章・第2章配下の似た構造（初動対応・復旧対応）と混同せず、展開ON/OFFの両方でline overlapが1.0を維持することを確認する。"
+        },
+        {
+            "id": "Q14",
+            "category": "parent-child-same-heading-other-document",
+            "query": "データ復元手順の復旧対応で、戻したデータの整合性はどのように検証しますか",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "2.2 整合性の検証",
+                    "line_start": 33,
+                    "line_end": 35
+                }
+            ],
+            "required_facts": ["チェックサム"],
+            "forbidden_facts": ["切り戻し"],
+            "require_expected_lines": true,
+            "holdout": true,
+            "notes": "別資料の同名見出し。障害対応手順書とデータ復元手順書が同じ「第2章 復旧対応」を持つ。正解はデータ復元手順書2.2の本文。障害対応手順書側の同名見出しの展開は無関係な展開範囲として集計する（受入判定の閾値にはしない）。必須語を持たない経路で、別資料の展開を根拠に sufficient を宣言しないことの回帰確認を兼ねる。上限・重みの調整に使わない保留質問。"
+        },
+        {
+            "id": "Q15",
+            "category": "parent-child-partial-expansion",
+            "query": "データ復元の事前準備の手順を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/data-restore-procedure.md",
+                    "heading": "1.1 復元依頼の受付",
+                    "line_start": 7,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": ["所属長"],
+            "forbidden_facts": [],
+            "require_expected_lines": true,
+            "expected_expansion": "partial",
+            "notes": "長い手順と例外。見出しだけの親（第1章 事前準備）の配下に5つの子節があり、1展開元あたりの範囲上限（既定4）を超えるため部分展開になる。手順全体を問う質問なので、部分展開の範囲だけを理由に sufficient を宣言しないこと（展開を除いた通常根拠だけで sufficient が成立する場合は許容、計画§4）、採用範囲（1.1）と必要事項が最終根拠に残ることを確認する。2026-09-14の実モデル評価の結果を見て判定条件と required_facts の表記（言い換え「所属長承認済み」を許容）を見直したため、保留質問から外した（後継の保留質問はQ17）。"
+        },
+        {
+            "id": "Q16",
+            "category": "parent-child-no-answer-near-miss",
+            "query": "データ復元作業を外部の委託先へ依頼する場合の手順を教えてください",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": ["所属長の承認", "19時以降"],
+            "holdout": true,
+            "notes": "該当なし（近接語）。データ復元手順書は存在するが、外部委託先への依頼手順は記載がない。関連資料と親見出しが検索に当たっても sufficient を宣言しないことを確認する。上限・重みの調整に使わない保留質問。 E0-4（2026-09-16）: 結論節だけで forbidden_facts を照合する案（Q-2a）は、本文中で流用しつつ結論だけ該当情報なしと述べる回答（該当なしと誤手順の併記）を誤ってPASSにするため取り下げた。代わりに回答全体を文単位で見て、流用の断定文を検出する新判定器（`tests/eval/diversion_evaluator.py`）を試作し、`tests/eval/diversion_fixtures.json`のQ16型5分類・F05型5分類の計10件全てで期待判定と一致することを確認した（変更前の forbidden_facts 原文一致判定は10件中8件で不一致）。詳細は`tests/eval/README.md`のE0-4を参照。E0b（2026-09-16、実機gpt-oss:20b/bge-m3、案A・Q-1実装前の基準値）: 根拠ステータスはagentic-lite検索計画込みで5/5回partial。回答はhybrid 5回中4回・agentic-lite 5回中2回で新判定器がdiversion(流用)と判定し、うちhybrid 1回は変更前のforbidden_fact判定が見逃した実例だった（新旧の不一致はこの1件のみ）。この実機データとfixture全件一致を踏まえ、同日利用者判断でmeasure_answer_probeのpassed判定をforbidden_fact原文一致からdiversion_verdictへ置き換えた（変更前判定は比較のためreceiptへ残す）。詳細は`tests/eval/README.md`のE0bを参照。"
+        },
+        {
+            "id": "Q17",
+            "category": "parent-child-partial-expansion",
+            "query": "新しく配属された社員への端末の受け渡し手順を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "guides/device-handover-procedure.md",
+                    "heading": "1.1 受け渡し日の調整",
+                    "line_start": 7,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": ["配属日"],
+            "forbidden_facts": [],
+            "require_expected_lines": true,
+            "expected_expansion": "partial",
+            "holdout": true,
+            "notes": "長い手順（Q15の後継の保留質問）。見出しだけの親（第1章 受け渡し手順）の配下に6つの子節があり、1展開元あたりの範囲上限（既定4）を超えるため部分展開になる。部分展開の範囲だけを理由に sufficient を宣言しないこと（展開を除いた通常根拠だけで sufficient が成立する場合は許容）と、採用範囲（1.1）と必要事項が最終根拠に残ることを確認する。2026-09-14に追加し、実モデル経路の結果を見る前に判定条件を固定した（作成時にkeyword経路で親見出しが候補に入らずシナリオが成立しなかったため、質問文だけを見出しと語彙が一致する形へ直した。実モデル経路の結果は未確認）。上限・重みの調整に使わない保留質問。"
+        }
+    ]
+}
