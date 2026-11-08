@@ -41,13 +41,13 @@ from prompt_templates import (
     build_deep_section_prompt,
 )
 from source_structure import (
+    candidate_for,
     documents_from_texts,
     match_documents,
     node_for_line,
     parse_heading_tree,
     primary_units,
     section_range_for_line,
-    title_core,
 )
 
 
@@ -2026,8 +2026,7 @@ def _primary_candidates(query, sources, chunks):
     path = matched["confirmed"]
     if not path:
         return None, []
-    title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
-    scope = ap.classify_guided_scope(query, exclude_texts=(title, title_core(title)))
+    scope = ap.classify_guided_scope(query, exclude_texts=candidate_for(matched, path)["exclude"])
     if scope.scope == ap.GUIDED_SCOPE_SPECIFIC:
         return path, []
     units = [unit for unit in primary_units(sources[path][2]) if not unit["ancillary"]]

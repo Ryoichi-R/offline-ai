@@ -103,10 +103,18 @@ def test_topics_overview_has_main_items_not_only_date_and_contact(tmp_path):
     assert "4 適用日" not in labels
 
 
-def test_long_paragraph_becomes_a_guide_and_headingless_document_has_points():
+def test_long_paragraph_keeps_leading_sentences_unless_a_qualifier_would_be_dropped():
     long_text = "# 表題\n## 本文\n" + "長い本文。" * 200 + "\n"
     point = gf.build_overview(long_text)["points"][0]
-    assert point["kind"] == "guide" and "text" not in point
+    assert point["kind"] == "excerpt" and point["truncated"] is True
+    assert point["text"].endswith("。") and len(point["text"]) <= gf.OVERVIEW_POINT_CHARS * 2
+    qualified = "# 表題\n## 本文\n" + "原則として押印は不要とする。" * 30 + "ただし外国法人は除く。\n"
+    assert gf.build_overview(qualified)["points"][0]["kind"] == "guide"
+    one_sentence = "# 表題\n## 本文\n" + "あ" * 500 + "。\n"
+    assert gf.build_overview(one_sentence)["points"][0]["kind"] == "guide"
+
+
+def test_headingless_document_has_points():
     plain = gf.build_overview("第一段落。\n\n第二段落。\n\n第三段落。\n")
     assert [p["text"] for p in plain["points"]][:2] == ["第一段落。", "第二段落。"]
     assert [o["kind"] for o in plain["options"]] == ["overview"]

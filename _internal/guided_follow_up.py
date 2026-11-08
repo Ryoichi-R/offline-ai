@@ -27,7 +27,7 @@ from source_structure import (
     normalize_match_text,
     parse_heading_tree,
     primary_units,
-    title_core,
+    title_exclusions,
 )
 
 GUIDED_ENV = "OFFLINE_AI_GUIDED_FOLLOW_UP"
@@ -58,6 +58,8 @@ _LIST_ITEM_RE = re.compile(
     r"^\s*(?:[-*・●○]|\(?[0-9０-９]+[).）]|[（(][0-9０-９]+[）)]|[①-⑳]|[一二三四五六七八九十]+[、.．]|[ア-ン][.．、])"
 )
 _QUALIFIER_RE = re.compile(r"例外|ただし|但し|除く|除き|場合|条件|限り|適用しない")
+# 概要で省いてはならない限定（省くと適用範囲を広く見せる）。
+_OMIT_QUALIFIER_RE = re.compile(r"ただし|但し|除く|除き|除いて|限る|限り|適用しない|この限りでない|例外")
 _DATE_RE = re.compile(r"(?:令和|平成|昭和)?\s*[0-9０-９元]+\s*年\s*[0-9０-９]+\s*月\s*[0-9０-９]+\s*日")
 _KIND_RE = re.compile(r"事務連絡|別添|別紙|通知|規程|要領|要綱|通達")
 _REPLACE_RE = re.compile(r"だけ|のみ")
@@ -166,7 +168,22 @@ def _point_for_range(lines: list[str], start: int, end: int, heading: str) -> di
         last = extra_last
     text = "\n".join(lines[first - 1 : last])
     if len(text) > OVERVIEW_POINT_CHARS * 2:
-        return {"kind": "guide", "heading": heading, "startLine": first, "endLine": last}
+        # 長い段落は先頭から文単位で原文のまま抜き出す。省く文に例外・限定があれば、
+        # 原則だけを見せて適用範囲を広く見せないよう、案内（見出しと行範囲）にする。
+        sentences = re.findall(r"[^。]*。|[^。]+$", text)
+        kept, used = [], 0
+        for sentence in sentences:
+            if used + len(sentence) > OVERVIEW_POINT_CHARS * 2:
+                break
+            kept.append(sentence)
+            used += len(sentence)
+        omitted = "".join(sentences[len(kept):])
+        if not kept or _OMIT_QUALIFIER_RE.search(omitted):
+            return {"kind": "guide", "heading": heading, "startLine": first, "endLine": last}
+        return {
+            "kind": "excerpt", "heading": heading, "startLine": first, "endLine": last,
+            "text": "".join(kept).strip(), "truncated": True,
+        }
     return {"kind": "excerpt", "heading": heading, "startLine": first, "endLine": last, "text": text}
 
 
@@ -243,19 +260,24 @@ def _fixed_document(source_root: Path, document: dict) -> dict | None:
     if read is None:
         return None
     text, digest = read
+    titles = list(document.get("titles") or [document["title"]])
     return {
         "path": document["path"],
         "title": document["title"],
+        "titles": titles,
         "sha256": digest,
         "sourceRoot": str(Path(source_root).resolve()),
         "text": text,
     }
 
 
+def _exclusions(document: dict) -> tuple[str, ...]:
+    return title_exclusions(document.get("titles") or [document.get("title") or ""])
+
+
 def route_for_document(query: str, document: dict) -> Decision:
     """資料が確定した後、元の質問の範囲で回答・案内を決める。"""
-    title = document["title"]
-    scope = ap.classify_guided_scope(query, exclude_texts=(title, title_core(title)))
+    scope = ap.classify_guided_scope(query, exclude_texts=_exclusions(document))
     if scope.scope == ap.GUIDED_SCOPE_BROAD:
         return Decision("topics", document=document, overview=build_overview(document["text"]), scope=scope.scope)
     return Decision("answer_fixed", document=document, scope=scope.scope)
@@ -269,25 +291,24 @@ def decide(query: str, chunks: list[dict], source_root: Path, *, initial: bool =
         fixed = _fixed_document(source_root, documents[matched["confirmed"]])
         if fixed is None:
             return Decision("direct", message="資料を読み出せませんでした")
-        title = fixed["title"]
-        scope = ap.classify_guided_scope(query, exclude_texts=(title, title_core(title)))
+        scope = ap.classify_guided_scope(query, exclude_texts=_exclusions(fixed))
         if initial and scope.scope != ap.GUIDED_SCOPE_BROAD:
             # 具体的な質問・全体概要の明示は従来の回答経路で直接回答する。
             return Decision("direct", scope=scope.scope)
         return route_for_document(query, fixed)
     candidates = matched["candidates"]
     scope = ap.classify_guided_scope(query)
+    if initial and scope.scope != ap.GUIDED_SCOPE_BROAD:
+        # 資料が確定しない具体的な質問は、従来の資料横断の回答経路で直接回答する
+        # （不要な確認を増やさない）。
+        return Decision("direct", scope=scope.scope)
     if candidates:
         cards = [_document_card(documents[item["path"]]) for item in candidates[:DOCUMENT_CANDIDATE_MAX]]
         for card, item in zip(cards, candidates):
             card["fileSha256"] = str(documents[item["path"]].get("file_sha256") or "")
-        if initial and scope.scope == ap.GUIDED_SCOPE_SPECIFIC and len(candidates) == 1:
-            return Decision("direct", scope=scope.scope)
         return Decision("documents", candidates=cards, scope=scope.scope,
                         message="該当しそうな資料が複数あります。対象の資料を選んでください。"
                         if len(cards) > 1 else "この資料が対象か確認してください。")
-    if initial and scope.scope != ap.GUIDED_SCOPE_BROAD:
-        return Decision("direct", scope=scope.scope)
     return Decision(
         "hints",
         scope=scope.scope,
@@ -428,7 +449,7 @@ def resolve_follow_up(
     body = unicodedata.normalize("NFKC", doc_text)
     candidates = [
         term
-        for term in _terms(text, (title, title_core(title)))
+        for term in _terms(text, _exclusions(document))
         if term not in cue_set and not any(cue in term for cue in cue_set)
     ]
     present = [term for term in candidates if term in body]
@@ -694,7 +715,8 @@ def _apply_decision(record: ConfirmationRecord, decision: Decision) -> None:
         changed = not record.document or record.document.get("path") != decision.document["path"]
         record.state = STATE_DOCUMENT_FIXED
         record.document = {
-            key: decision.document.get(key) for key in ("path", "title", "sha256", "sourceRoot", "indexMarker")
+            key: decision.document.get(key)
+            for key in ("path", "title", "titles", "sha256", "sourceRoot", "indexMarker")
         }
         record.candidates = []
         if changed:

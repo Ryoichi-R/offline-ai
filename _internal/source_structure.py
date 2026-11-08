@@ -251,12 +251,18 @@ def direct_child_ranges(nodes: list[HeadingNode], node: HeadingNode) -> list[tup
 # 付随的な節の見出し。質問が明示しない限り、主要範囲より後に回す。
 _ANCILLARY_HEADING_RE = re.compile(
     r"宛先|宛て|発出|発信|照会|問い?合わ?せ|連絡先|担当|様式|適用日|適用期日|施行日|施行期日|附則|付則"
+    r"|実施時期|施行時期|適用時期"
 )
 # 見出しのない段落（宛名・日付・署名・連絡先）だけで構成される付随範囲。
 _ANCILLARY_LINE_RE = re.compile(
     r"殿\s*$|様\s*$|^\s*(?:令和|平成|昭和)?\s*[0-9０-９元]+\s*年\s*[0-9０-９]+\s*月\s*[0-9０-９]+\s*日\s*(?:付)?\s*$"
-    r"|(?:課長|部長|局長|室長|所長|係長|担当)\s*$|内線|電話|TEL|E-?mail|メール"
+    r"|(?:課長|部長|局長|室長|所長|係長|担当|の長)\s*(?:[（(][^）)]*[）)])?\s*$|内線|電話|TEL|E-?mail|メール"
+    r"|第\s*[0-9０-９]+\s*号\s*$|^\s*事務連絡\s*$|^\s*【[^】]*】\s*$|^\s*(?:記|以上)\s*$"
 )
+# 行頭の引用記号・強調記号は付随行の判定に含めない。
+_LINE_MARKUP_RE = re.compile(r"^[\s>＞*＊_]+|[\s*＊_]+$")
+# 最初の見出しより前の短い行だけの段落（宛先・発出者・文書番号の並び）は付随範囲とする。
+HEADER_PARAGRAPH_MAX_LINE_CHARS = 40
 # 付随見出しの下でも、適用条件・経過措置・例外がある本文は主要範囲として扱う。
 _QUALIFYING_BODY_RE = re.compile(
     r"経過措置|ただし|但し|例外|除く|除き|条件|要件|限り|適用しない|適用除外|場合"
@@ -283,12 +289,19 @@ def _body_text(lines: list[str], start: int, end: int) -> str:
     return "\n".join(lines[start - 1 : min(end, len(lines))])
 
 
-def _is_ancillary(heading: str, body: str) -> bool:
+def _is_ancillary(heading: str, body: str, *, header: bool = False) -> bool:
+    content = [_LINE_MARKUP_RE.sub("", line) for line in body.splitlines() if line.strip()]
+    content = [line for line in content if line]
+    if not heading and content and all(re.fullmatch(r"(?:記|以上)", line) for line in content):
+        return True  # 「記」「以上」だけの段落
     if _QUALIFYING_BODY_RE.search(body):
         return False
     if heading:
         return bool(_ANCILLARY_HEADING_RE.search(heading))
-    content = [line for line in body.splitlines() if line.strip()]
+    if header and content and all(
+        "。" not in line and len(line) <= HEADER_PARAGRAPH_MAX_LINE_CHARS for line in content
+    ):
+        return True
     return bool(content) and all(_ANCILLARY_LINE_RE.search(line) for line in content)
 
 
@@ -305,7 +318,7 @@ def primary_units(text: str) -> list[dict]:
     nodes = parse_heading_tree(text)
     units: list[dict] = []
 
-    def add_paragraphs(start: int, end: int) -> None:
+    def add_paragraphs(start: int, end: int, *, header: bool = False) -> None:
         for first, last in _paragraph_ranges(lines, start, end):
             body = _body_text(lines, first, last)
             units.append(
@@ -313,7 +326,7 @@ def primary_units(text: str) -> list[dict]:
                     "heading": "",
                     "start_line": first,
                     "end_line": last,
-                    "ancillary": _is_ancillary("", body),
+                    "ancillary": _is_ancillary("", body, header=header),
                     "read_ranges": [(first, last, "")],
                 }
             )
@@ -323,7 +336,7 @@ def primary_units(text: str) -> list[dict]:
         return units
     roots = [node for node in nodes if node.parent_index is None]
     if roots[0].heading_line > 1:
-        add_paragraphs(1, roots[0].heading_line - 1)
+        add_paragraphs(1, roots[0].heading_line - 1, header=True)
     sections: list[HeadingNode]
     if len(roots) == 1 and roots[0].children_indices:
         wrapper = roots[0]
@@ -429,9 +442,27 @@ _MATCH_STRIP_RE = re.compile(r"[\s　、。，．,.・:：;；\"'“”‘’「
 _TITLE_NOISE_RE = re.compile(
     r"[（(](?:通知|事務連絡|依頼|周知|お知らせ|案内|写し?|別添|別紙|参考)[0-9０-９]*[）)]|について$|に関する(?:件|こと)?$|の件$"
 )
-_DOCUMENT_NUMBER_RE = re.compile(r"第\s*([0-9０-９]+)\s*号")
+_BRACKET_RE = re.compile(r"[（(]([^（）()]+)[）)]")
+_FILE_PREFIX_RE = re.compile(r"^(?:[0-9０-９]+[．.、]\s*|[A-Za-z]{0,3}[-_]?[0-9]{1,4}[-_]\s*)")
+# 変換・分割で付いたファイル名の接尾部（-resegmented-01、_part7 等）は表題に含めない。
+_FILE_SUFFIX_RE = re.compile(r"(?:[-_](?:resegmented|part|section|sec)[-_]?[0-9]+[A-Za-z0-9_\-]*)+$", re.IGNORECASE)
+# 発出者（役職）と文書種別。発出者だけの一致では資料を確定しない。
+_ISSUER_RE = re.compile(
+    r"[一-龥ァ-ヴー]{0,8}?(?:課長|室長|局長|部長|次長|所長|官房長|審議官|次官|大臣|センター長|専門官)"
+)
+_KIND_WORDS = ("通知", "事務連絡", "通達", "依頼", "周知")
+# 文書番号: 「会発1225第２号」のような接頭部を含めて丸ごと照合する。
+_DOCUMENT_NUMBER_RE = re.compile(r"([一-龥ァ-ヶA-Za-z]{0,4}[0-9]*)第([0-9]+)号")
+_SUBJECT_TERM_RE = re.compile(r"[一-龥々]{2,}|[ァ-ヴー]{2,}|[A-Za-z][A-Za-z0-9\-]{1,}")
+_GENERIC_QUERY_TERMS = frozenset(
+    {
+        "内容", "詳細", "内容詳細", "概要", "要点", "全体", "説明", "取扱", "取扱い", "取り扱い",
+        "資料", "文書", "通知", "事務連絡", "通達", "教", "関", "事", "求", "場合", "以下", "以上",
+    }
+)
 TITLE_CORE_MIN_CHARS = 4
 TITLE_WEAK_COVERAGE = 0.5
+HEADER_MAX_LINES = 30
 
 
 def normalize_match_text(value: str) -> str:
@@ -450,6 +481,51 @@ def title_core(title: str) -> str:
     return core
 
 
+def _is_issuer_or_kind_only(text: str) -> bool:
+    """「会計課長通知」のように発出者と文書種別だけでできた句か。"""
+    rest = unicodedata.normalize("NFKC", text).strip()
+    for word in _KIND_WORDS:
+        rest = rest.replace(word, "")
+    rest = _ISSUER_RE.sub("", rest)
+    return not normalize_match_text(rest)
+
+
+def title_variants(titles) -> list[str]:
+    """表題の別表記（メタデータ・見出し・ファイル名）から照合用の中核候補を作る。
+
+    「会計課長通知（会計手続における押印の見直しについて）」のように正式表題が
+    括弧内にある場合は括弧内も候補にする。発出者と文書種別だけの句は候補にしない。
+    """
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        core = title_core(value)
+        if core and not _is_issuer_or_kind_only(core) and core not in variants:
+            variants.append(core)
+
+    for raw in titles:
+        title = _FILE_SUFFIX_RE.sub("", _FILE_PREFIX_RE.sub("", str(raw or "").strip()))
+        if not title:
+            continue
+        add(title)
+        for inner in _BRACKET_RE.findall(title):
+            add(inner)
+        add(_BRACKET_RE.sub("", title))
+    return variants
+
+
+def title_exclusions(titles) -> tuple[str, ...]:
+    """質問範囲の判定で尋ねている項目から除く句（表題の別表記・発出者・文書種別）。"""
+    values: list[str] = []
+    for raw in titles:
+        raw = str(raw or "").strip()
+        if raw:
+            values.append(raw)
+            values.extend(_BRACKET_RE.findall(raw))
+    values.extend(title_variants(titles))
+    return tuple(dict.fromkeys(values))
+
+
 def document_title(text: str, *, source_title: str | None = None, path: str = "") -> str:
     """資料の表題: メタデータの表題、最初の見出し、ファイル名の順に採る。"""
     if source_title and str(source_title).strip():
@@ -457,8 +533,30 @@ def document_title(text: str, *, source_title: str | None = None, path: str = ""
     nodes = parse_heading_tree(text)
     if nodes and nodes[0].heading_text:
         return nodes[0].heading_text
-    stem = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return _path_stem(path)
+
+
+def _path_stem(path: str) -> str:
+    stem = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
     return stem.rsplit(".", 1)[0] if "." in stem else stem
+
+
+def _first_heading(text: str) -> str:
+    nodes = parse_heading_tree(text)
+    return nodes[0].heading_text if nodes else ""
+
+
+def _header_text(text: str) -> str:
+    """文書番号・発出者を探す冒頭部: 最初の見出しより前（最大30行）。見出しが1行目なら冒頭10行。
+
+    本文中で他の通知を引用した番号（「…付け会発…号をもって通知」等）を自身の番号と
+    取り違えないため、見出しより後は使わない。
+    """
+    lines = str(text or "").splitlines()
+    nodes = parse_heading_tree(text)
+    first = nodes[0].heading_line if nodes else len(lines) + 1
+    end = first - 1 if first > 1 else 10
+    return "\n".join(lines[: min(end, HEADER_MAX_LINES)])
 
 
 def _bigram_coverage(needle: str, haystack: str) -> float:
@@ -468,37 +566,85 @@ def _bigram_coverage(needle: str, haystack: str) -> float:
     return sum(gram in haystack for gram in grams) / len(grams)
 
 
-def document_numbers(text: str) -> set[str]:
-    return {
-        unicodedata.normalize("NFKC", match.group(1)).lstrip("0") or "0"
-        for match in _DOCUMENT_NUMBER_RE.finditer(unicodedata.normalize("NFKC", str(text or "")))
-    }
+def document_numbers(text: str) -> set[tuple[str, str]]:
+    """文書番号を ``(接頭部, 番号)`` の組で返す（全角・半角と空白を正規化）。"""
+    normalized = re.sub(r"[ 　\t]+", "", unicodedata.normalize("NFKC", str(text or "")))
+    numbers = set()
+    for match in _DOCUMENT_NUMBER_RE.finditer(normalized):
+        prefix = match.group(1).lower()
+        number = match.group(2).lstrip("0") or "0"
+        numbers.add((prefix, number))
+    return numbers
+
+
+def _numbers_match(query_numbers, document_numbers_) -> bool:
+    for q_prefix, q_number in query_numbers:
+        for d_prefix, d_number in document_numbers_:
+            if q_number != d_number:
+                continue
+            # 接頭部（会発1225 等）を書いた質問は、接頭部まで一致した場合だけ強い一致とする。
+            if not q_prefix or q_prefix == d_prefix:
+                return True
+    return False
+
+
+def _issuers(text: str) -> set[str]:
+    return {normalize_match_text(m.group(0)) for m in _ISSUER_RE.finditer(unicodedata.normalize("NFKC", text))}
+
+
+def _subject_terms(query: str, issuers: set[str]) -> list[str]:
+    terms = []
+    for term in _SUBJECT_TERM_RE.findall(unicodedata.normalize("NFKC", query)):
+        if term in _GENERIC_QUERY_TERMS:
+            continue
+        normalized = normalize_match_text(term)
+        if any(issuer and issuer in normalized for issuer in issuers):
+            continue  # 「会計課長通知」等は発出者の句であり主題ではない
+        if any(word in term for word in _KIND_WORDS) and _is_issuer_or_kind_only(term):
+            continue
+        terms.append(normalized)
+    return list(dict.fromkeys(terms))
 
 
 def match_documents(query: str, documents: list[dict]) -> dict:
     """質問と資料を照合し、資料単位の候補と、1つに確定した資料を返す。
 
-    ``documents`` は ``{"path", "title", "head_text"}`` の一覧（資料単位）。
-    表題の中核部分が質問に現れる場合と、文書番号が一致する場合を強い一致とし、
-    強い一致がちょうど1資料のときだけ確定する。発出者だけの一致では確定しない。
-    モデルを呼ばない決定的な照合である。
+    ``documents`` は ``{"path", "title", "titles", "head_text"}`` の一覧（資料単位）。
+    強い一致（確定に使う）: 表題の別表記の中核が質問に現れる、または文書番号が一致する。
+    弱い一致（候補だけ）: 質問の発出者が資料の表題・冒頭に現れ主題の語が表題に現れる、
+    主題の語がすべて表題に現れる、または表題の2文字単位の重なりが半分以上。強い一致がちょうど1資料のときだけ確定し、
+    発出者だけの一致では確定しない。モデルを呼ばない決定的な照合である。
     """
     normalized_query = normalize_match_text(query)
     query_numbers = document_numbers(query)
+    query_issuers = _issuers(query)
+    subjects = _subject_terms(query, query_issuers)
     candidates = []
     for document in documents:
         title = str(document.get("title") or "")
-        core = normalize_match_text(title_core(title))
-        reasons = []
+        titles = document.get("titles") or [title]
+        variants = [normalize_match_text(v) for v in title_variants(titles)]
+        reasons: list[str] = []
         strength = 0
-        coverage = _bigram_coverage(core, normalized_query) if core else 0.0
-        if len(core) >= TITLE_CORE_MIN_CHARS and core in normalized_query:
+        coverages = [(v, _bigram_coverage(v, normalized_query)) for v in variants]
+        coverage = max((c for _, c in coverages), default=0.0)
+        if any(len(v) >= TITLE_CORE_MIN_CHARS and v in normalized_query for v in variants):
             strength, reasons = 2, ["title"]
-        if query_numbers and query_numbers & document_numbers(str(document.get("head_text") or "")):
+        if query_numbers and _numbers_match(query_numbers, document_numbers(str(document.get("head_text") or ""))):
             strength = 2
             reasons.append("document_number")
-        if strength == 0 and len(core) >= TITLE_CORE_MIN_CHARS and coverage >= TITLE_WEAK_COVERAGE:
-            strength, reasons = 1, ["title_partial"]
+        title_text = normalize_match_text(" ".join(str(t or "") for t in titles))
+        subject_hits = [term for term in subjects if term in title_text]
+        if strength == 0:
+            issuer_text = title_text + normalize_match_text(str(document.get("head_text") or ""))
+            issuer_hit = any(issuer in issuer_text for issuer in query_issuers)
+            if issuer_hit and subject_hits:
+                strength, reasons = 1, ["issuer_subject"]
+            elif subjects and len(subject_hits) == len(subjects) and sum(map(len, subjects)) >= TITLE_CORE_MIN_CHARS:
+                # 表題を知らない質問: 主題の語がすべて表題に現れる資料を候補にする（確定しない）。
+                strength, reasons = 1, ["subject"]
+            elif any(len(v) >= TITLE_CORE_MIN_CHARS and c >= TITLE_WEAK_COVERAGE for v, c in coverages):
+                strength, reasons = 1, ["title_partial"]
         if strength:
             candidates.append(
                 {
@@ -506,25 +652,35 @@ def match_documents(query: str, documents: list[dict]) -> dict:
                     "title": title,
                     "strength": strength,
                     "coverage": round(coverage, 4),
+                    "subject_hits": len(subject_hits),
                     "reasons": reasons,
+                    "exclude": list(title_exclusions(titles)),
                 }
             )
-    candidates.sort(key=lambda item: (-item["strength"], -item["coverage"], item["path"]))
+    candidates.sort(
+        key=lambda item: (-item["strength"], -item["subject_hits"], -item["coverage"], item["path"])
+    )
     strong = [item for item in candidates if item["strength"] == 2]
     confirmed = strong[0]["path"] if len(strong) == 1 else None
     return {"confirmed": confirmed, "candidates": candidates}
 
 
+def candidate_for(matched: dict, path: str) -> dict:
+    return next(item for item in matched["candidates"] if item["path"] == path)
+
+
 def documents_from_texts(texts: dict[str, str], titles: dict[str, str] | None = None) -> list[dict]:
-    """``{path: text}`` から照合用の資料一覧を作る（冒頭30行を文書番号照合に使う）。"""
+    """``{path: text}`` から照合用の資料一覧を作る。"""
     titles = titles or {}
     documents = []
     for path, text in texts.items():
+        variants = [titles.get(path) or "", _first_heading(text), _path_stem(path)]
         documents.append(
             {
                 "path": path,
                 "title": document_title(text, source_title=titles.get(path), path=path),
-                "head_text": "\n".join(text.splitlines()[:30]),
+                "titles": [v for v in dict.fromkeys(variants) if v],
+                "head_text": _header_text(text),
             }
         )
     return documents
@@ -533,8 +689,8 @@ def documents_from_texts(texts: dict[str, str], titles: dict[str, str] | None = 
 def documents_from_chunks(chunks: list[dict]) -> list[dict]:
     """検索チャンクから照合用の資料一覧を作る（資料ファイルを読み直さない）。
 
-    表題はメタデータの ``source_title``、1行目の見出し、ファイル名の順に採る。
-    文書番号の照合には冒頭30行に掛かるチャンク本文を使う。
+    表題はメタデータの ``source_title``、最初の見出し、ファイル名の順に採り、別表記として
+    すべて照合に使う。文書番号・発出者の照合には冒頭部（最初の見出しより前）を使う。
     """
     by_path: dict[str, list[dict]] = {}
     for chunk in chunks:
@@ -545,13 +701,30 @@ def documents_from_chunks(chunks: list[dict]) -> list[dict]:
     for path, items in by_path.items():
         items = sorted(items, key=lambda c: int(c.get("start_line") or 0))
         source_title = next((str(c["source_title"]) for c in items if c.get("source_title")), "")
-        first_text = str(items[0].get("text") or "") if int(items[0].get("start_line") or 0) == 1 else ""
-        head = "\n".join(str(c.get("text") or "") for c in items if int(c.get("start_line") or 0) <= 30)
+        heading = next((str(c.get("heading") or "") for c in items if c.get("heading")), "") or next(
+            (_first_heading(str(c.get("text") or "")) for c in items if _first_heading(str(c.get("text") or ""))),
+            "",
+        )
+        head_lines: list[str] = []
+        for chunk in items:
+            if int(chunk.get("start_line") or 0) > HEADER_MAX_LINES:
+                break
+            for line in str(chunk.get("text") or "").splitlines():
+                if line.lstrip().startswith("#") and head_lines:
+                    break
+                head_lines.append(line)
+            else:
+                continue
+            break
+        if not head_lines and items:
+            head_lines = str(items[0].get("text") or "").splitlines()[:10]
+        variants = [source_title, heading, _path_stem(path)]
         documents.append(
             {
                 "path": path,
-                "title": document_title(first_text, source_title=source_title, path=path),
-                "head_text": head,
+                "title": source_title or heading or _path_stem(path),
+                "titles": [v for v in dict.fromkeys(variants) if v],
+                "head_text": "\n".join(head_lines[:HEADER_MAX_LINES]),
                 "file_sha256": str(items[0].get("file_sha256") or ""),
             }
         )

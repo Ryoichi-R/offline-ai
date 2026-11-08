@@ -16,8 +16,8 @@
         "ollamaSource": "https://ollama.com/download/windows"
     },
     "appPayloadEstimate": {
-        "totalBytes": 1410936,
-        "largestFileBytes": 283818,
+        "totalBytes": 1421991,
+        "largestFileBytes": 283779,
         "largestFile": "_internal/search.py",
         "fileCount": 44,
     "reviewedAt": "2026-11-08",

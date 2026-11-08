@@ -5737,10 +5737,9 @@ def _with_primary_ranges(
         path = matched["confirmed"]
         if not path:
             return evidence_items, []
-        title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
-        scope = _answer_policy.classify_guided_scope(
-            query, exclude_texts=(title, _source_structure.title_core(title))
-        )
+        candidate = _source_structure.candidate_for(matched, path)
+        title = candidate["title"]
+        scope = _answer_policy.classify_guided_scope(query, exclude_texts=candidate["exclude"])
         if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC:
             return evidence_items, []
         expected_sha = next(
