@@ -1674,6 +1674,8 @@ const ui = {
             if (item.startLine !== null && item.startLine !== undefined && item.endLine !== null && item.endLine !== undefined) {
                 metaParts.push(`行 ${item.startLine}-${item.endLine}`);
             }
+            const excerptLabel = this._excerptRangeLabel(item);
+            if (excerptLabel) metaParts.push(excerptLabel);
             if (item.layoutType) metaParts.push(`種別 ${item.layoutType}`);
             if (item.parser) metaParts.push(`parser ${item.parser}`);
             if (item.source) metaParts.push(`検索 ${item.source}`);
@@ -1776,6 +1778,16 @@ const ui = {
         this.els.saveMarkdownBtn.hidden = !canSave;
     },
 
+    // 根拠範囲より抜粋が短いとき、抜粋自体の行範囲と省略を示す（画面と保存で同じ文言）。
+    _excerptRangeLabel(item) {
+        if (!item || !item.snippetTruncated) return "";
+        const hasRange = item.snippetStartLine !== null && item.snippetStartLine !== undefined
+            && item.snippetEndLine !== null && item.snippetEndLine !== undefined;
+        return hasRange
+            ? `抜粋 行 ${item.snippetStartLine}-${item.snippetEndLine}（根拠範囲の一部。省略あり）`
+            : "抜粋は根拠範囲の一部（省略あり）";
+    },
+
     _markdownFence(value) {
         const text = String(value ?? "");
         const runs = text.match(/`+/g) || [];
@@ -1854,6 +1866,7 @@ const ui = {
                 `- source内相対パス: ${this._markdownMeta(item.path)}`,
                 `- 位置: ${this._markdownMeta(location || "不明")}`,
                 `- 検索時SHA-256: ${this._markdownMeta(item.sourceSha256 || "不明")}`,
+                ...(this._excerptRangeLabel(item) ? [`- 抜粋の範囲: ${this._markdownMeta(this._excerptRangeLabel(item))}`] : []),
                 "",
                 this._markdownTextBlock("検索時の抜粋", item.snippet),
                 "",

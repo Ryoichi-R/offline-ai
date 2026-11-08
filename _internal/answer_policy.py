@@ -2175,3 +2175,64 @@ def assess_answer_text(answer: str) -> dict:
         "codes": codes,
         "claim_lines": len(claims),
     }
+
+
+# ---------------------------------------------------------------------------
+# 案内の振り分け: 質問範囲の判定（plans/offline-ai-guided-follow-up-plan.md 4.2）
+# ---------------------------------------------------------------------------
+# 回答の詳しさ（granularity）とは別の判定。v2の `_ASPECT_CUES` と必須観点を
+# 変えないよう、振り分け用の手掛かり語は独立した表に持つ。
+
+GUIDED_SCOPE_OVERVIEW = "overview"
+GUIDED_SCOPE_SPECIFIC = "specific"
+GUIDED_SCOPE_BROAD = "broad"
+
+_GUIDED_OVERVIEW_RE = re.compile(
+    r"全体(?:を|の)?(?:まとめ|要約|概要|像)|全体的に(?:まとめ|説明|要約)"
+    r"|全文(?:を|の)?(?:まとめ|要約)|(?:を|に|で)要約(?:して|し|する)"
+)
+# 尋ねている項目・情報の種類を表す語。主題語（押印・請求書など）は置かない。
+GUIDED_ITEM_CUES = (
+    ("時期", ("適用日", "適用期日", "施行日", "施行期日", "いつ", "期限", "期間", "締切", "締め切り", "時期", "日付", "何日")),
+    ("対象", ("対象", "誰", "だれ", "範囲", "該当")),
+    ("例外", ("例外", "除外", "ただし", "但し", "除く")),
+    ("条件", ("条件", "要件", "基準", "場合")),
+    ("手続", ("手続", "手順", "方法", "やり方", "流れ")),
+    ("書類", ("提出", "書類", "添付", "様式", "申請", "届出")),
+    ("金額", ("金額", "上限", "下限", "費用", "単価", "いくら", "何円")),
+    ("比較", ("違い", "比較", "相違")),
+    ("定義", ("定義", "とは", "意味")),
+    ("理由", ("理由", "なぜ", "目的", "趣旨", "背景")),
+    ("可否", ("必要", "不要", "できる", "できます", "可能", "義務", "禁止", "可否")),
+    ("経過措置", ("経過措置", "罰則")),
+    ("窓口", ("照会先", "連絡先", "窓口", "問合せ", "問い合わせ")),
+)
+
+
+@dataclass(frozen=True)
+class GuidedScope:
+    scope: str
+    items: tuple[str, ...] = ()
+
+
+def classify_guided_scope(query: str, *, exclude_texts: Iterable[str] = ()) -> GuidedScope:
+    """質問範囲を overview / specific / broad に判定する（モデルを使わない）。
+
+    資料の照合に使った表題などの句（``exclude_texts``）を除いた残りで、全体概要の
+    明示、尋ねている項目の手掛かりの順に判定する。内容・詳細・ポイント等の汎用語は
+    項目に数えない。いずれにも当たらなければ広い質問（broad）とする。
+    """
+    text = unicodedata.normalize("NFKC", str(query or ""))
+    for phrase in sorted(
+        (unicodedata.normalize("NFKC", str(p or "")).strip() for p in exclude_texts),
+        key=len,
+        reverse=True,
+    ):
+        if phrase:
+            text = text.replace(phrase, " ")
+    if _GUIDED_OVERVIEW_RE.search(text):
+        return GuidedScope(GUIDED_SCOPE_OVERVIEW)
+    items = tuple(label for label, cues in GUIDED_ITEM_CUES if any(cue in text for cue in cues))
+    if items:
+        return GuidedScope(GUIDED_SCOPE_SPECIFIC, items)
+    return GuidedScope(GUIDED_SCOPE_BROAD)

@@ -40,7 +40,15 @@ from prompt_templates import (
     build_deep_final_prompt,
     build_deep_section_prompt,
 )
-from source_structure import parse_heading_tree, section_range_for_line, node_for_line
+from source_structure import (
+    documents_from_texts,
+    match_documents,
+    node_for_line,
+    parse_heading_tree,
+    primary_units,
+    section_range_for_line,
+    title_core,
+)
 
 
 DEEP_SCHEMA_VERSION = 1
@@ -2000,6 +2008,51 @@ def _fallback_answer(evidence, unconfirmed, ledger, stop_reason):
     return "\n".join(lines)
 
 
+def _primary_candidates(query, sources, chunks):
+    """資料が1つに確定し、特定の項目を尋ねていない質問の主要範囲を読取候補にする。
+
+    plans/offline-ai-guided-follow-up-plan.md 4.1: 検索ヒットが付随範囲（適用日・
+    照会先等）に偏っても、確定した資料の主要節を節ごとに先頭から読む。1つの節が
+    予算を占有しないよう、各候補は1単位だけ読み、各主要節の最初の範囲を先に並べる。
+    複数資料にまたがる質問・具体的な項目を尋ねる質問では従来の根拠選別を変えない。
+    """
+    titles = {}
+    for chunk in chunks:
+        title = chunk.get("source_title")
+        if title:
+            titles.setdefault(str(chunk.get("path") or "").replace("\\", "/"), str(title))
+    texts = {path: source[2] for path, source in sources.items()}
+    matched = match_documents(query, documents_from_texts(texts, titles))
+    path = matched["confirmed"]
+    if not path:
+        return None, []
+    title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
+    scope = ap.classify_guided_scope(query, exclude_texts=(title, title_core(title)))
+    if scope.scope == ap.GUIDED_SCOPE_SPECIFIC:
+        return path, []
+    units = [unit for unit in primary_units(sources[path][2]) if not unit["ancillary"]]
+    ordered = []
+    depth = 0
+    while True:
+        layer = [unit["read_ranges"][depth] for unit in units if depth < len(unit["read_ranges"])]
+        if not layer:
+            break
+        ordered.extend(layer)
+        depth += 1
+    return path, [
+        {
+            "path": path,
+            "start_line": start,
+            "end_line": end,
+            "heading": heading,
+            "source_sha256": sources[path][1],
+            "primary": True,
+            "max_units": 1,
+        }
+        for start, end, heading in dict.fromkeys(ordered)
+    ]
+
+
 def run_deep_research(
     query: str,
     *,
@@ -2086,6 +2139,7 @@ def run_deep_research(
     role_selection: dict[str, int] = {}
     node_cache: dict = {}
     checked_sources: dict[str, bool] = {}
+    primary_batch: list[dict] = []
     call_ledger = ap.CallLedger()
     stage_clock = (
         ap.StageClock(min(float(timeout_seconds), budget.remaining()), "deep", remaining_fn=budget.remaining)
@@ -2230,10 +2284,16 @@ def run_deep_research(
                 int(candidate.get("start_line") or 1),
                 int(candidate.get("end_line") or 1),
             )
-            for section_start, section_end, heading in _ranges_with_context(
-                source[2], start, end
-            ):
+            read_ranges = (
+                [(start, end, str(candidate.get("heading") or ""))]
+                if candidate.get("primary")
+                else _ranges_with_context(source[2], start, end)
+            )
+            for section_start, section_end, heading in read_ranges:
                 units = _split_line_range(source[3], section_start, section_end)
+                if candidate.get("max_units"):
+                    # 主要範囲は節ごとに先頭の単位だけ読み、残りは未読として後で明示する。
+                    units = units[: int(candidate["max_units"])]
                 # Table headings remain separate source ranges, not synthetic text in a quoted range.
                 headers = [
                     (n, n + 1)
@@ -2444,6 +2504,7 @@ def run_deep_research(
             stage_clock.enter("retrieve")
         try:
             sources, chunks = _snapshot(root, budget, note)
+            _, primary_batch = _primary_candidates(query, sources, chunks)
             if not isolate_retrieval_embedding:
                 try:
                     import search as _search
@@ -2528,6 +2589,12 @@ def run_deep_research(
                     batch, round_roles = _prioritize_by_role(batch, sources, intent, node_cache)
                     for role, count in round_roles.items():
                         role_selection[role] = role_selection.get(role, 0) + count
+                if round_index == 1 and primary_batch:
+                    # 確定した資料の主要範囲を、検索ヒットより先に節ごとに読む。
+                    batch = {
+                        **{(c["path"], c["start_line"], c["end_line"], "primary"): c for c in primary_batch},
+                        **batch,
+                    }
                 before = len(evidence)
                 read_batch(batch, reserve)
                 # References are resolved only by actually retained source text, never by a search hit alone.
@@ -2594,6 +2661,17 @@ def run_deep_research(
                 raise
             note("time_budget", detail="モデル呼出が時間内に終わらず探索を終了")
 
+        for candidate in primary_batch:
+            source = sources.get(candidate["path"])
+            if source is None:
+                continue
+            for unit in _split_line_range(source[3], candidate["start_line"], candidate["end_line"]):
+                key = (
+                    candidate["path"], source[1], unit["start_line"], unit["end_line"],
+                    unit["char_start"], unit["char_end"],
+                )
+                if key not in seen:
+                    note("primary_unread", candidate["path"], unit, detail=candidate["heading"] or "見出しなし")
         for issue in current_gaps["unresolved"]:
             note("unresolved", detail=issue)
         for viewpoint in current_gaps["queries"]:

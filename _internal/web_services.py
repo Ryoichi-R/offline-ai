@@ -25,7 +25,8 @@ import uuid
 from pathlib import Path
 
 from config import OLLAMA_HOST, DEEP_SEARCH_TIMEOUT_DEFAULT
-from source_view import EvidenceRegistry, EvidenceViewError  # noqa: F401 - web_server re-exports this service boundary error
+# EvidenceViewError は web_server が再エクスポートするサービス境界の例外でもある。
+from source_view import EvidenceRegistry, EvidenceViewError
 
 logger = logging.getLogger("offlineai.services")
 
@@ -60,6 +61,114 @@ def _utc_now_iso() -> str:
     )
 
 
+# 根拠の抜粋（SSE・保存Markdown）の文字数枠。範囲が長い場合は、枠内で必要箇所を
+# 優先した連続行を選び、抜粋自体の行範囲と省略の有無を返す（guided-follow-up 4.1）。
+EVIDENCE_EXCERPT_MAX_CHARS = 500
+
+
+def _bigrams(text: str) -> set[str]:
+    import unicodedata
+
+    normalized = "".join(unicodedata.normalize("NFKC", str(text or "")).split())
+    return {normalized[i : i + 2] for i in range(len(normalized) - 1)}
+
+
+def select_excerpt(
+    text: str,
+    start_line: int | None,
+    *,
+    focus=(),
+    limit: int = EVIDENCE_EXCERPT_MAX_CHARS,
+) -> dict:
+    """根拠範囲の本文から、枠内で必要箇所を優先した連続行の抜粋を選ぶ。
+
+    ``focus``（回答本文・抽出内容・質問など）と2文字単位で多く重なる連続行を選び、
+    同点なら先頭に近い範囲を採る。重なりがなければ従来どおり先頭から採る。
+    1行が枠を超える場合だけ、その行を枠で切る。原文の文言は変えない。
+    ``start_line`` が本文1行目の行番号のとき、抜粋自体の行範囲を返す。
+    """
+    lines = str(text or "").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+        start_line = start_line + 1 if isinstance(start_line, int) else start_line
+    while lines and not lines[-1].strip():
+        lines.pop()
+    joined = "\n".join(lines)
+    aligned = isinstance(start_line, int) and not isinstance(start_line, bool)
+    if len(joined) <= limit:
+        return {
+            "snippet": joined,
+            "startLine": start_line if aligned and lines else None,
+            "endLine": start_line + len(lines) - 1 if aligned and lines else None,
+            "truncated": False,
+        }
+    focus_grams: set[str] = set()
+    for value in focus:
+        focus_grams |= _bigrams(value)
+    scores = [len(_bigrams(line) & focus_grams) for line in lines]
+    best = None
+    for first in range(len(lines)):
+        if not lines[first].strip():
+            continue
+        total = score = 0
+        last = first
+        while last < len(lines):
+            cost = len(lines[last]) + (1 if last > first else 0)
+            if total + cost > limit:
+                break
+            total += cost
+            score += scores[last]
+            last += 1
+        if last == first:
+            window = (scores[first], -first, first, first, lines[first][:limit])
+        else:
+            end = last - 1
+            while end > first and not lines[end].strip():
+                end -= 1
+            window = (score, -first, first, end, "\n".join(lines[first : end + 1]))
+        if best is None or window[:2] > best[:2]:
+            best = window
+    _, _, first, end, snippet = best
+    return {
+        "snippet": snippet,
+        "startLine": start_line + first if aligned else None,
+        "endLine": start_line + end if aligned else None,
+        "truncated": True,
+    }
+
+
+def _source_range_text(registry, relative_path, sha256, start_line, end_line, cache):
+    """検索時と同じハッシュの資料から根拠範囲の原文を読む。読めなければ None。"""
+    import hashlib
+
+    from source_view import MAX_SOURCE_FILE_BYTES, _assert_path_boundary
+
+    if registry is None or not isinstance(start_line, int) or not isinstance(end_line, int):
+        return None
+    key = (relative_path, sha256)
+    if key not in cache:
+        cache[key] = None
+        try:
+            path = _assert_path_boundary(registry.source_root, relative_path)
+            data = path.read_bytes()
+            if len(data) <= MAX_SOURCE_FILE_BYTES and hashlib.sha256(data).hexdigest() == str(sha256).lower():
+                cache[key] = data.decode("utf-8", errors="replace").splitlines()
+        except (EvidenceViewError, OSError, ValueError):
+            cache[key] = None
+    lines = cache[key]
+    if lines is None or start_line < 1 or end_line < start_line or start_line > len(lines):
+        return None
+    return "\n".join(lines[start_line - 1 : min(end_line, len(lines))])
+
+
+def _apply_excerpt(item: dict, selected: dict) -> None:
+    item["snippet"] = selected["snippet"]
+    if selected["startLine"] is not None:
+        item["snippetStartLine"] = selected["startLine"]
+        item["snippetEndLine"] = selected["endLine"]
+    item["snippetTruncated"] = bool(selected["truncated"])
+
+
 def create_evidence_registry(source_root: Path | None = None) -> EvidenceRegistry:
     return EvidenceRegistry(source_root or SKILL_SOURCE_DIR)
 
@@ -87,6 +196,8 @@ def build_evidence_event(
     """RetrievalResultをWeb公開用の最小・JSON安全な根拠イベントへ変換する。"""
     items = []
     warnings: list[str] = [str(w).strip() for w in getattr(retrieval, "warnings", []) if str(w).strip()]
+    source_cache: dict = {}
+    query_text = str(getattr(retrieval, "query", "") or "")
     for match in list(retrieval.matches)[:8]:
         source_sha256 = str(
             match.get("source_sha256") or match.get("file_sha256") or ""
@@ -101,9 +212,18 @@ def build_evidence_event(
             "layoutType": str(match.get("layout_type") or ""),
             "parser": str(match.get("parser") or ""),
             "source": str(match.get("source") or ""),
-            "snippet": str(match.get("snippet") or "")[:500],
+            "snippet": "",
             "sourceSha256": source_sha256,
         }
+        # 行範囲の原文（検索時と同じハッシュ）から抜粋し、抜粋自体の行範囲を記録する。
+        # 読めない場合は検索時の抜粋を使い、行範囲は記録しない。
+        range_text = _source_range_text(
+            evidence_registry, item["path"], source_sha256, item["startLine"], item["endLine"], source_cache
+        )
+        if range_text is not None:
+            _apply_excerpt(item, select_excerpt(range_text, item["startLine"], focus=(query_text,)))
+        else:
+            _apply_excerpt(item, select_excerpt(str(match.get("snippet") or ""), None, focus=(query_text,)))
         group_id = match.get("group_id")
         if group_id:
             item["groupId"] = str(group_id)
@@ -159,6 +279,7 @@ def build_deep_evidence_event(
     *,
     evidence_registry: EvidenceRegistry | None = None,
     session_id: str = "",
+    query: str = "",
 ) -> dict:
     """deep結果を既存の根拠表示契約へ変換する。
 
@@ -167,8 +288,18 @@ def build_deep_evidence_event(
     確認できる範囲を保ったまま、個別文字列と件数を制限する。
     """
     items = []
+    answer_lines = str(getattr(result, "answer", "") or "").splitlines()
     for evidence in list(getattr(result, "evidence", [])):
         path = str(evidence.get("path") or "")
+        cited = f"[{evidence.get('evidence_id')}]" if evidence.get("evidence_id") else ""
+        focus = [line for line in answer_lines if cited and cited in line]
+        for key in ("subject", "scope"):
+            if evidence.get(key):
+                focus.append(str(evidence[key]))
+        for key in ("conditions", "exceptions"):
+            focus.extend(str(value) for value in evidence.get(key) or [])
+        if not focus and query:
+            focus.append(query)
         source_sha256 = str(evidence.get("source_sha256") or "")
         item = {
             "path": path,
@@ -176,12 +307,18 @@ def build_deep_evidence_event(
             "heading": str(evidence.get("heading") or ""),
             "startLine": evidence.get("start_line"),
             "endLine": evidence.get("end_line"),
-            "snippet": str(evidence.get("excerpt") or "")[:500],
+            "snippet": "",
             "sourceSha256": source_sha256,
             "evidenceId": str(evidence.get("evidence_id") or ""),
             "deepStatus": str(evidence.get("verification_status") or ""),
             "viewable": False,
         }
+        # 読んだ単位（最大4000文字）の本文は行範囲そのもの。枠内で回答・抽出内容に
+        # 対応する箇所を優先し、抜粋自体の行範囲と省略の有無を記録する。
+        _apply_excerpt(
+            item,
+            select_excerpt(str(evidence.get("excerpt") or ""), item["startLine"], focus=focus),
+        )
         if evidence_registry is not None:
             evidence_id = evidence_registry.register(
                 session_id=session_id,
@@ -1006,6 +1143,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 deep_result,
                 evidence_registry=evidence_registry,
                 session_id=session_id,
+                query=query,
             ))
             if deep_result.answer:
                 event_queue.put({"type": "chunk", "text": _truncate_deep_text(deep_result.answer)})

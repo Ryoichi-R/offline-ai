@@ -5699,6 +5699,105 @@ def finalize_ranked_matches(
     return limited, confidence, status
 
 
+# 確定した資料の主要範囲に割く根拠予算の割合。残りは検索ヒットに使う。
+PRIMARY_RANGE_BUDGET_SHARE = 0.7
+PRIMARY_UNREAD_WARNING_MAX = 3
+
+
+def _with_primary_ranges(
+    query: str,
+    evidence_items: list[dict],
+    *,
+    source_root: Path,
+    chunks: list[dict] | None,
+    char_budget: int,
+    item_limit: int,
+) -> tuple[list[dict], list[str]]:
+    """確定した資料の主要範囲を根拠の先頭へ加え、読めない主要範囲を警告にする。
+
+    資料の確定・質問範囲の判定はモデルを呼ばない。資料は検索時のチャンクと同じ
+    SHA-256 の原文だけを使い、一致しなければ何もしない。原文順に隣接する完全な
+    節は1件にまとめ、件数枠の1件は検索ヒット用に残す。チャンク検索が無効
+    （``chunks`` が None）なら従来どおり何もしない。
+    """
+    if not chunks:
+        return evidence_items, []
+    matched = _source_structure.match_documents(
+        query, _source_structure.documents_from_chunks(chunks)
+    )
+    path = matched["confirmed"]
+    if not path:
+        return evidence_items, []
+    title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
+    scope = _answer_policy.classify_guided_scope(
+        query, exclude_texts=(title, _source_structure.title_core(title))
+    )
+    if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC:
+        return evidence_items, []
+    expected_sha = next(
+        (str(c.get("file_sha256") or "") for c in chunks if str(c.get("path") or "").replace("\\", "/") == path),
+        "",
+    )
+    try:
+        data = (Path(source_root) / path).read_bytes()
+    except OSError:
+        return evidence_items, []
+    if not expected_sha or hashlib.sha256(data).hexdigest() != expected_sha:
+        return evidence_items, []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    selection = _source_structure.primary_section_ranges(text, budget_chars=max(0, char_budget))
+    merged: list[dict] = []
+    for item in selection["ranges"]:
+        previous = merged[-1] if merged else None
+        if previous and previous["complete"] and previous["end_line"] + 1 == item["start_line"]:
+            previous.update(end_line=item["end_line"], complete=item["complete"])
+            previous["headings"].append(item["heading"])
+        else:
+            merged.append({**item, "headings": [item["heading"]]})
+    keep = merged[: max(0, item_limit - 1)] if evidence_items else merged[:item_limit]
+    unread = list(selection["unread"]) + [
+        {"start_line": m["start_line"], "end_line": m["end_line"], "heading": m["heading"]}
+        for m in merged[len(keep):]
+    ]
+    top_score = max((float(m.get("score") or 0) for m in evidence_items), default=1.0)
+    primary_items = [
+        {
+            "path": path,
+            "chunk_id": f"primary:{path}:{m['start_line']}-{m['end_line']}",
+            "heading": " / ".join(h for h in m["headings"] if h) or m["heading"],
+            "start_line": m["start_line"],
+            "end_line": m["end_line"],
+            "snippet": "\n".join(lines[m["start_line"] - 1 : m["end_line"]]),
+            "score": top_score,
+            "source": "expanded",
+            "source_title": title,
+            "file_sha256": expected_sha,
+            "source_sha256": expected_sha,
+            "primary_range": True,
+        }
+        for m in keep
+    ]
+    covered = [(m["start_line"], m["end_line"]) for m in keep]
+    rest = [
+        m
+        for m in evidence_items
+        if not (
+            str(m.get("path") or "").replace("\\", "/") == path
+            and isinstance(m.get("start_line"), int)
+            and isinstance(m.get("end_line"), int)
+            and any(a <= m["start_line"] and m["end_line"] <= b for a, b in covered)
+        )
+    ]
+    warnings = []
+    for item in unread[:PRIMARY_UNREAD_WARNING_MAX]:
+        label = item["heading"] or f"行 {item['start_line']}-{item['end_line']}"
+        warnings.append(f"主要範囲のうち根拠予算内に収まらず読めていない範囲: {title} {label}")
+    if len(unread) > PRIMARY_UNREAD_WARNING_MAX:
+        warnings.append(f"ほかに読めていない主要範囲が{len(unread) - PRIMARY_UNREAD_WARNING_MAX}件あります")
+    return primary_items + rest, warnings
+
+
 def run_retrieval_pipeline(
     query: str,
     *,
@@ -6026,6 +6125,18 @@ def run_retrieval_pipeline(
     )
     evidence_char_limit = compute_evidence_char_limit(shell_chars)
     final_trace: dict = {"stage": "prompt_budget", "evidence_char_limit": evidence_char_limit}
+    # 資料が1つに確定し、特定の項目を尋ねていない質問では、確定した資料の主要範囲を
+    # 節ごとに先頭から根拠へ加える（guided-follow-up 4.1）。検索ヒットが付随範囲に
+    # 偏っても主要本文を回答へ渡す。複数資料・具体的な質問では従来どおり。
+    evidence_items, primary_warnings = _with_primary_ranges(
+        query,
+        evidence_items,
+        source_root=SKILL_SOURCE_DIR,
+        chunks=source_chunks,
+        char_budget=int(evidence_char_limit * PRIMARY_RANGE_BUDGET_SHARE),
+        item_limit=final_evidence_match_limit(),
+    )
+    warnings.extend(primary_warnings)
     if answer_intent is not None:
         final_trace["answer_policy"] = {
             "version": _answer_policy.POLICY_V2,
