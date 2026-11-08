@@ -550,7 +550,7 @@ class JobEntry:
 
     __slots__ = ("state", "cancel_token", "subscriber_queues",
                  "created_at", "completed_at", "fingerprint",
-                  "_event_buffer", "_lock", "released")
+                  "_event_buffer", "_lock", "released", "deep_slot")
 
     def __init__(self, cancel_token: CancellationToken, fingerprint=None):
         self.state: str = "running"
@@ -562,6 +562,9 @@ class JobEntry:
         self._event_buffer: list[dict] = []
         self._lock = threading.Lock()
         self.released = False
+        # 深掘りの実調査枠を保持しているか。終了イベントで state が running でなく
+        # なった時点で枠は空く（解放は一度だけ）。
+        self.deep_slot = False
 
     def add_subscriber(self) -> queue.Queue:
         """購読者キューを追加し、バッファ済みイベントを replay する。"""
@@ -665,8 +668,12 @@ class JobTable:
     def submit(self, request_id: str,
                cancel_token: CancellationToken, *, fingerprint=None,
                mode: str | None = None,
-               resume_only: bool = False) -> tuple[JobEntry, bool]:
+               resume_only: bool = False,
+               defer_deep_slot: bool = False) -> tuple[JobEntry, bool]:
         """ジョブを登録する。
+
+        ``defer_deep_slot``: 確認段階を経る深掘りジョブは登録時に深掘り枠を取らず、
+        実調査の開始時に ``acquire_deep_slot`` で取る（確認段階は枠を消費しない）。
 
         Returns:
             (entry, is_new) — 既存ジョブなら is_new=False
@@ -681,20 +688,34 @@ class JobTable:
                 return entry, False
             if resume_only:
                 raise JobNotFoundError("search job is no longer available")
-            if mode == "deep" and any(
-                entry.state == "running"
-                and entry.fingerprint
-                and len(entry.fingerprint) >= 5
-                and entry.fingerprint[4] == "deep"
-                for entry in self._jobs.values()
-            ):
+            if mode == "deep" and not defer_deep_slot and self._deep_busy_locked():
                 raise RuntimeError("deep_busy")
             if self._running_count >= self._max_concurrent:
                 raise RuntimeError("server_busy")
             entry = JobEntry(cancel_token, fingerprint=fingerprint)
+            entry.deep_slot = mode == "deep" and not defer_deep_slot
             self._jobs[request_id] = entry
             self._running_count += 1
             return entry, True
+
+    def _deep_busy_locked(self) -> bool:
+        return any(
+            entry.state == "running" and entry.deep_slot
+            for entry in self._jobs.values()
+        )
+
+    def acquire_deep_slot(self, request_id: str) -> bool:
+        """深掘りの実調査枠を同じロック内で確認・取得する。取れなければ False。"""
+        with self._lock:
+            entry = self._jobs.get(request_id)
+            if entry is None or entry.state != "running":
+                return False
+            if entry.deep_slot:
+                return True
+            if self._deep_busy_locked():
+                return False
+            entry.deep_slot = True
+            return True
 
     def finish(self, request_id: str):
         """ワーカー完了時に running カウントを減らす。"""
@@ -970,6 +991,10 @@ ERROR_CODES = {
     "job_not_found": 404,
     "forbidden_origin": 403,
     "server_busy": 503,
+    "confirmation_expired": 410,
+    "confirmation_invalid": 409,
+    "confirmation_busy": 409,
+    "deep_busy": None,            # SSE only（確認段階を経た深掘り）
     "service_unavailable": None,  # SSE only
     "timeout": None,              # SSE only
     "cancelled": None,            # SSE only
@@ -1050,15 +1075,19 @@ def check_health(configured_model: str | None = None) -> dict:
 # 検索サービス
 # ---------------------------------------------------------------------------
 
-def run_search(query: str, reasoning: str, event_queue: queue.Queue,
-               cancel_token: CancellationToken, request_id: str, *,
-               mode: str = "answer", started_at: str | None = None,
-               session_id: str = "", evidence_registry: EvidenceRegistry | None = None,
-               model_name: str | None = None, model_digest: str | None = None,
-               model_selection_source: str | None = None):
+def _run_search_core(query: str, reasoning: str, event_queue: queue.Queue,
+                     cancel_token: CancellationToken, request_id: str, *,
+                     mode: str = "answer", started_at: str | None = None,
+                     session_id: str = "", evidence_registry: EvidenceRegistry | None = None,
+                     model_name: str | None = None, model_digest: str | None = None,
+                     model_selection_source: str | None = None,
+                     fixed_document: dict | None = None,
+                     acquire_deep_slot=None):
     """検索処理をバックグラウンドスレッドで実行し、イベントを queue に put する。
 
     イベント形式: {"type": "status"|"chunk"|"done"|"error", ...}
+    ``fixed_document`` は確認案内で固定した資料（根拠をこの資料に限る）。
+    ``acquire_deep_slot`` は確認段階を経た深掘りが実調査の直前に枠を取る関数。
     """
     try:
         if mode not in VALID_SEARCH_MODES:
@@ -1108,6 +1137,15 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 cancel_token.touch()
                 event_queue.put(event)
 
+            if acquire_deep_slot is not None and not acquire_deep_slot():
+                # 確認段階は深掘り枠を消費しない。実調査の開始時に枠を取れなければ
+                # 入力を画面に残したまま deep_busy で完了する。
+                event_queue.put({
+                    "type": "error", "code": "deep_busy",
+                    "message": "別の深掘り調査を実行中です。終わってから再試行してください。",
+                })
+                return
+            deep_kwargs = {"fixed_document": fixed_document} if fixed_document else {}
             deep_result = run_deep_research(
                 query,
                 model=model or "",
@@ -1118,6 +1156,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 cancel_check=cancel_token.check,
                 absolute_deadline=cancel_token.deadline,
                 answer_policy=answer_policy,
+                **deep_kwargs,
             )
             cancel_token.touch()
             event_queue.put({
@@ -1230,6 +1269,8 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
             pipeline_kwargs["remaining_seconds"] = retrieval_remaining
         if "answer_policy" in parameters:
             pipeline_kwargs["answer_policy"] = answer_policy
+        if fixed_document:
+            pipeline_kwargs["fixed_document"] = fixed_document
         retrieval = run_retrieval_pipeline(query, **pipeline_kwargs)
         log_structured(
             request_id,
@@ -1438,3 +1479,245 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
         logger.exception("Search error [%s]", request_id)
         event_queue.put({"type": "error", "code": "internal_error",
                          "message": "内部エラーが発生しました"})
+
+
+# ---------------------------------------------------------------------------
+# 確認案内と追質問（guided-follow-up 段階2、既定は無効）
+# ---------------------------------------------------------------------------
+
+
+class _GuidedQueue:
+    """回答の正常完了（stage のない done）だけで確認情報を更新するキュー。"""
+
+    def __init__(self, inner, on_finish):
+        self._inner = inner
+        self._on_finish = on_finish
+        self.finished = False
+
+    def put(self, event: dict):
+        if not self.finished and event.get("type") == "done" and not event.get("stage"):
+            self.finished = True
+            state = self._on_finish(True)
+            if state:
+                self._inner.put({"type": "confirmation_state", **state})
+        elif not self.finished and event.get("type") == "error":
+            self.finished = True
+            self._on_finish(False)
+        self._inner.put(event)
+
+
+def _index_marker() -> list | None:
+    try:
+        from search import EMBED_CACHE_PATH
+
+        stat = Path(EMBED_CACHE_PATH).stat()
+        return [stat.st_mtime_ns, stat.st_size]
+    except (ImportError, OSError):
+        return None
+
+
+def _guided_source_ok(document: dict) -> bool:
+    """参考資料フォルダー・資料のハッシュ・インデックスが確定時から変わっていないか。"""
+    from guided_follow_up import read_document
+
+    try:
+        active = Path(SKILL_SOURCE_DIR).resolve()
+        if document.get("sourceRoot") != str(active):
+            return False
+        from source_folder import load_source_root
+
+        if load_source_root(SCRIPT_DIR.parent).resolve() != active:
+            return False  # 参考資料フォルダーの切替が再起動待ち
+    except (ImportError, OSError, ValueError):
+        return False
+    if document.get("indexMarker") != _index_marker():
+        return False
+    return read_document(active, document["path"], document.get("sha256", "")) is not None
+
+
+def _with_document_text(document: dict) -> dict | None:
+    from guided_follow_up import read_document
+
+    read = read_document(Path(SKILL_SOURCE_DIR), document["path"], document.get("sha256", ""))
+    if read is None:
+        return None
+    return {**document, "text": read[0]}
+
+
+def _emit_clarification(event_queue, request_id: str, public: dict, kind: str, ask: dict | None = None) -> None:
+    from guided_follow_up import clarification_event
+
+    event_queue.put(clarification_event(public, kind=kind, ask=ask))
+    # 確認段階では result_meta と chunk を送らない。stage で通常の完了と区別する。
+    event_queue.put({"type": "done", "stage": "clarify", "requestId": request_id})
+
+
+def run_search(query: str, reasoning: str, event_queue: queue.Queue,
+               cancel_token: CancellationToken, request_id: str, *,
+               mode: str = "answer", started_at: str | None = None,
+               session_id: str = "", evidence_registry: EvidenceRegistry | None = None,
+               model_name: str | None = None, model_digest: str | None = None,
+               model_selection_source: str | None = None,
+               confirmation_store=None, guided_request: dict | None = None,
+               acquire_deep_slot=None):
+    """検索処理。確認案内が有効なら、モデル検出の前に資料と質問範囲を振り分ける。
+
+    無効時（既定）は従来と同じ経路・イベント・モデル呼び出し回数で
+    ``_run_search_core`` を呼ぶ。
+    """
+    core_kwargs = {
+        "mode": mode, "started_at": started_at, "session_id": session_id,
+        "evidence_registry": evidence_registry, "model_name": model_name,
+        "model_digest": model_digest, "model_selection_source": model_selection_source,
+    }
+    try:
+        from guided_follow_up import guided_enabled
+    except ImportError:
+        guided_enabled = None
+    guided_on = (
+        confirmation_store is not None
+        and guided_enabled is not None
+        and guided_enabled()
+        and mode in {"answer", "deep"}
+        and _search_available
+    )
+    if not guided_on:
+        _run_search_core(query, reasoning, event_queue, cancel_token, request_id,
+                         acquire_deep_slot=acquire_deep_slot, **core_kwargs)
+        return
+    try:
+        step = _guided_step(query, event_queue, request_id, session_id=session_id,
+                            store=confirmation_store, guided_request=guided_request)
+    except CancelledError as exc:
+        event_queue.put({"type": "error", "code": exc.code, "message": str(exc)})
+        return
+    except Exception:
+        logger.exception("Guided step error [%s]", request_id)
+        if guided_request:
+            confirmation_store.finish(guided_request["confirmationId"], request_id, completed=False)
+        event_queue.put({"type": "error", "code": "internal_error", "message": "内部エラーが発生しました"})
+        return
+    if step is None:
+        return
+    effective_query, fixed_document, on_finish = step
+    guided_queue = _GuidedQueue(event_queue, on_finish) if on_finish else event_queue
+    try:
+        _run_search_core(effective_query, reasoning, guided_queue, cancel_token, request_id,
+                         fixed_document=fixed_document, acquire_deep_slot=acquire_deep_slot,
+                         **core_kwargs)
+    finally:
+        if on_finish and not guided_queue.finished:
+            guided_queue.finished = True
+            on_finish(False)
+
+
+def _guided_step(query, event_queue, request_id, *, session_id, store, guided_request):
+    """確認段階を処理する。回答へ進む場合は ``(問い, 固定資料, 完了時の処理)`` を返す。
+
+    確認結果を返した場合と、エラーで完了した場合は None を返す。
+    """
+    import guided_follow_up as gf
+    from answer_policy import GUIDED_SCOPE_OVERVIEW
+    from search import load_source_chunks_cached
+
+    def emit_error(code, message):
+        event_queue.put({"type": "error", "code": code, "message": message})
+
+    if guided_request is None:
+        event_queue.put({"type": "status", "text": "資料と質問の範囲を確認しています..."})
+        chunks, _ = load_source_chunks_cached(SKILL_SOURCE_DIR)
+        decision = gf.decide(query, chunks, Path(SKILL_SOURCE_DIR), initial=True)
+        if decision.kind == "direct":
+            return query, None, None
+        if decision.document is not None:
+            decision.document["indexMarker"] = _index_marker()
+        record = store.create(session_id, query, decision)
+        _emit_clarification(event_queue, request_id, record.public(), decision.kind)
+        return None
+
+    cid = guided_request["confirmationId"]
+    action = guided_request["action"]
+    snapshot = guided_request["record"]  # store.begin が返した写し（web_server が登録前に取得）
+
+    def finish(**kwargs):
+        return store.finish(cid, request_id, **kwargs)
+
+    def fail(code, message, *, discard=False):
+        finish(completed=False)
+        if discard:
+            store.discard(cid)
+        emit_error(code, message)
+
+    if snapshot.document is not None and not _guided_source_ok(snapshot.document):
+        return fail("source_changed", "資料または参考資料フォルダーが変更されました。もう一度質問してください。", discard=True)
+
+    if action in {gf.ACTION_SELECT_DOCUMENT, gf.ACTION_HINT}:
+        chunks, _ = load_source_chunks_cached(SKILL_SOURCE_DIR)
+        if action == gf.ACTION_SELECT_DOCUMENT:
+            choice = guided_request.get("choice")
+            if not isinstance(choice, int) or not 0 <= choice < len(snapshot.candidates):
+                return fail("confirmation_invalid", "選択肢が無効です")
+            card = snapshot.candidates[choice]
+            documents = {doc["path"]: doc for doc in gf.documents_from_chunks(chunks)}
+            current = documents.get(card["path"])
+            if current is None or str(current.get("file_sha256") or "") != card.get("fileSha256"):
+                return fail("source_changed", "候補の資料が変更されました。もう一度質問してください。", discard=True)
+            fixed = gf._fixed_document(Path(SKILL_SOURCE_DIR), current)
+            if fixed is None:
+                return fail("source_changed", "候補の資料を読み出せません。もう一度質問してください。", discard=True)
+            decision = gf.route_for_document(snapshot.initial_query, fixed)
+        else:
+            combined = f"{snapshot.initial_query} {guided_request['text']}"
+            decision = gf.decide(combined, chunks, Path(SKILL_SOURCE_DIR), initial=False)
+            if decision.kind == "direct":
+                decision = gf.Decision("hints", message=(
+                    "まだ資料を確定できません。別の手掛かり（発出年・発出者・文書番号など）を入力してください。"
+                ))
+        if decision.document is not None:
+            decision.document["indexMarker"] = _index_marker()
+        if decision.kind in {"documents", "hints", "topics"}:
+            public = finish(decision=decision, completed=True)
+            if public is None:
+                emit_error("confirmation_expired", "確認の有効期限が切れました。もう一度質問してください。")
+                return None
+            _emit_clarification(event_queue, request_id, public, decision.kind)
+            return None
+        # 具体的な質問・全体概要の指定は固定資料で回答する。
+        document = decision.document
+        fixed_document = {
+            "path": document["path"], "title": document["title"], "sha256": document["sha256"],
+            "primary": decision.scope == GUIDED_SCOPE_OVERVIEW,
+        }
+        return (
+            snapshot.initial_query,
+            fixed_document,
+            lambda ok: finish(decision=decision, completed=ok),
+        )
+
+    # 論点選択・追質問（資料は固定済み）
+    document = _with_document_text(snapshot.document)
+    if document is None:
+        return fail("source_changed", "資料が変更されました。もう一度質問してください。", discard=True)
+    try:
+        plan = gf.resolve_follow_up(
+            document, snapshot.topic, snapshot.options,
+            action=action, choice=guided_request.get("choice"),
+            text=guided_request.get("text") or "",
+            drop_targets=tuple(guided_request.get("dropTargets") or ()),
+        )
+    except gf.ConfirmationError as exc:
+        return fail(exc.code, str(exc))
+    if plan.ask is not None:
+        # 聞き返しでは直前に確定した論点を保持し、候補を新しい選択肢にする。
+        public = finish(completed=True, options=plan.ask["options"] or None)
+        if public is None:
+            emit_error("confirmation_expired", "確認の有効期限が切れました。もう一度質問してください。")
+            return None
+        _emit_clarification(event_queue, request_id, public, "ask", ask=plan.ask)
+        return None
+    fixed_document = {
+        "path": document["path"], "title": document["title"], "sha256": document["sha256"],
+        "focus_ranges": [list(r) for r in plan.focus_ranges],
+        "primary": plan.overview,
+    }
+    return plan.query, fixed_document, lambda ok: finish(topic=plan.topic, completed=ok)

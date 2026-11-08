@@ -238,3 +238,61 @@ def test_normal_path_warns_about_unread_primary_ranges(tmp_path):
     )
     assert any("2 取扱い" in w for w in warnings)
     assert all(i.get("primary_range") for i in items)
+
+
+def test_fixed_document_restricts_deep_research_to_the_focus_range(tmp_path, monkeypatch):
+    """段階2: 固定した資料の焦点範囲を先に読み、他の資料は調査対象にしない。"""
+    root = _corpus(tmp_path, other="# 別の通知\n押印の取扱いの別資料。\n")
+    sha = hashlib.sha256((root / "notice.md").read_bytes()).hexdigest()
+    chunks = search.build_source_chunks(root)
+    other = next(c for c in chunks if c["path"] == "other.md")
+    patch_retrieval(
+        monkeypatch,
+        deep_research,
+        lambda q, ch, **k: deep_candidate_selection.select_candidates(
+            [{"path": c["path"], "chunk_id": c["chunk_id"], "heading": c.get("heading", ""),
+              "start_line": c["start_line"], "end_line": c["end_line"], "score": 1, "rrf_score": 0.5,
+              "source_sha256": c["file_sha256"]} for c in ch],
+            source_chunks=ch,
+        ),
+    )
+    monkeypatch.setattr(
+        deep_research, "_call_ollama_json",
+        lambda *a, **k: (
+            {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+            if a[1] == deep_research.DEEP_VERIFY_SYSTEM
+            else {"queries": [], "unresolved": []} if a[1] == deep_research.DEEP_GAPS_SYSTEM
+            else {"subject": "押印", "scope": "会計事務", "conditions": [], "exceptions": [], "references": []}
+        ),
+    )
+    monkeypatch.setattr(deep_research, "_call_ollama_text", lambda *a, **k: "記名が必要。[E1]")
+    result = deep_research.run_deep_research(
+        "請求書の記名", model="m", source_root=root, timeout_seconds=300,
+        fixed_document={"path": "notice.md", "sha256": sha, "focus_ranges": [[6, 9]], "primary": False},
+    )
+    seen_paths = {e["path"] for e in result.evidence}
+    assert seen_paths == {"notice.md"} and other["path"] not in seen_paths
+    assert (result.evidence[0]["start_line"], result.evidence[0]["end_line"]) == (6, 9)
+    changed = deep_research.run_deep_research(
+        "請求書の記名", model="m", source_root=root, timeout_seconds=300,
+        fixed_document={"path": "notice.md", "sha256": "0" * 64},
+    )
+    assert changed.evidence == [] and any(u.startswith("source_changed") for u in changed.unconfirmed)
+
+
+def test_fixed_document_limits_normal_evidence_to_the_focus_range(tmp_path):
+    root = _corpus(tmp_path)
+    sha = hashlib.sha256((root / "notice.md").read_bytes()).hexdigest()
+    items, _ = search._with_primary_ranges(
+        "請求書の記名", [], source_root=root, chunks=None, char_budget=8000, item_limit=5,
+        forced={"path": "notice.md", "title": "通知", "sha256": sha, "focus_ranges": [[10, 11]], "primary": False},
+    )
+    assert [(i["start_line"], i["end_line"]) for i in items] == [(10, 11)]
+    assert search._with_primary_ranges(
+        "q", [], source_root=root, chunks=None, char_budget=8000, item_limit=5,
+        forced={"path": "notice.md", "title": "通知", "sha256": sha, "focus_ranges": [], "primary": False},
+    ) == ([], [])
+    assert search._with_primary_ranges(
+        "q", [], source_root=root, chunks=None, char_budget=8000, item_limit=5,
+        forced={"path": "notice.md", "title": "通知", "sha256": "0" * 64, "focus_ranges": [[10, 11]]},
+    ) == ([], [])

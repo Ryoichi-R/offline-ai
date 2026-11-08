@@ -100,6 +100,15 @@ except ValueError as exc:
 from source_folder import (
     SourceFolderError, describe_source_folder, pick_source_folder, save_source_root,
 )
+from guided_follow_up import (
+    ACTIONS as GUIDED_ACTIONS,
+    ACTION_FOLLOW_UP,
+    ACTION_HINT,
+    ConfirmationError,
+    ConfirmationStore,
+    guided_enabled,
+    normalize_follow_up_text,
+)
 
 logger = logging.getLogger("offlineai.server")
 
@@ -343,6 +352,8 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self._shutdown_once = threading.Event()
         self.index_coordinator = IndexCoordinator()
         self.evidence_registry = evidence_registry or create_evidence_registry()
+        # 確認案内（既定は無効）の確認情報。サーバーのメモリ内だけに置く。
+        self.confirmation_store = ConfirmationStore()
         # web.bat（非表示起動）だけが設定する。None ならページを閉じても停止しない。
         self.page_presence = page_presence
         self.chat_model = chat_model
@@ -413,7 +424,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
 class OfflineAIHandler(BaseHTTPRequestHandler):
     """offline-ai Web UI HTTP ハンドラ。"""
 
-    server_version = "OfflineAI/0.1.1"
+    server_version = "OfflineAI/0.2.0"
 
     def log_message(self, format, *args):
         """デフォルトのログ出力を抑制（構造化ログに統一）。"""
@@ -817,6 +828,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_search()
         elif path == "/api/evidence/view":
             self._handle_evidence_view(parsed)
+        elif path == "/api/confirmation":
+            self._handle_confirmation_view(parsed)
         else:
             self.send_error(404)
 
@@ -841,6 +854,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_index_cancel()
         elif path == "/api/search/cancel":
             self._handle_search_cancel()
+        elif path == "/api/search":
+            self._handle_search_continue()
         elif path == "/api/page/heartbeat":
             self._handle_page_presence(closing=False)
         elif path == "/api/page/close":
@@ -1141,11 +1156,13 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             stall_timeout=getattr(self.server, "generation_stall_timeout", GENERATION_STALL_TIMEOUT),
             defer_stall=True,
         )
+        # 確認案内が有効なら、深掘りの確認段階は深掘り枠を消費しない。
+        guided = guided_enabled() and mode in {"answer", "deep"}
         try:
             fingerprint = (session_id, query, reasoning, timeout_seconds, mode)
             entry, is_new = self.server.job_table.submit(
                 request_id, cancel_token, fingerprint=fingerprint, mode=mode,
-                resume_only=resume_only,
+                resume_only=resume_only, defer_deep_slot=guided and mode == "deep",
             )
         except JobNotFoundError:
             self._send_error_json(
@@ -1165,48 +1182,17 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             return
 
         if is_new:
-            self.server.register_token(cancel_token)
-            bcast_queue = _BroadcastQueue(entry)
-
-            log_structured(request_id, phase="search_start",
-                           query_length=len(query),
-                           timeout_seconds=timeout_seconds,
-                           user_agent=self.headers.get("User-Agent", ""),
-                           remote_addr=self.client_address[0])
-
-            def _worker():
-                try:
-                    kwargs = {
-                        "mode": mode,
-                        "started_at": datetime.now(timezone.utc).isoformat(
-                            timespec="milliseconds"
-                        ).replace("+00:00", "Z"),
-                        "session_id": session_id,
-                        "evidence_registry": self.server.evidence_registry,
-                    }
-                    run_parameters = inspect.signature(run_search).parameters
-                    if "model_name" in run_parameters:
-                        kwargs["model_name"] = getattr(self.server, "chat_model", None)
-                    if "model_digest" in run_parameters:
-                        kwargs["model_digest"] = getattr(self.server, "model_digest", None)
-                    if "model_selection_source" in run_parameters:
-                        kwargs["model_selection_source"] = getattr(
-                            self.server, "model_selection_source", None
-                        )
-                    if "mode" in run_parameters:
-                        run_search(
-                            query, reasoning, bcast_queue, cancel_token, request_id,
-                            **kwargs,
-                        )
-                    else:
-                        # 旧 fake/reader の worker seam を壊さない。
-                        run_search(query, reasoning, bcast_queue, cancel_token, request_id)
-                finally:
-                    self.server.job_table.finish(request_id)
-                    self.server.unregister_token(cancel_token)
-                    log_structured(request_id, phase="search_end")
-
-            threading.Thread(target=_worker, daemon=True).start()
+            guided_kwargs = {}
+            if guided:
+                guided_kwargs["confirmation_store"] = self.server.confirmation_store
+                if mode == "deep":
+                    guided_kwargs["acquire_deep_slot"] = (
+                        lambda: self.server.job_table.acquire_deep_slot(request_id)
+                    )
+            self._spawn_search_worker(
+                entry, request_id, query, reasoning, cancel_token, mode, session_id,
+                timeout_seconds, guided_kwargs,
+            )
 
         # 購読（新規でも既存でも同じ）
         sub_queue = entry.add_subscriber()
@@ -1214,6 +1200,206 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._begin_sse(close_on_terminal=True)
             self._stream_events(sub_queue, entry.cancel_token,
                                 cancel_on_disconnect=False)
+        finally:
+            entry.remove_subscriber(sub_queue)
+
+    def _spawn_search_worker(self, entry, request_id, query, reasoning, cancel_token,
+                             mode, session_id, timeout_seconds, extra_kwargs):
+        """検索ワーカーを起動する（GET の検索と確認案内の続きで共用）。"""
+        self.server.register_token(cancel_token)
+        bcast_queue = _BroadcastQueue(entry)
+
+        log_structured(request_id, phase="search_start",
+                       query_length=len(query),
+                       timeout_seconds=timeout_seconds,
+                       user_agent=self.headers.get("User-Agent", ""),
+                       remote_addr=self.client_address[0])
+
+        def _worker():
+            try:
+                kwargs = {
+                    "mode": mode,
+                    "started_at": datetime.now(timezone.utc).isoformat(
+                        timespec="milliseconds"
+                    ).replace("+00:00", "Z"),
+                    "session_id": session_id,
+                    "evidence_registry": self.server.evidence_registry,
+                }
+                run_parameters = inspect.signature(run_search).parameters
+                for key, value in extra_kwargs.items():
+                    if key in run_parameters:
+                        kwargs[key] = value
+                if "model_name" in run_parameters:
+                    kwargs["model_name"] = getattr(self.server, "chat_model", None)
+                if "model_digest" in run_parameters:
+                    kwargs["model_digest"] = getattr(self.server, "model_digest", None)
+                if "model_selection_source" in run_parameters:
+                    kwargs["model_selection_source"] = getattr(
+                        self.server, "model_selection_source", None
+                    )
+                if "mode" in run_parameters:
+                    run_search(
+                        query, reasoning, bcast_queue, cancel_token, request_id,
+                        **kwargs,
+                    )
+                else:
+                    # 旧 fake/reader の worker seam を壊さない。
+                    run_search(query, reasoning, bcast_queue, cancel_token, request_id)
+            finally:
+                self.server.job_table.finish(request_id)
+                self.server.unregister_token(cancel_token)
+                log_structured(request_id, phase="search_end")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # --- 確認案内の続き（POST /api/search）と確認パネルの復元 ---
+
+    def _handle_confirmation_view(self, parsed):
+        session_id = self._get_auth_session_id()
+        if not session_id:
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        if not guided_enabled():
+            self.send_error(404)
+            return
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        values = params.get("id", [])
+        try:
+            if len(values) != 1:
+                raise ConfirmationError("confirmation_invalid", "確認IDが不正です")
+            # 読み取り専用。期限を延長しない。
+            public = self.server.confirmation_store.view(values[0], session_id)
+        except ConfirmationError as exc:
+            self._send_error_json(exc.code, str(exc))
+            return
+        self._send_json({"confirmation": public})
+
+    def _handle_search_continue(self):
+        session_id = self._get_auth_session_id()
+        if not session_id:
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        if not guided_enabled():
+            self.send_error(404)
+            return
+        try:
+            payload = self._read_json_body(max_bytes=MAX_REQUEST_LINE)
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error_json("invalid_query", f"送信内容が不正です（{MAX_REQUEST_LINE}バイト以内）")
+            return
+        mode = payload.get("mode", "answer")
+        if mode not in {"answer", "deep"}:
+            self._send_error_json("invalid_mode", "検索モードが不正です")
+            return
+        action = payload.get("action")
+        cid = payload.get("confirmationId")
+        if action not in GUIDED_ACTIONS or not isinstance(cid, str):
+            self._send_error_json("confirmation_invalid", "確認の操作が不正です")
+            return
+        resume_only = payload.get("resume_only") is True
+        request_id = str(payload.get("requestId") or "").strip()
+        if resume_only and not request_id:
+            self._send_error_json("invalid_query", "再接続には検索IDが必要です")
+            return
+        request_id = request_id or generate_request_id()
+        reasoning = str(payload.get("reasoning") or "").strip()
+        choice = payload.get("choice")
+        if choice is not None and (isinstance(choice, bool) or not isinstance(choice, int)):
+            self._send_error_json("confirmation_invalid", "選択肢が不正です")
+            return
+        options_version = payload.get("optionsVersion")
+        text = ""
+        try:
+            if action in {ACTION_HINT, ACTION_FOLLOW_UP}:
+                text = normalize_follow_up_text(payload.get("text"))
+        except ConfirmationError as exc:
+            self._send_error_json(exc.code, str(exc))
+            return
+        drop_targets = payload.get("dropTargets") or []
+        if (
+            not isinstance(drop_targets, list)
+            or len(drop_targets) > 20
+            or any(not isinstance(t, str) or len(t) > 100 for t in drop_targets)
+        ):
+            self._send_error_json("confirmation_invalid", "外す対象の指定が不正です")
+            return
+        timeout_values = payload.get("timeout_seconds")
+        try:
+            timeout_default = (
+                self.server.deep_search_timeout if mode == "deep" else self.server.search_timeout
+            )
+            timeout_seconds = _parse_search_timeout_param(
+                [] if timeout_values is None else [str(timeout_values)], timeout_default, mode
+            )
+        except ValueError:
+            self._send_error_json("invalid_timeout", "タイムアウトの指定が不正です")
+            return
+
+        identity = json.dumps(
+            [cid, action, options_version, choice, text, sorted(drop_targets)], ensure_ascii=False
+        )
+        fingerprint = (session_id, "guided\x00" + identity, reasoning, timeout_seconds, mode)
+        cancel_token = CancellationToken(
+            timeout_seconds,
+            stall_timeout=getattr(self.server, "generation_stall_timeout", GENERATION_STALL_TIMEOUT),
+            defer_stall=True,
+        )
+        job_table = self.server.job_table
+        existing = job_table.get(request_id)
+        record = None
+        if not resume_only and existing is None:
+            # 新規ジョブだけが確認IDの有効性と現在の状態を検証する。
+            try:
+                record = self.server.confirmation_store.begin(
+                    cid, session_id, action=action, options_version=options_version,
+                    request_id=request_id,
+                )
+            except ConfirmationError as exc:
+                self._send_error_json(exc.code, str(exc))
+                return
+        try:
+            entry, is_new = job_table.submit(
+                request_id, cancel_token, fingerprint=fingerprint, mode=mode,
+                resume_only=resume_only or existing is not None, defer_deep_slot=True,
+            )
+        except JobNotFoundError:
+            self._send_error_json(
+                "job_not_found",
+                "再接続先の調査が見つかりません。保持期限切れ、またはサーバーが再起動した可能性があります。自動で新しい調査は開始しません。",
+            )
+            return
+        except RequestConflictError:
+            self._send_error_json("request_conflict", "request_id は別の検索条件で既に使用されています")
+            return
+        except RuntimeError:
+            if record is not None:
+                self.server.confirmation_store.finish(cid, request_id, completed=False)
+            self._send_error_json("server_busy", "サーバーが処理中です。しばらく待ってから再試行してください")
+            return
+
+        if is_new:
+            guided_request = {
+                "confirmationId": cid,
+                "action": action,
+                "choice": choice,
+                "text": text,
+                "dropTargets": list(drop_targets),
+                "record": record,
+            }
+            extra = {
+                "confirmation_store": self.server.confirmation_store,
+                "guided_request": guided_request,
+            }
+            if mode == "deep":
+                extra["acquire_deep_slot"] = lambda: job_table.acquire_deep_slot(request_id)
+            self._spawn_search_worker(
+                entry, request_id, record.initial_query, reasoning, cancel_token, mode,
+                session_id, timeout_seconds, extra,
+            )
+        sub_queue = entry.add_subscriber()
+        try:
+            self._begin_sse(close_on_terminal=True)
+            self._stream_events(sub_queue, entry.cancel_token, cancel_on_disconnect=False)
         finally:
             entry.remove_subscriber(sub_queue)
 

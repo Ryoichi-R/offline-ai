@@ -1,5 +1,12 @@
 # offline-ai 内部アーキテクチャ
 
+## 確認案内と追質問（2026-11-08、`OFFLINE_AI_GUIDED_FOLLOW_UP=1`、既定は無効）
+
+設計正本は[確認質問と段階的な深掘りのプラン](../../plans/offline-ai-guided-follow-up-plan.md)。`guided_follow_up.py`はモデルを呼ばない決定的な部分（資料の照合結果からの振り分け、原文からの概要・選択肢の抽出、追質問の対象と論点の解決、確認情報の期限・件数・直列化）を持つ。資料の照合（表題の中核・文書番号）と主要範囲の選定は`source_structure.py`、質問範囲の判定（overview/specific/broad）は`answer_policy.classify_guided_scope`（v2の`_ASPECT_CUES`とは別表）にある。Webは`run_search`がモデル検出前に確認段階を処理し、確認結果は`clarification`イベントと`done`（`stage: "clarify"`）で返す。続きは`POST /api/search`、パネル復元は`GET /api/confirmation`。固定した資料は`fixed_document`として通常回答（`run_retrieval_pipeline`）と深掘り（`run_deep_research`）へ渡し、根拠・候補をその資料と焦点範囲に限る。深掘り枠は`JobTable.acquire_deep_slot`で実調査の直前に取る。
+
+段階1（既定で有効）: 資料が1つに確定し特定の項目を尋ねない質問では、通常回答・深掘りとも確定した資料の主要節を節ごとに先頭から根拠へ加える（宛先・単独の適用日・照会先は後回し、読めない主要範囲は警告）。SSE・保存の抜粋は回答・抽出内容に対応する箇所を優先し、抜粋自体の行範囲と省略を記録する。
+
+
 ## 回答方針v2（2026-10-01、移行中。既定はlegacy）
 
 質問への適合・根拠選択・文章品質を改める回答方針。`OFFLINE_AI_ANSWER_POLICY_VERSION=v2`（未指定・`legacy`は従来経路）で有効になり、方針は**要求ごとに一度だけ解決**して検索・選別・回答の全経路を固定する。v2の失敗時にlegacyへ無通知でfallbackしない。legacyは品質既知不合格であり、合格な代替として扱わない。設計正本は[回答品質の再設計プラン](../../plans/offline-ai-answer-quality-redesign-plan.md)。

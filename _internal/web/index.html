@@ -263,6 +263,18 @@ body {
 .quality-msg.quality-review { background: #fffbeb; border: 1px solid #f59e0b; color: #92400e; font-weight: 600; }
 
 
+.guided-panel { margin: 12px 0; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; }
+.guided-panel h3 { margin: 0 0 6px; font-size: 1em; }
+.guided-message { margin: 4px 0 8px; }
+.guided-points { margin: 6px 0; padding-left: 1.4em; }
+.guided-point-text { white-space: pre-wrap; }
+.guided-point-meta { color: #64748b; font-size: 0.85em; }
+.guided-options { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.guided-topic { margin: 6px 0; font-size: 0.92em; }
+.guided-chip { display: inline-flex; align-items: center; gap: 4px; margin-right: 6px; padding: 1px 6px; border: 1px solid #94a3b8; border-radius: 10px; }
+.guided-chip.removed { text-decoration: line-through; color: #94a3b8; }
+.guided-follow { display: flex; gap: 6px; align-items: flex-start; margin-top: 8px; }
+.guided-follow textarea { flex: 1; min-height: 3em; }
 .error-msg {
     color: #ef4444;
     background: #fef2f2;
@@ -363,6 +375,19 @@ body {
         <div id="searchWarning" class="warning-msg" hidden></div>
         <div id="answerQuality" class="quality-msg" role="status" hidden></div>
         <div id="searchError" class="error-msg" hidden></div>
+        <section id="guidedPanel" class="guided-panel" aria-live="polite" hidden>
+            <h3 id="guidedTitle"></h3>
+            <p id="guidedMessage" class="guided-message"></p>
+            <ol id="guidedPoints" class="guided-points"></ol>
+            <div id="guidedOptions" class="guided-options"></div>
+            <div id="guidedTopic" class="guided-topic"></div>
+            <div class="guided-follow">
+                <label class="search-label" for="guidedInput" id="guidedInputLabel">この資料への追質問</label>
+                <textarea id="guidedInput" rows="2" maxlength="1000"></textarea>
+                <button class="btn btn-primary" id="guidedSendBtn" type="button">送信</button>
+                <button class="btn btn-secondary" id="guidedUnpinBtn" type="button">固定を解除</button>
+            </div>
+        </section>
         <div class="result-actions">
             <button class="btn btn-secondary" id="saveMarkdownBtn" type="button" hidden>Markdownで保存</button>
             <span class="save-hint" id="saveMarkdownHint">質問・回答・根拠の抜粋が含まれます。</span>
@@ -432,6 +457,8 @@ function persistActiveSearch() {
             query: state.activeQuery,
             reasoning: state.activeReasoning,
             timeoutSeconds: state.activeTimeoutSeconds,
+            // 確認案内の続き（POST）。確認IDと操作だけで、概要・抜粋は保存しない。
+            guided: state.activeGuided || null,
         }));
         return true;
     } catch {
@@ -459,10 +486,33 @@ function loadPersistedSearch() {
             || typeof data.requestId !== "string" || !data.requestId
             || typeof data.reasoning !== "string"
             || !Number.isFinite(data.timeoutSeconds)
+            || (data.guided !== null && data.guided !== undefined
+                && (typeof data.guided !== "object" || typeof data.guided.confirmationId !== "string"))
         ) return null;
         return data;
     } catch {
         return null;
+    }
+}
+
+// --- guidedStorage ---
+// 確認案内のタブ単位の確認ID。概要・抜粋・質問履歴は保存しない。
+const GUIDED_STORAGE_KEY = "offlineai.guidedConfirmation";
+
+function persistGuidedId(confirmationId) {
+    try {
+        if (confirmationId) sessionStorage.setItem(GUIDED_STORAGE_KEY, confirmationId);
+        else sessionStorage.removeItem(GUIDED_STORAGE_KEY);
+    } catch {
+        // no-op
+    }
+}
+
+function loadGuidedId() {
+    try {
+        return sessionStorage.getItem(GUIDED_STORAGE_KEY) || "";
+    } catch {
+        return "";
     }
 }
 
@@ -936,6 +986,59 @@ const api = {
         return ctrl;
     },
 
+    async confirmation(confirmationId) {
+        const res = await fetch(`/api/confirmation?id=${encodeURIComponent(confirmationId)}`);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw Object.assign(new Error(data.error?.message || `HTTP ${res.status}`), { code: data.error?.code });
+        return data.confirmation;
+    },
+
+    // 確認案内の続きはPOSTで送る（日本語1000文字がURLの上限を超えるため）。
+    guidedSSE(body, callbacks) {
+        const ctrl = new AbortController();
+        state.searchAbort = ctrl;
+        const payload = { ...body, requestId: state.activeRequestId };
+        if (callbacks.resumeOnly) payload.resume_only = true;
+        fetch("/api/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: ctrl.signal,
+        })
+            .then(async (res) => {
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    callbacks.onError(err.error?.message || `HTTP ${res.status}`, {
+                        terminal: res.status >= 400 && res.status < 500 && ![408, 429].includes(res.status),
+                        code: err.error?.code,
+                    });
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() || "";
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            try {
+                                callbacks.onEvent(JSON.parse(line.slice(6)));
+                            } catch {}
+                        }
+                    }
+                }
+            })
+            .catch((err) => {
+                if (err.name !== "AbortError") callbacks.onError(err.message);
+            })
+            .finally(() => callbacks.onEnd());
+        return ctrl;
+    },
+
     async cancelSearch(requestId) {
         const res = await fetch("/api/search/cancel", {
             method: "POST",
@@ -1052,6 +1155,16 @@ const ui = {
             saveMarkdownHint: document.getElementById("saveMarkdownHint"),
             searchResult: document.getElementById("searchResult"),
             pageCloseHint: document.getElementById("pageCloseHint"),
+            guidedPanel: document.getElementById("guidedPanel"),
+            guidedTitle: document.getElementById("guidedTitle"),
+            guidedMessage: document.getElementById("guidedMessage"),
+            guidedPoints: document.getElementById("guidedPoints"),
+            guidedOptions: document.getElementById("guidedOptions"),
+            guidedTopic: document.getElementById("guidedTopic"),
+            guidedInput: document.getElementById("guidedInput"),
+            guidedInputLabel: document.getElementById("guidedInputLabel"),
+            guidedSendBtn: document.getElementById("guidedSendBtn"),
+            guidedUnpinBtn: document.getElementById("guidedUnpinBtn"),
         };
 
         this.bindEvents();
@@ -1059,6 +1172,7 @@ const ui = {
         this.updateSearchModeUI();
         pagePresence.start();
         this.pollHealth();
+        this.restoreGuidedPanel();
         this.resumeActiveSearch();
     },
 
@@ -1075,7 +1189,7 @@ const ui = {
         const resume = saved || (state.searchDisconnected ? {
             requestId: state.activeRequestId, query: state.activeQuery,
             mode: state.activeMode, reasoning: state.activeReasoning,
-            timeoutSeconds: state.activeTimeoutSeconds,
+            timeoutSeconds: state.activeTimeoutSeconds, guided: state.activeGuided || null,
         } : null);
         if (resume) this.startSearch(resume);
     },
@@ -1153,6 +1267,14 @@ const ui = {
         this.els.searchModeSelect.addEventListener("change", () => this.updateSearchModeUI());
         this.els.evidenceViewerCloseBtn.addEventListener("click", () => this.closeEvidenceViewer());
         this.els.saveMarkdownBtn.addEventListener("click", () => this.saveMarkdown());
+        this.els.guidedSendBtn.addEventListener("click", () => this.sendGuidedText());
+        this.els.guidedUnpinBtn.addEventListener("click", () => this.clearGuided());
+        this.els.guidedInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing && e.keyCode !== 229 && !state.searching) {
+                e.preventDefault();
+                this.sendGuidedText();
+            }
+        });
         this.els.searchInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing && e.keyCode !== 229 && !state.searching) {
                 e.preventDefault();
@@ -1341,9 +1463,15 @@ const ui = {
         if (state.cancelPending || (state.searching && (!resume || !state.searchDisconnected))) return;
         // Invalidate old callbacks before aborting an earlier subscription.
         if (state.searchAbort) state.searchAbort.abort();
-        const query = resume ? resume.query : this.els.searchInput.value.trim();
+        // resume.fresh は確認案内の続きの新規送信（再接続ではない）。
+        const source = resume;
+        const fresh = Boolean(resume && resume.fresh);
+        const query = source ? source.query : this.els.searchInput.value.trim();
         if (!query) return;
-        const selectedMode = resume ? resume.mode : this.els.searchModeSelect.value;
+        // メイン入力欄からの新しい質問は、常に資料を改めて特定する（確認の続きではない）。
+        const guidedBody = source ? (source.guided || null) : null;
+        if (!source) this.clearGuided();
+        const selectedMode = source ? source.mode : this.els.searchModeSelect.value;
         const mode = ["answer", "search", "deep"].includes(selectedMode) ? selectedMode : "answer";
         if (!resume) {
             const featureAvailable = mode === "search" ? state.features.retrieval : state.features.search;
@@ -1358,19 +1486,20 @@ const ui = {
 
         const searchId = ++state.searchSequence;
         state.activeSearchId = searchId;
-        state.activeRequestId = resume
+        state.activeRequestId = resume && !fresh
             ? resume.requestId
             : (crypto.randomUUID ? crypto.randomUUID() : `req-${Date.now()}-${searchId}`);
+        state.activeGuided = guidedBody;
         state.searching = true;
         state.searchDisconnected = false;
         state.rawSearchText = "";
         state.rawThinkingText = "";
         state.activeMode = mode;
         state.activeQuery = query;
-        state.activeReasoning = resume
-            ? resume.reasoning
+        state.activeReasoning = source
+            ? source.reasoning
             : (mode === "search" ? "off" : (this.els.reasoningSelect.value || "off"));
-        state.activeTimeoutSeconds = resume ? resume.timeoutSeconds
+        state.activeTimeoutSeconds = source ? source.timeoutSeconds
             : parseInt(this.els.searchTimeoutInput.value, 10);
         state.resultMeta = null;
         state.resultEvidence = null;
@@ -1379,7 +1508,7 @@ const ui = {
         state.resultAnswerEmpty = false;
         state.resultAnswerQuality = null;
         this.renderAnswerQuality();
-        if (resume) {
+        if (resume && !guidedBody) {
             this.els.searchInput.value = query;
             this.els.searchModeSelect.value = mode;
             if (mode !== "search") this.els.reasoningSelect.value = state.activeReasoning;
@@ -1408,13 +1537,14 @@ const ui = {
         this.els.searchInput.disabled = true;
         this.els.searchModeSelect.disabled = true;
         this.els.searchTimeoutInput.disabled = true;
+        this.setGuidedBusy(true);
         this.updateSearchModeUI();
         this.clearBudgetTimer();
         if (!persistActiveSearch()) {
             this.els.searchWarning.textContent = "このブラウザでは再接続情報を保存できません。調査中の再読み込みを避けてください。";
             this.els.searchWarning.hidden = false;
         }
-        if (resume) {
+        if (resume && !fresh) {
             this.els.searchStatus.textContent = "進行中の調査に再接続しています…";
             this.els.searchStatus.hidden = false;
         }
@@ -1446,8 +1576,9 @@ const ui = {
             this.els.searchInput.disabled = false;
             this.els.searchModeSelect.disabled = false;
             this.els.searchTimeoutInput.disabled = false;
+            this.setGuidedBusy(false);
             this.updateSearchModeUI();
-            this.els.searchInput.focus();
+            if (!state.guided) this.els.searchInput.focus();
             clearTimeout(renderTimer);
             clearTimeout(thinkingRenderTimer);
             this.clearBudgetTimer();
@@ -1471,8 +1602,11 @@ const ui = {
             // Keep request identity and inputs locked; EOF is not a terminal result.
         };
 
-        api.searchSSE(query, mode, reasoning, timeoutSeconds, {
-            resumeOnly: Boolean(resume),
+        const subscribe = guidedBody
+            ? (callbacks) => api.guidedSSE(guidedBody, callbacks)
+            : (callbacks) => api.searchSSE(query, mode, reasoning, timeoutSeconds, callbacks);
+        subscribe({
+            resumeOnly: Boolean(resume) && !fresh,
             onEvent: (ev) => {
                 // 遅い旧SSEのfinally/onEndやreconnect replayが、次の検索の
                 // DOMと操作状態を上書きしない。
@@ -1536,6 +1670,18 @@ const ui = {
                         ? "モデルの出力上限に達したため回答本文を生成できませんでした。「推論: 非表示」で再試行するか、OLLAMA_NUM_CTX を大きくしてください。"
                         : "回答本文が生成されませんでした。再試行してください。";
                     this.els.searchWarning.hidden = false;
+                } else if (ev.type === "clarification") {
+                    this.applyGuided(ev);
+                } else if (ev.type === "confirmation_state") {
+                    this.applyGuided(ev);
+                    if (guidedBody && ["follow_up", "hint"].includes(guidedBody.action)) this.els.guidedInput.value = "";
+                } else if (ev.type === "done" && ev.stage === "clarify") {
+                    // 確認段階の完了: 深掘りの状態表示・回答本文の描画を行わず、保存もしない。
+                    this.els.searchStatus.hidden = true;
+                    this.clearBudgetTimer();
+                    this.els.saveMarkdownBtn.hidden = true;
+                    if (guidedBody && guidedBody.action === "hint") this.els.guidedInput.value = "";
+                    finishSearch();
                 } else if (ev.type === "done") {
                     this.els.searchStatus.hidden = true;
                     if (state.activeMode === "deep") {
@@ -1575,6 +1721,7 @@ const ui = {
                 } else if (ev.type === "error") {
                     this.els.searchError.textContent = ev.message || "エラーが発生しました";
                     this.els.searchError.hidden = false;
+                    if (["confirmation_expired", "source_changed"].includes(ev.code) && guidedBody) this.clearGuided();
                     this.els.searchStatus.hidden = true;
                     this.clearBudgetTimer();
                     state.resultMeta = null;
@@ -1591,6 +1738,7 @@ const ui = {
                 if (state.activeSearchId !== searchId || !state.searching) return;
                 this.els.searchError.textContent = msg;
                 this.els.searchError.hidden = false;
+                if (details.code === "confirmation_expired" && guidedBody) this.clearGuided();
                 state.resultMeta = null;
                 state.resultEvidence = null;
                 state.resultAnswerQuality = null;
@@ -1612,6 +1760,145 @@ const ui = {
                 suspendSearch();
             },
         });
+    },
+
+    // --- 確認案内（資料の固定・論点・追質問）---
+    applyGuided(data) {
+        const previous = state.guided || {};
+        state.guided = { ...previous, ...data, removedTargets: [] };
+        if (data.type === "confirmation_state") delete state.guided.ask;
+        persistGuidedId(state.guided.confirmationId);
+        this.renderGuided();
+    },
+
+    clearGuided() {
+        state.guided = null;
+        persistGuidedId("");
+        if (this.els.guidedPanel) this.els.guidedPanel.hidden = true;
+    },
+
+    async restoreGuidedPanel() {
+        const confirmationId = loadGuidedId();
+        if (!confirmationId) return;
+        try {
+            // 読み取り専用の受け口。期限を延長しない。
+            this.applyGuided(await api.confirmation(confirmationId));
+        } catch (err) {
+            this.clearGuided();
+            if (err.code === "confirmation_expired") {
+                this.els.searchWarning.textContent = "確認の有効期限が切れました。もう一度質問してください。";
+                this.els.searchWarning.hidden = false;
+            }
+        }
+    },
+
+    setGuidedBusy(busy) {
+        if (!this.els.guidedPanel) return;
+        for (const el of this.els.guidedPanel.querySelectorAll ? this.els.guidedPanel.querySelectorAll("button, textarea") : []) {
+            if (el !== this.els.guidedUnpinBtn) el.disabled = busy;
+        }
+    },
+
+    renderGuided() {
+        const g = state.guided;
+        const els = this.els;
+        if (!g) {
+            els.guidedPanel.hidden = true;
+            return;
+        }
+        els.guidedPanel.hidden = false;
+        const fixed = g.state === "document_fixed";
+        els.guidedTitle.textContent = fixed
+            ? `固定中の資料: ${g.document?.title || g.document?.path || ""}`
+            : "対象の資料を確認してください";
+        els.guidedMessage.textContent = (g.ask && g.ask.message) || g.message || "";
+        els.guidedPoints.replaceChildren();
+        for (const point of (fixed ? g.points || [] : [])) {
+            const li = document.createElement("li");
+            const text = document.createElement("div");
+            text.className = "guided-point-text";
+            text.textContent = point.kind === "guide"
+                ? `${point.heading || "該当箇所"}（長い本文のため原文の該当箇所を参照してください）`
+                : point.text;
+            const meta = document.createElement("div");
+            meta.className = "guided-point-meta";
+            meta.textContent = `${point.heading ? point.heading + " / " : ""}行 ${point.startLine}-${point.endLine}`;
+            li.append(text, meta);
+            els.guidedPoints.appendChild(li);
+        }
+        els.guidedOptions.replaceChildren();
+        const items = fixed ? (g.options || []) : (g.candidates || []);
+        items.forEach((item, index) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "btn btn-secondary";
+            const extra = fixed ? "" : [item.kind, item.date].filter(Boolean).join(" / ");
+            button.textContent = `${index + 1}. ${fixed ? item.label : item.title}${extra ? `（${extra}）` : ""}`;
+            button.addEventListener("click", () => this.sendGuided({
+                action: fixed ? "select_topic" : "select_document",
+                choice: index,
+                optionsVersion: g.optionsVersion,
+            }, button.textContent));
+            els.guidedOptions.appendChild(button);
+        });
+        els.guidedTopic.replaceChildren();
+        if (fixed && g.topic) {
+            const parts = [];
+            if (g.topic.section) parts.push(`論点: ${g.topic.section.label}`);
+            if (parts.length) els.guidedTopic.append(parts.join(" "));
+            for (const target of g.topic.targets || []) {
+                const chip = document.createElement("span");
+                const removed = (g.removedTargets || []).includes(target);
+                chip.className = removed ? "guided-chip removed" : "guided-chip";
+                chip.append(`対象: ${target}`);
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.className = "btn btn-secondary";
+                remove.textContent = removed ? "戻す" : "外す";
+                remove.addEventListener("click", () => {
+                    const list = new Set(state.guided.removedTargets || []);
+                    if (list.has(target)) list.delete(target); else list.add(target);
+                    state.guided.removedTargets = [...list];
+                    this.renderGuided();
+                });
+                chip.appendChild(remove);
+                els.guidedTopic.appendChild(chip);
+            }
+        }
+        els.guidedInputLabel.textContent = fixed ? "この資料への追質問" : "手掛かり（発出年・発出者・文書番号など）";
+    },
+
+    sendGuidedText() {
+        const g = state.guided;
+        const text = this.els.guidedInput.value.trim();
+        if (!g || !text || state.searching) return;
+        if ([...text].length > 1000) {
+            this.els.searchError.textContent = "入力は1000文字以内にしてください。";
+            this.els.searchError.hidden = false;
+            return;
+        }
+        const fixed = g.state === "document_fixed";
+        this.sendGuided({
+            action: fixed ? "follow_up" : "hint",
+            text,
+            dropTargets: fixed ? (g.removedTargets || []) : [],
+        }, text);
+    },
+
+    sendGuided(fields, label) {
+        const g = state.guided;
+        if (!g || state.searching) return;
+        const mode = ["answer", "deep"].includes(this.els.searchModeSelect.value) ? this.els.searchModeSelect.value : "answer";
+        const reasoning = this.els.reasoningSelect.value || "off";
+        const timeoutSeconds = parseInt(this.els.searchTimeoutInput.value, 10);
+        const body = {
+            confirmationId: g.confirmationId,
+            mode,
+            reasoning,
+            ...(Number.isFinite(timeoutSeconds) ? { timeout_seconds: timeoutSeconds } : {}),
+            ...fields,
+        };
+        this.startSearch({ query: label, mode, reasoning, timeoutSeconds, guided: body, fresh: true });
     },
 
     startBudgetDisplay(timeoutSeconds, remainingSeconds) {

@@ -5712,6 +5712,7 @@ def _with_primary_ranges(
     chunks: list[dict] | None,
     char_budget: int,
     item_limit: int,
+    forced: dict | None = None,
 ) -> tuple[list[dict], list[str]]:
     """確定した資料の主要範囲を根拠の先頭へ加え、読めない主要範囲を警告にする。
 
@@ -5720,24 +5721,32 @@ def _with_primary_ranges(
     節は1件にまとめ、件数枠の1件は検索ヒット用に残す。チャンク検索が無効
     （``chunks`` が None）なら従来どおり何もしない。
     """
-    if not chunks:
-        return evidence_items, []
-    matched = _source_structure.match_documents(
-        query, _source_structure.documents_from_chunks(chunks)
-    )
-    path = matched["confirmed"]
-    if not path:
-        return evidence_items, []
-    title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
-    scope = _answer_policy.classify_guided_scope(
-        query, exclude_texts=(title, _source_structure.title_core(title))
-    )
-    if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC:
-        return evidence_items, []
-    expected_sha = next(
-        (str(c.get("file_sha256") or "") for c in chunks if str(c.get("path") or "").replace("\\", "/") == path),
-        "",
-    )
+    focus_ranges = None
+    if forced:
+        # 確認案内で固定した資料（guided-follow-up 段階2）。照合・範囲判定は済んでいる。
+        path, title, expected_sha = forced["path"], forced.get("title") or forced["path"], forced["sha256"]
+        focus_ranges = forced.get("focus_ranges") or None
+        if not forced.get("primary", True) and not focus_ranges:
+            return evidence_items, []
+    else:
+        if not chunks:
+            return evidence_items, []
+        matched = _source_structure.match_documents(
+            query, _source_structure.documents_from_chunks(chunks)
+        )
+        path = matched["confirmed"]
+        if not path:
+            return evidence_items, []
+        title = next(item["title"] for item in matched["candidates"] if item["path"] == path)
+        scope = _answer_policy.classify_guided_scope(
+            query, exclude_texts=(title, _source_structure.title_core(title))
+        )
+        if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC:
+            return evidence_items, []
+        expected_sha = next(
+            (str(c.get("file_sha256") or "") for c in chunks if str(c.get("path") or "").replace("\\", "/") == path),
+            "",
+        )
     try:
         data = (Path(source_root) / path).read_bytes()
     except OSError:
@@ -5746,7 +5755,10 @@ def _with_primary_ranges(
         return evidence_items, []
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
-    selection = _source_structure.primary_section_ranges(text, budget_chars=max(0, char_budget))
+    if focus_ranges:
+        selection = _focus_selection(lines, focus_ranges, max(0, char_budget))
+    else:
+        selection = _source_structure.primary_section_ranges(text, budget_chars=max(0, char_budget))
     merged: list[dict] = []
     for item in selection["ranges"]:
         previous = merged[-1] if merged else None
@@ -5798,6 +5810,32 @@ def _with_primary_ranges(
     return primary_items + rest, warnings
 
 
+def _focus_selection(lines: list[str], focus_ranges, char_budget: int) -> dict:
+    """指定した焦点範囲を、各範囲の先頭から予算内で均等に取得する。"""
+    ranges, unread = [], []
+    valid = [
+        (max(1, int(a)), min(len(lines), int(b)))
+        for a, b in focus_ranges
+        if int(a) <= int(b) and int(a) <= len(lines)
+    ]
+    share = char_budget // max(1, len(valid))
+    for start, end in valid:
+        used, last = 0, start - 1
+        for line_no in range(start, end + 1):
+            cost = len(lines[line_no - 1]) + 1
+            if used + cost > share:
+                break
+            used += cost
+            last = line_no
+        if last >= start:
+            ranges.append(
+                {"start_line": start, "end_line": last, "heading": "", "section_end_line": end, "complete": last >= end}
+            )
+        if last < end:
+            unread.append({"start_line": max(start, last + 1), "end_line": end, "heading": ""})
+    return {"ranges": ranges, "unread": unread, "ancillary": []}
+
+
 def run_retrieval_pipeline(
     query: str,
     *,
@@ -5808,6 +5846,7 @@ def run_retrieval_pipeline(
     mode: str = "answer",
     remaining_seconds=None,
     answer_policy: str | None = None,
+    fixed_document: dict | None = None,
 ) -> RetrievalResult:
     """CLI/Web 共通の bounded retrieval pipeline。
 
@@ -5818,6 +5857,9 @@ def run_retrieval_pipeline(
     等）が持つ全体の残り秒数を返すコールバック。案Aの検証予算の逆算に使う。
     ``None``（CLI等、キャンセル・タイムアウト概念が無い経路）なら無制限として
     扱う。
+
+    ``fixed_document``: 確認案内で固定した資料（``path``・``title``・``sha256``、任意で
+    ``focus_ranges``）。回答の根拠をこの資料に限り、焦点範囲（無ければ主要範囲）を加える。
     """
 
     if mode not in {"answer", "search"}:
@@ -6128,11 +6170,17 @@ def run_retrieval_pipeline(
     # 資料が1つに確定し、特定の項目を尋ねていない質問では、確定した資料の主要範囲を
     # 節ごとに先頭から根拠へ加える（guided-follow-up 4.1）。検索ヒットが付随範囲に
     # 偏っても主要本文を回答へ渡す。複数資料・具体的な質問では従来どおり。
+    if fixed_document:
+        fixed_path = str(fixed_document["path"]).replace("\\", "/")
+        evidence_items = [
+            m for m in evidence_items if str(m.get("path") or "").replace("\\", "/") == fixed_path
+        ]
     evidence_items, primary_warnings = _with_primary_ranges(
         query,
         evidence_items,
         source_root=SKILL_SOURCE_DIR,
         chunks=source_chunks,
+        forced=fixed_document,
         char_budget=int(evidence_char_limit * PRIMARY_RANGE_BUDGET_SHARE),
         item_limit=final_evidence_match_limit(),
     )

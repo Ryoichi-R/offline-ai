@@ -2053,6 +2053,65 @@ def _primary_candidates(query, sources, chunks):
     ]
 
 
+def _restrict_to_document(sources, chunks, fixed_document, note):
+    """固定した資料だけを調査対象にする。検索時と同じハッシュでなければ対象を空にする。"""
+    path = str(fixed_document["path"]).replace("\\", "/")
+    source = sources.get(path)
+    if source is None or source[1] != fixed_document.get("sha256"):
+        note("source_changed", path)
+        return {}, []
+    return {path: source}, [c for c in chunks if str(c.get("path") or "").replace("\\", "/") == path]
+
+
+def _fixed_candidates(sources, fixed_document):
+    """固定した資料の焦点範囲（無ければ主要範囲）を、節ごとに先頭から読む候補にする。"""
+    path = str(fixed_document["path"]).replace("\\", "/")
+    source = sources.get(path)
+    if source is None:
+        return []
+    focus = fixed_document.get("focus_ranges") or []
+    if focus:
+        nodes = parse_heading_tree(source[2])
+        lines = source[3]
+        ranges = []
+        for start, end in focus:
+            inner = [
+                (node.heading_line,
+                 nodes[node.children_indices[0]].heading_line - 1 if node.children_indices else node.section_end_line,
+                 node.heading_text)
+                for node in nodes
+                if start <= node.heading_line <= end
+            ]
+            inner = [r for r in inner if any(line.strip() for line in lines[r[0]:r[1]])]
+            if not inner or inner[0][0] > start:
+                inner.insert(0, (start, min(end, inner[0][0] - 1) if inner else end, ""))
+            ranges.extend(inner)
+    elif fixed_document.get("primary", True):
+        units = [unit for unit in primary_units(source[2]) if not unit["ancillary"]]
+        ranges, depth = [], 0
+        while True:
+            layer = [unit["read_ranges"][depth] for unit in units if depth < len(unit["read_ranges"])]
+            if not layer:
+                break
+            ranges.extend(layer)
+            depth += 1
+    else:
+        return []
+    return [
+        {
+            "path": path,
+            "start_line": start,
+            "end_line": end,
+            "heading": heading,
+            "source_sha256": source[1],
+            "primary": True,
+            "max_units": 1,
+        }
+        for start, end, heading in dict.fromkeys(ranges)
+        if start <= end
+    ]
+
+
 def run_deep_research(
     query: str,
     *,
@@ -2071,7 +2130,10 @@ def run_deep_research(
     retrieval_embedding_cache_path: Path | None = None,
     retrieval_embedding_cache_sha256: str | None = None,
     answer_policy: str | None = None,
+    fixed_document: dict | None = None,
 ) -> DeepResearchResult:
+    """``fixed_document``: 確認案内で固定した資料（``path``・``sha256``、任意で
+    ``focus_ranges``・``primary``）。検索・候補選別・根拠をこの資料に限る。"""
     timeout_seconds = validate_deep_timeout_seconds(timeout_seconds)
     # Resolved once per request: every path inside this request is fixed to it.
     policy_version = ap.resolve_policy_version(answer_policy)
@@ -2504,7 +2566,11 @@ def run_deep_research(
             stage_clock.enter("retrieve")
         try:
             sources, chunks = _snapshot(root, budget, note)
-            _, primary_batch = _primary_candidates(query, sources, chunks)
+            if fixed_document:
+                sources, chunks = _restrict_to_document(sources, chunks, fixed_document, note)
+                primary_batch = _fixed_candidates(sources, fixed_document)
+            else:
+                _, primary_batch = _primary_candidates(query, sources, chunks)
             if not isolate_retrieval_embedding:
                 try:
                     import search as _search

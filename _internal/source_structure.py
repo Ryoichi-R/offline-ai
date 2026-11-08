@@ -427,7 +427,7 @@ def primary_section_ranges(text: str, *, budget_chars: int) -> dict:
 
 _MATCH_STRIP_RE = re.compile(r"[\s　、。，．,.・:：;；\"'“”‘’「」『』（）()\[\]【】〔〕<>＜＞/／\\|｜~〜～\-－―‐]+")
 _TITLE_NOISE_RE = re.compile(
-    r"[（(](?:通知|事務連絡|依頼|周知|お知らせ|案内|写し?)[）)]|について$|に関する(?:件|こと)?$|の件$"
+    r"[（(](?:通知|事務連絡|依頼|周知|お知らせ|案内|写し?|別添|別紙|参考)[0-9０-９]*[）)]|について$|に関する(?:件|こと)?$|の件$"
 )
 _DOCUMENT_NUMBER_RE = re.compile(r"第\s*([0-9０-９]+)\s*号")
 TITLE_CORE_MIN_CHARS = 4
