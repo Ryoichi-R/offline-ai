@@ -1,8 +1,10 @@
 """Candidate transfer contract tests; no live model or user corpus."""
 
+import hashlib
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 
 import pytest
@@ -348,10 +350,10 @@ class _FakeWorkerProcess:
 class _PendingWorkerProcess:
     def __init__(self):
         self.returncode = None
+        self.finished = threading.Event()
 
     def communicate(self, input=None, timeout=None):
-        if timeout is not None:
-            raise deep_transport.subprocess.TimeoutExpired("fake-worker", timeout)
+        self.finished.wait()
         return (b"", b"")
 
     def poll(self):
@@ -359,6 +361,7 @@ class _PendingWorkerProcess:
 
     def kill(self):
         self.returncode = -9
+        self.finished.set()
 
 
 @pytest.mark.parametrize("mode", ["cancel", "deadline"])
@@ -662,9 +665,14 @@ def test_cli_markdown_and_replay_preserve_the_same_human_reason(monkeypatch, cap
     monkeypatch.setattr(deep_research, "detect_deep_model", lambda: "fake")
     monkeypatch.setattr(deep_research, "run_deep_research", lambda *args, **kwargs: result)
     monkeypatch.setattr(
+        cli_search,
+        "get_model_identity",
+        lambda _model: {"digest": "8b9d11d807c57feb1e2ecb0d6cbf40334c37dcc3523bed5540af4f927f112a37"},
+    )
+    monkeypatch.setattr(
         sys,
         "argv",
-        ["search.py", "対象", "--mode", "deep", "--timeout-seconds", "300"],
+        ["search.py", "対象", "--model", "qwen3.5:122b", "--mode", "deep", "--timeout-seconds", "300"],
     )
 
     cli_search.main()
@@ -695,3 +703,76 @@ def test_cli_markdown_and_replay_preserve_the_same_human_reason(monkeypatch, cap
     html_text = html.read_text(encoding="utf-8")
     assert "meta.stopReasonMessage" in html_text
     assert "evidence.routeReasonMessage" in html_text
+
+
+def test_isolated_worker_without_embedding_never_reads_production_settings(monkeypatch):
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("production embedding settings must not be read")
+
+    monkeypatch.setattr(cli_search, "detect_embed_model", unexpected)
+    monkeypatch.setattr(cli_search, "load_embed_cache", unexpected)
+    model, cache = deep_transport._load_worker_embedding_context(
+        {"isolated_embedding": {"model": None, "cache_path": None, "cache_sha256": None}},
+        [],
+        cli_search,
+    )
+
+    assert model is None
+    assert cache == {}
+
+
+def test_isolated_worker_reads_only_digest_bound_snapshot_cache(tmp_path, monkeypatch):
+    chunk = {
+        "path": "fixture.md",
+        "chunk_id": "fixture.md#0001",
+        "start_line": 1,
+        "end_line": 1,
+        "text": "合成資料",
+        "file_sha256": "a" * 64,
+        "text_sha256": hashlib.sha256("合成資料".encode("utf-8")).hexdigest(),
+    }
+    model = "bge-m3"
+    identity = {"digest": "d" * 64}
+    entry = {**cli_search._strip_cache_metadata(chunk), "embedding": [0.1, 0.2]}
+    cache = {
+        "version": cli_search.EMBED_CACHE_VERSION,
+        "embed_model": model,
+        "chunking": {"max_chars": cli_search.CHUNK_MAX_CHARS, "overlap_chars": cli_search.CHUNK_OVERLAP_CHARS},
+        "compatibility": cli_search._new_embed_compatibility(model, identity, 2),
+        "entries": {chunk["chunk_id"]: entry},
+    }
+    cache_path = tmp_path / "isolated-cache.json"
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    digest = __import__("hashlib").sha256(cache_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli_search, "get_embed_model_identity", lambda _model: identity)
+    monkeypatch.setattr(cli_search, "detect_embed_model", lambda: pytest.fail("production config read"))
+    monkeypatch.setattr(cli_search, "load_embed_cache", lambda: pytest.fail("production cache read"))
+
+    observed_model, observed_cache = deep_transport._load_worker_embedding_context(
+        {"isolated_embedding": {"model": model, "cache_path": str(cache_path), "cache_sha256": digest}},
+        [chunk],
+        cli_search,
+    )
+
+    assert observed_model == model
+    assert set(observed_cache["entries"]) == {chunk["chunk_id"]}
+
+
+def test_deep_chat_uses_the_selected_model_reasoning_wire_value(monkeypatch):
+    requests = []
+    monkeypatch.setattr(deep_research, "_check_prompt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deep_research,
+        "run_worker",
+        lambda payload, **_kwargs: requests.append(payload) or "ok",
+    )
+
+    deep_research._call_ollama_content(
+        "gpt-oss:120b", "system", "user", timeout=30, reasoning="off"
+    )
+    deep_research._call_ollama_content(
+        "qwen3.5:122b", "system", "user", timeout=30, reasoning="high"
+    )
+
+    assert requests[0]["body"]["think"] == "low"
+    assert requests[1]["body"]["think"] is True

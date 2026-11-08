@@ -34,3 +34,25 @@ Describe 'offline-ai collect skill source scoring' {
         }
     }
 }
+
+Describe 'offline-ai source inventory filtering' {
+    It 'keeps supported extensions and excludes private files and directories' {
+        $source = Join-Path $TestDrive 'corpus'
+        New-Item -ItemType Directory -Path $source | Out-Null
+        foreach ($name in @('nested', '.hidden', 'node_modules')) {
+            New-Item -ItemType Directory -Path (Join-Path $source $name) | Out-Null
+        }
+        foreach ($name in @('a.md', 'b.txt', 'nested/c.json', 'ignored.bin', 'secrets.json', '.hidden/h.md', 'node_modules/n.md')) {
+            [IO.File]::WriteAllText((Join-Path $source $name), "# alpha`nalpha details")
+        }
+        $output = & pwsh -NoProfile -File $script:CollectSkillSourcePath -Query 'alpha' -SourceRoot $source
+        $LASTEXITCODE | Should -Be 0
+        $result = ($output -join "`n") | ConvertFrom-Json
+        $result.status | Should -Be 'ok'
+        $result.scannedFileCount | Should -Be 3
+        @($result.matches).Count | Should -Be 3
+        @($result.matches.path) | Should -Contain 'a.md'
+        @($result.matches.path) | Should -Contain 'b.txt'
+        @($result.matches.path) | Should -Contain 'nested/c.json'
+    }
+}

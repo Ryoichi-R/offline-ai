@@ -87,6 +87,14 @@ def project_candidate(
     return result
 
 
+# Role-aware selection (answer policy v2): share of the total slots reserved, in
+# rank order, for candidates that answer the question directly or qualify the
+# answer, and how many top-ranked candidates are classified (the cost bound).
+ROLE_PRIORITY_SHARE = 0.6
+ROLE_SCAN_LIMIT = 400
+ROLE_COUNT_KEYS = frozenset({"role_selected", "role_excluded"})
+
+
 def select_candidates(
     ranked_candidates: Iterable[Mapping[str, object]],
     *,
@@ -95,8 +103,18 @@ def select_candidates(
     max_total: int = DEEP_MAX_CANDIDATES_TOTAL,
     cancel_check: Callable[[], None] | None = None,
     deadline: float | None = None,
+    role_of: Callable[[Mapping[str, object]], str] | None = None,
+    priority_roles: Iterable[str] = ("direct_answer", "qualifier_reference"),
 ) -> dict:
-    """Select in ranked order and retain every omitted candidate as a reference."""
+    """Select candidates and retain every omitted candidate as a reference.
+
+    Without `role_of` this is the legacy rank-order selection. With it, part of
+    the slots (`ROLE_PRIORITY_SHARE`) is first given to candidates whose role
+    answers the question directly or qualifies the answer, so that a long
+    detail table ranked higher cannot crowd out the governing rule. The rest
+    follows the original rank (an ambiguous candidate is never discarded for
+    lack of a role). Selected candidates stay in rank order.
+    """
     ranked = []
     for candidate in ranked_candidates:
         _check_control(cancel_check, deadline)
@@ -126,14 +144,53 @@ def select_candidates(
 
     selected: list[dict] = []
     excluded: list[dict] = []
-    for candidate in ranked:
+    chosen: set[int] | None = None
+    roles: dict[int, str] = {}
+    if role_of is not None:
+        priority = set(priority_roles)
+        quota = max(1, int(max_total * ROLE_PRIORITY_SHARE))
+        chosen = set()
+        per_path: dict[str, int] = {}
+        for index, candidate in enumerate(ranked[:ROLE_SCAN_LIMIT]):
+            _check_control(cancel_check, deadline)
+            chunk = by_chunk_id.get(str(candidate.get("chunk_id") or "").replace("\\", "/"))
+            roles[index] = str(role_of(chunk if chunk is not None else candidate))
+            path = normalize_candidate_path(candidate.get("path"))
+            if (
+                roles[index] in priority
+                and len(chosen) < quota
+                and per_path.get(path, 0) < max_per_file
+            ):
+                chosen.add(index)
+                per_path[path] = per_path.get(path, 0) + 1
+        # Fill the remaining slots in the original rank order.
+        for index, candidate in enumerate(ranked):
+            if len(chosen) >= max_total:
+                break
+            if index in chosen:
+                continue
+            path = normalize_candidate_path(candidate.get("path"))
+            if per_path.get(path, 0) >= max_per_file:
+                continue
+            chosen.add(index)
+            per_path[path] = per_path.get(path, 0) + 1
+    role_selected: dict[str, int] = {}
+    role_excluded: dict[str, int] = {}
+    for index, candidate in enumerate(ranked):
         _check_control(cancel_check, deadline)
         path = normalize_candidate_path(candidate.get("path"))
         source_chunk = by_chunk_id.get(
             str(candidate.get("chunk_id") or "").replace("\\", "/")
         )
         reference = project_candidate(candidate, source_chunk=source_chunk)
-        if counts.get(path, 0) >= max_per_file or len(selected) >= max_total:
+        if chosen is not None:
+            keep = index in chosen
+            role = roles.get(index, "unclassified")
+            bucket = role_selected if keep else role_excluded
+            bucket[role] = bucket.get(role, 0) + 1
+        else:
+            keep = not (counts.get(path, 0) >= max_per_file or len(selected) >= max_total)
+        if not keep:
             reference["reason"] = "candidate_limit"
             reference.pop("path")
             reference["path_index"] = path_index(path)
@@ -143,17 +200,21 @@ def select_candidates(
             continue
         counts[path] = counts.get(path, 0) + 1
         selected.append(reference)
+    result_counts: dict = {
+        "ranked": len(ranked),
+        "selected": len(selected),
+        "excluded": len(excluded),
+    }
+    if chosen is not None:
+        result_counts["role_selected"] = role_selected
+        result_counts["role_excluded"] = role_excluded
     return {
         "schema_version": CANDIDATE_RESPONSE_SCHEMA_VERSION,
         "paths": paths,
         "source_hashes": source_hashes,
         "selected": selected,
         "excluded": excluded,
-        "counts": {
-            "ranked": len(ranked),
-            "selected": len(selected),
-            "excluded": len(excluded),
-        },
+        "counts": result_counts,
     }
 
 
@@ -218,8 +279,19 @@ def validate_response(value: object) -> dict:
         set(source_hashes)
     ) != len(source_hashes):
         raise ValueError("invalid retrieve response source hash table")
-    if set(counts) != {"ranked", "selected", "excluded"}:
+    base_counts = {"ranked", "selected", "excluded"}
+    if not base_counts <= set(counts) or set(counts) - base_counts - ROLE_COUNT_KEYS:
         raise ValueError("invalid retrieve response counts")
+    for name in ROLE_COUNT_KEYS & set(counts):
+        table = counts[name]
+        if not isinstance(table, dict) or any(
+            not isinstance(role, str)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for role, count in table.items()
+        ):
+            raise ValueError("invalid retrieve response role counts")
     for name in ("ranked", "selected", "excluded"):
         count = counts[name]
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:

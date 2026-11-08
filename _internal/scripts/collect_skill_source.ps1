@@ -94,8 +94,9 @@ function Test-AllowedSourceFile {
 
 # 全ファイル取得
 $files = @()
+$sourceFiles = @(Get-ChildItem -LiteralPath $SourceRoot -Recurse -File -ErrorAction SilentlyContinue)
 foreach ($ext in $extensions) {
-    $files += Get-ChildItem -Path $SourceRoot -Recurse -Filter $ext -File -ErrorAction SilentlyContinue
+    $files += @($sourceFiles | Where-Object { $_.Name -like $ext })
 }
 $files = @($files | Where-Object { Test-AllowedSourceFile -File $_ })
 

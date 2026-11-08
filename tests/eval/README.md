@@ -1,5 +1,56 @@
 # Phase 2 検索品質・根拠品質 評価ハーネス
 
+## Mac大型モデルの隔離比較
+
+`macos_large_model_compare.py` は、調整に使用済みの合成4問だけを使い、固定digestの
+`qwen3.5:122b` と `gpt-oss:120b` を通常回答／deepで比較する。既存評価corpus、
+`skill-source`、運用Embedding cacheは開かない。receiptにはモデル・条件・資料hash、
+判定状態、時間だけを保存し、回答本文・資料本文・絶対path・思考本文は保存しない。
+
+まず準備receiptを作る。このコマンドはOllamaへ接続せず、合成仕様と実行本数を検証する。
+
+```bash
+python tests/eval/macos_large_model_compare.py --run-id macos-holdout-stage1 --reasoning off
+```
+
+既定の両モデル・通常／deep・3反復では48件で、各通常質問300秒以内の検索と回答、
+各deep質問1,800秒以内、6回以内のウォームアップを含む最大実行時間は59,400秒
+（16時間30分）。この上限に準備・人手採点時間は含まれない。設定されたMac runtimeの
+Ollama所有記録・固定モデルdigest・loopback接続を確認できる場合だけ実行可能。
+実行時は件数と最大秒数を両方明示して確認する。Embeddingを使う場合は既に導入済みの
+`bge-m3`を指定し、同一run内で構築した一時cacheを通常／deepの双方へ渡す。
+
+```bash
+python tests/eval/macos_large_model_compare.py \
+  --run-id macos-holdout-stage1 \
+  --reasoning off \
+  --embed-model bge-m3 \
+  --execute \
+  --confirm-case-runs 48 \
+  --confirm-max-seconds 59400
+```
+
+精度優先設定は別のrun-id・別receiptで実行し、設定と結果を混ぜない。keyword-onlyの
+配線確認は実行できるが、hybrid受入eligibleとは表示しない。合成holdoutの結果だけで
+実資料受入やモデル採用を決めない。実資料の場所・対象・利用条件と16時間枠は別途確定する。
+
+### 2026-09-27以降の評価上の扱い
+
+`macos-large-model-holdout/` の4問は48ケース比較後に不具合分析・修正へ使用したため、
+以後は **calibration（調整・回帰確認用）** とする。新規計画・実行receiptは
+`synthetic-calibration-only`、`acceptanceEligible: false`を固定し、旧計画の実行時もこの状態へ更新する。ディレクトリ名と旧仕様のholdout表記は
+過去receiptの再現用に残すが、同じ質問での再試験を独立保留評価の合格根拠にしない。
+最終採用には修正に使っていない別資料・別質問と、人手による意味採点が必要である。
+
+通常回答の機械採点では、`required_fact_aliases` に必須事実ごとの許容表記を明示できる。
+未定義の言い換えを自動で正解にはしない。`allow_scoped_abstention: true` は全必須事実が
+あり、禁止事実がなく、情報不足の記述が項目に限定される場合だけ許容する。全体棄権や
+必要条件の欠落は不合格のまま。文字列検査は意味の正しさを証明せず、人手採点を代替しない。
+元の回答・receiptを保持し、再採点は別の結果に保存する。
+
+deepの期待行範囲は、回答で引用され、hashと抜粋が照合済みの複数根拠でも連続して
+覆える。途中の未読行・未引用の根拠・必要な別資料の欠落は不合格とする。
+
 ## deep の網羅性評価
 
 `coverage_evaluator.py` は deep 結果の回答本文、根拠ID、資料path・行範囲・SHA-256を
@@ -55,6 +106,15 @@ python tests/eval/coverage_evaluator.py \
 比較レポートをそのまま正解データへ転記せずに追加する。
 
 検索品質・根拠品質の受入を、固定 corpus と固定質問で再現可能に測るための評価ハーネスである。独立したrepository内で実行でき、親workspaceの計画ファイルには依存しない。
+
+## 回答品質（回答方針v2）の採点
+
+`material_review.py` の `QUALITY_AXES` / `acceptance_verdict` が、ケースごとの独立受入の判定を固定する。
+
+- 4軸（意味支持・質問適合・必須事項充足・文章品質）を0（不合格）/ 1（要修正）/ 2（充足）で採点する。エージェントの一次評価と人手確認は別欄で、未確認を確認済みとして扱わない。
+- 判定は `NOT_SCORED` / `FAIL` / `NEEDS_REVISION` / `PASS_PENDING_HUMAN` / `PASS`。全軸2のエージェント評価だけでは `PASS_PENDING_HUMAN` で、人手確認も全軸2のときだけ `PASS`。一軸でも0、または重大な引用・意味の誤り（主体・否定・数値・条件・例外・適用範囲）があれば、他が満点でも `FAIL`。速度は軸ではなく、品質不合格を相殺しない。
+- `answer_quality`（v2のゲート状態）は `review.md` と受領票へ固定状態だけを記録する。自動検査は同じモデルによる評価を含む暫定で、独立受入の代わりにしない。
+- 共有回帰には独立した合成資料を使い、SSD実資料の本文を追跡ファイルへ複製しない。原本付きの期待事項と生回答はworkspace直下の `result/` に保存する。
 
 ## 何を測るか
 
@@ -450,3 +510,54 @@ P2で確認したT11の脆弱性（案A・Q-1・hybridのいずれでも防げ�
 ### 単体試験
 
 `tests/unit/test_eval_harness.py` と `tests/unit/test_diversion_evaluator.py` が、上記の契約（`run_id`付与、`answer_prompt`の使用、repeat反復、fixture全件一致、案Aの検証状態と遅延の記録）を固定する。`tests/unit/test_p2_aggregate.py` は集計スクリプトの数え方（同一根拠比較の検索を1回だけ数える、未実行の検証を遅延へ混ぜない、層別の完了率）を固定する。
+
+### Mac比較runnerの質問採点・snapshot契約
+
+実行時は、対象Python source（workerの推移依存を含む）・独立合成corpus・仕様を一時ディレクトリへコピーし、そのコピーから別Pythonプロセスを起動する。コピーした各fileのSHA-256を準備receiptへ束縛し、コピー時・各質問の実行前・全実行後に再照合する。運用`.model`・`skill-source`・cacheはコピーしない。`--runtime-config`は元のhost設定を明示して渡せる。
+
+deepの採点は質問ごとに行い、`questionSpecSha256`（元仕様hash・質問ID・採点項目・受入基準から算出）と`parentSpecSha256`を残す。全4問の基準を1問の回答に要求しない。機械採点を通過しても意味上の人手採点がない結果は`NEEDS_REVIEW`であり、採用PASSにはならない。
+
+`diagnostics.sourceRepair`は補完前主張行数、原文置換／追加行数、照合削除数、重複削除数、最終主張行数、最終回答に残る原文由来の一意行数と依存率を記録する。見出しと空行は主張から除外し、引用IDと表記の差は正規化する。分母0はnull。生成回答が検証に失敗して抜粋表示になった場合も分母0として、抜粋を生成回答へ加点しない。本文は診断へ保存しない。補完前後の意味品質、人手採点、全ホストRAM／swap等の受入実測は別途必要。
+
+launcherは今回の起動要求専用の通知fileを通じて、Ollama子launcherの検査成功を確認する。既存所有serverが応答するだけではCLI/Webを開始しない。実モデル受入とWindows実機互換は自動試験の成功と別に記録する。
+
+## Mac CLI/Web synthetic smoke
+
+`macos_product_smoke.py` は既存の固定2モデルについてCLI実entrypointとWebのbootstrap認証・SSE検索経路を検証します。品質比較用holdoutを使わず、専用の架空備品規程を隔離コピーの`skill-source`へ配置します。prepare-onlyが既定です。
+
+```sh
+python tests/eval/macos_product_smoke.py --run-id smoke-prepared
+python tests/eval/macos_product_smoke.py --run-id smoke-executed --execute --confirm-case-runs 8 --runtime-config .test-results/macos-large-model/host-runtime.json
+# CLIだけの場合は --interfaces cli --confirm-case-runs 4
+```
+
+実行はmacOS限定です。各caseは300秒、終了処理に10秒の猶予を設け、異常終了・deadline到達時は残りのcaseを開始しません。所有検証済みOllamaを使用し、新たに起動したlauncherとcaseのprocess groupだけを終了対象とします。既存サーバーは停止しません。モデル追加取得・Embedding導入は行いません。子processの`OFFLINE_AI_*`上書きを除き、製品既定値・明示model・reasoning=offで実行します。Qwenのoffは`think=false`、gpt-ossのoffは`think=low`です。固定2モデルではHTTPエラー時もthinkを除去した再送は行いません。
+
+receiptは`.test-results/macos-large-model/<run-id>/smoke.json`に保存します。source/corpus SHA-256、所要時間、Web先頭本文到達時間、正答2項目・出典表記の有無、モデルmetadata、deep完了状態、process tree RSSとシステムswapの標本値を記録します。本文・thinking本文・認証token・例外本文は保存しません。RSSは共有ページを重複計上し得るprocess tree合計、swapは他アプリも含むシステム全体であり、memory pressureや厳密な最大使用量とは異なります。
+
+PASSは合成資料による配線確認に限定されます。実推論のキャンセル確認、ブラウザーDOM、保存・再接続、30分連続運転、人手の意味品質判定、正式モデル選定を代替しません。caseの終了からOllama内部推論の資源解放は断定しません。
+
+原因調査では`--select-case cli:deep --select-case web:answer --model qwen3.5:122b --confirm-case-runs 2`で代表2件だけを選択できます（実行には`--execute`も必要）。観測wrapperは製品の引数・戻り値・例外・signatureを保ち、段階時間、既知の例外型・error code、固定JSON項目の型・長さ・判定値だけを保存します。任意のJSONキー・回答本文・例外文は記録しません。診断の追加自体は製品の不具合修正・合格条件変更ではありません。
+
+固定大型モデルのWeb通常回答は、検索子予算をモデルcall上限・request残時間で制限し、既定30秒を回答生成用に残します（300秒requestでは検索最大270秒）。実際のLLMへも子予算と全体残時間の小さい方を渡します。既存の他モデル向け検索120秒契約は維持します。
+
+deepでは抽出時のirrelevant判定を原文だけの独立関連性チェックでも確認し、両方がirrelevantの場合だけ除外します。食い違いはrelevance_disputed、判断不能はrelevance_uncertain、関連する抽出の支持否定はextraction_unsupportedとして未確認状態を維持します。意味上の否定と通信・JSONエラーを区別し、最終回答の支持照合は継続します。
+
+本文のない親見出しは独立した根拠抽出単位にせず、子本文の補助文脈へ原文・path・行番号を保って渡します。親見出しが直接検索候補になった場合は子の節を展開します。本文を持つ親節と末端見出しは独立範囲のまま保持し、文脈が予算に収まらない場合は未確認として残します。
+
+Mac比較のdeep機械採点には、必須語／根拠語の欠落件数、出典一致、矛盾、棄権表現の有無を`itemChecks`に保存する。回答本文や欠落語そのものはreceiptへ追加しない。
+
+
+## 実資料の人手確認用Markdown
+
+`material_review.export_review_bundle()`は評価runner内部用で、deepの`to_public_dict()`、質問、
+資料root、新規出力directory、固定モデルdigestを受け取る。`answer.md`に質問と回答、
+`review.md`に未確認事項・引用原文・補助文脈・確認項目を保存する。資料に対する明示的な
+ローカル回答保存に用い、通常の診断や共有fixtureへ本文を追加する機能ではない。
+
+保存前に引用元のSHA-256、行／文字範囲、抜粋、補助文脈を照合する。資料root外への参照、
+秘密情報として除外される名前やそのリンク、重複ID、原文変更、不正な範囲は拒否する。
+資料root内や既存出力への書込みも拒否し、原資料を変更しない。receiptは全Markdown保存後の
+完了マーカーで、hash・件数・固定状態だけを持つ。`semanticReview=NOT_REVIEWED`、
+`acceptanceEligible=false`を固定する。原文一致は意味の支持や網羅性を保証せず、
+未検証根拠・未知の引用・partial結果も人手確認で区別する必要がある。

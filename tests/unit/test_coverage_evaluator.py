@@ -6,6 +6,12 @@ import coverage_evaluator as evaluator
 
 
 SPEC = Path(__file__).resolve().parent.parent / "eval" / "eval-spec-coverage-synthetic.json"
+MAC_HOLDOUT_SPEC = (
+    Path(__file__).resolve().parent.parent
+    / "eval"
+    / "macos-large-model-holdout"
+    / "eval-spec-deep.json"
+)
 
 
 def _result(*, complete=True, bad_citation=False):
@@ -93,3 +99,49 @@ def test_aggregate_requires_every_run_to_pass():
     assert aggregate["all_runs_passed"] is False
     assert aggregate["critical_misses"] == ["C03"]
     assert aggregate["item_covered_runs"]["C03"] == 2
+
+
+def test_contradictory_false_answer_fails_as_a_critical_miss():
+    result = _result()
+    result["answer"] = result["answer"].replace("非正規雇用者は対象外", "正社員は対象外")
+
+    report = evaluator.evaluate_result(evaluator.load_spec(SPEC), result)
+
+    assert report["status"] == "FAIL"
+    assert report["critical_misses"] == ["C01"]
+    assert report["items"][0]["contradiction"] is True
+
+
+def test_unanswerable_holdout_requires_an_explicit_abstention():
+    spec = evaluator.load_spec(MAC_HOLDOUT_SPEC)
+    item = next(item for item in spec["items"] if item["id"] == "MH04")
+    spec["items"] = [item]
+    answer = "関連規程には保育サービス費用の記載がありません。"
+
+    report = evaluator.evaluate_result(
+        spec, {"status": "completed", "answer": answer, "evidence": []}
+    )
+
+    assert report["item_coverage"] == 1.0
+    assert report["critical_misses"] == []
+    assert report["items"][0]["expected_abstention"] is True
+    assert report["items"][0]["abstention_reported"] is True
+
+
+def test_unanswerable_holdout_rejects_a_confident_unsupported_answer():
+    spec = evaluator.load_spec(MAC_HOLDOUT_SPEC)
+    item = next(item for item in spec["items"] if item["id"] == "MH04")
+    spec["items"] = [item]
+
+    report = evaluator.evaluate_result(
+        spec,
+        {
+            "status": "completed",
+            "answer": "保育サービス費用は会社から支給できます。",
+            "evidence": [],
+        },
+    )
+
+    assert report["item_coverage"] == 0.0
+    assert report["critical_misses"] == ["MH04"]
+    assert report["items"][0]["contradiction"] is True

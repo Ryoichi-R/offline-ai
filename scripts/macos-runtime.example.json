@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "modelsDirectory": "/Volumes/YourModelDrive/ollama-models",
+  "volumeUuid": "SET-THE-EXPECTED-VOLUME-UUID",
+  "ollamaExecutable": "/absolute/path/to/ollama",
+  "pythonExecutable": "/absolute/path/to/python3",
+  "ollamaVersion": "0.34.4",
+  "minimumFreeBytes": 1073741824
+}

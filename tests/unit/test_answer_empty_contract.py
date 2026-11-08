@@ -231,7 +231,7 @@ def test_stall_message_includes_seconds_matching_check_path(monkeypatch):
     _prepare_worker(monkeypatch)
     events = _run(monkeypatch, urlopen=_raising_urlopen(TimeoutError("timed out")))
     message = _error_event(events)["message"]
-    expected_seconds = int(web_services.GENERATION_STALL_TIMEOUT)
+    expected_seconds = 5  # _run configures a 5-second stall deadline on its token.
     assert message == f"モデルからの応答が{expected_seconds}秒途絶えました"
 
     token = web_services.CancellationToken(timeout=5.0, stall_timeout=expected_seconds)

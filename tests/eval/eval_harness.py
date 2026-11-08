@@ -129,6 +129,9 @@ class Question:
     # 併記を不合格にしない（2026-09-19の利用者判断、資料内の矛盾型T10用。partial時の
     # 「根拠不足を明示」規則により、両論を示したうえで該当情報なしとも書く回答が多いため）。
     allow_abstain_phrase: bool = False
+    # Explicit alternatives belong to a versioned question, not global synonyms.
+    required_fact_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    allow_scoped_abstention: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,6 +246,17 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
             raise SpecError(f"{question_id}: allow_abstain_phrase は真偽値")
         if allow_abstain_phrase and not raw.get("required_facts"):
             raise SpecError(f"{question_id}: allow_abstain_phrase には required_facts が必要")
+        aliases = raw.get("required_fact_aliases", {})
+        if not isinstance(aliases, dict) or any(
+            key not in raw.get("required_facts", [])
+            or not isinstance(values, list) or not values
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+            for key, values in aliases.items()
+        ):
+            raise SpecError(f"{question_id}: invalid required_fact_aliases")
+        scoped = raw.get("allow_scoped_abstention", False)
+        if not isinstance(scoped, bool) or (scoped and not raw.get("required_facts")):
+            raise SpecError(f"{question_id}: invalid allow_scoped_abstention")
         require_expected_lines = raw.get("require_expected_lines", False)
         if not isinstance(require_expected_lines, bool):
             raise SpecError(f"{question_id}: require_expected_lines は真偽値")
@@ -277,6 +291,8 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
                 holdout=holdout,
                 notes=str(raw.get("notes", "")).strip(),
                 allow_abstain_phrase=allow_abstain_phrase,
+                required_fact_aliases=tuple((key, tuple(values)) for key, values in aliases.items()),
+                allow_scoped_abstention=scoped,
             )
         )
 
@@ -999,6 +1015,33 @@ def apply_answer_probe_to_acceptance(report: dict[str, Any], probes: list[dict])
     )
 
 
+def _fact_present(answer: str, fact: str, aliases=()) -> bool:
+    # Whitespace changes are typographic; values, negation and boundaries remain.
+    normalize = lambda text: re.sub(r"\s+", "", _normalize_answer_text(text))
+    normalized = normalize(answer)
+    for value in (fact, *aliases):
+        token = normalize(value)
+        prefix = r"(?<![0-9])" if token[:1].isdigit() else ""
+        for match in re.finditer(prefix + re.escape(token), normalized):
+            suffix = normalized[match.end():]
+            if not re.match(r"(?:ではない|ではありません|ではなく|じゃない|とは限らない)", suffix):
+                return True
+    return False
+
+
+def _only_scoped_abstention(answer: str) -> bool:
+    """Allow explicitly localized absence, never a whole-answer refusal."""
+    lines = [re.sub(r"[*#]", "", line).strip() for line in answer.splitlines()]
+    marked = [line for line in lines if any(p in line for p in ANSWER_ABSTAIN_PHRASES)]
+    if not marked:
+        return True
+    return all(
+        not re.search(r"質問全体|全体として|全体について|したがって", line)
+        and re.search(r".{2,}(?:について|に関する|の.{1,20}[：:])", line)
+        for line in marked
+    )
+
+
 def measure_answer_quality_probe(
     question: Question,
     outcome: RouteOutcome,
@@ -1066,7 +1109,7 @@ def measure_answer_quality_probe(
     missing_facts = sum(
         1
         for fact in question.required_facts
-        if _normalize_answer_text(fact) not in normalized_answer
+        if not _fact_present(answer_text, fact, dict(question.required_fact_aliases).get(fact, ()))
     )
     forbidden_fact = any(
         _normalize_answer_text(fact) in normalized_answer for fact in question.forbidden_facts
@@ -1085,7 +1128,12 @@ def measure_answer_quality_probe(
             and missing_facts == 0
             and not forbidden_fact
             and cites_expected
-            and (not abstained or (question.allow_abstain_phrase and missing_facts == 0))
+            and (
+                not abstained
+                or (question.allow_abstain_phrase and missing_facts == 0)
+                or (question.allow_scoped_abstention and missing_facts == 0
+                    and _only_scoped_abstention(answer_text))
+            )
             and not transport_error,
             "answer_nonempty": nonempty,
             "missing_required_facts": missing_facts,

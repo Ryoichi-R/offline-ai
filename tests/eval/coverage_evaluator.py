@@ -44,8 +44,8 @@ def _string_list(
 
 
 def _sources(value: object, *, item_id: str) -> tuple[dict[str, Any], ...]:
-    if not isinstance(value, list) or not value:
-        raise CoverageSpecError(f"{item_id}: expected_sources は1件以上必要")
+    if not isinstance(value, list):
+        raise CoverageSpecError(f"{item_id}: expected_sources は配列でなければならない")
     result: list[dict[str, Any]] = []
     for source in value:
         if not isinstance(source, dict) or not str(source.get("path", "")).strip():
@@ -110,7 +110,6 @@ def load_spec(path: str | Path) -> dict[str, Any]:
             raw.get("required_terms"),
             field="required_terms",
             item_id=item_id,
-            required=True,
         )
         required_any = _string_list(raw.get("required_any"), field="required_any", item_id=item_id)
         evidence_terms = _string_list(
@@ -122,23 +121,46 @@ def load_spec(path: str | Path) -> dict[str, Any]:
             raw.get("expected_statements"),
             field="expected_statements",
             item_id=item_id,
-            required=True,
         )
+        expected_abstention = raw.get("expected_abstention", False)
+        if type(expected_abstention) is not bool:
+            raise CoverageSpecError(f"{item_id}: expected_abstention は真偽値でなければならない")
+        if not expected_abstention and not required_terms:
+            raise CoverageSpecError(f"{item_id}: required_terms は1件以上必要")
+        if not expected_abstention and not statements:
+            raise CoverageSpecError(f"{item_id}: expected_statements は1件以上必要")
+        abstention_patterns = _string_list(
+            raw.get("abstention_patterns"),
+            field="abstention_patterns",
+            item_id=item_id,
+            required=expected_abstention,
+        )
+        for pattern in abstention_patterns:
+            re.compile(pattern)
         forbidden = _string_list(
             raw.get("forbidden_patterns"), field="forbidden_patterns", item_id=item_id
         )
         for pattern in forbidden:
             re.compile(pattern)
+        expected_sources = _sources(raw.get("expected_sources", []), item_id=item_id)
+        if expected_abstention and expected_sources:
+            raise CoverageSpecError(f"{item_id}: abstention item cannot require expected_sources")
+        if not expected_abstention and not expected_sources:
+            raise CoverageSpecError(f"{item_id}: expected_sources は1件以上必要")
+        query = str(raw.get("query", "")).strip()
         items.append(
             {
                 "id": item_id,
+                "query": query,
                 "category": str(raw.get("category", "")).strip(),
                 "required_terms": required_terms,
                 "required_any": required_any,
                 "required_evidence_terms": evidence_terms,
                 "expected_statements": statements,
+                "expected_abstention": expected_abstention,
+                "abstention_patterns": abstention_patterns,
                 "forbidden_patterns": forbidden,
-                "expected_sources": _sources(raw.get("expected_sources"), item_id=item_id),
+                "expected_sources": expected_sources,
                 "critical": bool(raw.get("critical", False)),
             }
         )
@@ -183,18 +205,24 @@ def _matching_evidence(
 ) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
     for expected in item["expected_sources"]:
-        for actual in evidence:
-            if str(actual.get("path", "")).replace("\\", "/") != expected["path"]:
-                continue
-            start = actual.get("start_line")
-            end = actual.get("end_line")
-            if (
-                isinstance(start, int)
-                and isinstance(end, int)
-                and start <= expected["line_start"]
-                and end >= expected["line_end"]
-            ):
-                matches.append(actual)
+        candidates = [
+            actual for actual in evidence
+            if str(actual.get("path", "")).replace("\\", "/") == expected["path"]
+            and type(actual.get("start_line")) is int
+            and type(actual.get("end_line")) is int
+            and actual["start_line"] <= expected["line_end"]
+            and actual["end_line"] >= expected["line_start"]
+        ]
+        # Several cited, hash/excerpt-validated units can jointly cover a source.
+        # Any uncovered line or missing required document still fails closed.
+        next_line = expected["line_start"]
+        for actual in sorted(candidates, key=lambda entry: entry["start_line"]):
+            if actual["start_line"] > next_line:
+                break
+            next_line = max(next_line, actual["end_line"] + 1)
+        if next_line <= expected["line_end"]:
+            return []
+        matches.extend(candidates)
     return matches
 
 
@@ -284,7 +312,9 @@ def evaluate_result(spec: dict[str, Any], result: dict[str, Any]) -> dict[str, A
     )
     item_reports: list[dict[str, Any]] = []
     for item in spec["items"]:
-        matching = _matching_evidence(item, list(evidence_by_id.values()))
+        matching = _matching_evidence(
+            item, [entry for key, entry in evidence_by_id.items() if key in cited]
+        )
         matching_ids = {str(entry["evidence_id"]) for entry in matching}
         missing_terms = [term for term in item["required_terms"] if _normalize(term) not in answer]
         required_any = item["required_any"]
@@ -296,19 +326,27 @@ def evaluate_result(spec: dict[str, Any], result: dict[str, Any]) -> dict[str, A
         ]
         cited_support = sorted(cited & matching_ids)
         contradiction = any(re.search(p, answer) for p in item["forbidden_patterns"])
-        covered = (
-            not contradiction
-            and not missing_terms
-            and any_ok
-            and not evidence_terms_missing
-            and bool(matching)
-            and bool(cited_support)
+        abstention_reported = any(
+            re.search(pattern, answer) for pattern in item["abstention_patterns"]
         )
+        if item["expected_abstention"]:
+            covered = bool(answer.strip()) and abstention_reported and not contradiction
+        else:
+            covered = (
+                not contradiction
+                and not missing_terms
+                and any_ok
+                and not evidence_terms_missing
+                and bool(matching)
+                and bool(cited_support)
+            )
         item_reports.append(
             {
                 "id": item["id"],
                 "category": item["category"],
                 "critical": item["critical"],
+                "expected_abstention": item["expected_abstention"],
+                "abstention_reported": abstention_reported,
                 "covered": covered,
                 "contradiction": contradiction,
                 "matching_evidence": cited_support,

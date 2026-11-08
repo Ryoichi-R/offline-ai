@@ -83,13 +83,23 @@ try:
         IndexGenerationChangedError,
         IndexModeConflictError,
     )
-    from search import EmbedBuildError, SourceSnapshotError
+    from search import EmbedBuildError, SourceSnapshotError, MODEL_CONFIG, get_model_identity, detect_model, SKILL_SOURCE_DIR
+    from model_config import (
+        MAC_MODEL_DIGESTS,
+        ModelConfigurationError,
+        model_call_timeout_seconds,
+        resolve_model_selection,
+    )
 except ValueError as exc:
     if __name__ == "__main__":
         print(f"[設定エラー] {exc}", file=sys.stderr)
         print("OLLAMA_HOST は localhost / 127.0.0.1 / ::1 のみ指定できます。", file=sys.stderr)
         raise SystemExit(2) from None
     raise
+
+from source_folder import (
+    SourceFolderError, describe_source_folder, pick_source_folder, save_source_root,
+)
 
 logger = logging.getLogger("offlineai.server")
 
@@ -313,7 +323,13 @@ class LimitedThreadingServer(ThreadingHTTPServer):
                  deep_search_timeout=DEEP_SEARCH_TIMEOUT_DEFAULT,
                  bind_port=8080,
                  evidence_registry=None,
-                 page_presence=None):
+                 page_presence=None,
+                 chat_model=None, model_selection_source=None, model_digest=None,
+                 generation_stall_timeout=GENERATION_STALL_TIMEOUT,
+                 source_settings_root=None, source_root=None):
+        self.source_settings_root = Path(source_settings_root or SCRIPT_DIR.parent)
+        self.source_root = Path(source_root or SKILL_SOURCE_DIR)
+        self._source_picker_lock = threading.Lock()
         self._conn_sem = threading.Semaphore(max_connections)
         self.job_table = JobTable(max_concurrent=2)
         self.session_token = session_token
@@ -329,6 +345,10 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self.evidence_registry = evidence_registry or create_evidence_registry()
         # web.bat（非表示起動）だけが設定する。None ならページを閉じても停止しない。
         self.page_presence = page_presence
+        self.chat_model = chat_model
+        self.model_selection_source = model_selection_source
+        self.model_digest = model_digest
+        self.generation_stall_timeout = generation_stall_timeout
         super().__init__(server_address, RequestHandlerClass)
 
     def process_request(self, request, client_address):
@@ -393,7 +413,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
 class OfflineAIHandler(BaseHTTPRequestHandler):
     """offline-ai Web UI HTTP ハンドラ。"""
 
-    server_version = "OfflineAI/0.1.0"
+    server_version = "OfflineAI/0.1.1"
 
     def log_message(self, format, *args):
         """デフォルトのログ出力を抑制（構造化ログに統一）。"""
@@ -785,6 +805,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_bootstrap_get()
         elif path == "/api/health":
             self._handle_health()
+        elif path == "/api/source-folder":
+            self._handle_source_folder()
         elif path == "/api/index/status":
             self._handle_index_status()
         elif path == "/api/index/plan":
@@ -807,6 +829,10 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
 
         if path == "/bootstrap":
             self._handle_bootstrap_post()
+        elif path == "/api/source-folder":
+            self._handle_source_folder(save=True)
+        elif path == "/api/source-folder/pick":
+            self._handle_source_folder(pick=True)
         elif path == "/api/index/start":
             self._handle_index_start()
         elif path == "/api/index/resume":
@@ -827,12 +853,44 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    # --- /api/source-folder ---
+
+    def _handle_source_folder(self, *, save=False, pick=False):
+        if not self._check_auth():
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        try:
+            if pick:
+                if self._read_json_body(max_bytes=128):
+                    raise SourceFolderError("フォルダー選択の要求が不正です。")
+                if not self.server._source_picker_lock.acquire(blocking=False):
+                    self._send_error_json("server_busy", "フォルダー選択を開いています。")
+                    return
+                try:
+                    chosen = pick_source_folder()
+                finally:
+                    self.server._source_picker_lock.release()
+                self._send_json({"path": chosen, "cancelled": chosen is None})
+                return
+            if save:
+                payload = self._read_json_body(max_bytes=16384)
+                if set(payload) != {"path"}:
+                    raise SourceFolderError("フォルダーのパスを指定してください。")
+                save_source_root(self.server.source_settings_root, payload["path"])
+            self._send_json(describe_source_folder(
+                self.server.source_settings_root, self.server.source_root
+            ))
+        except (ValueError, UnicodeError) as exc:
+            self._send_error_json("invalid_query", str(exc))
+        except OSError:
+            self._send_error_json("source_settings_unavailable", "参考資料フォルダーの設定を保存できません。アプリの書き込み権限を確認してください。")
+
     # --- /api/health ---
 
     def _handle_health(self):
         # health は認証不要（ただし Origin 検証済み）
         # Cookie がなくても応答する
-        result = check_health()
+        result = check_health(getattr(self.server, "chat_model", None))
         result["index"] = self.server.index_coordinator.status()
         result["searchTimeoutDefault"] = self.server.search_timeout
         result["searchTimeoutMin"] = SEARCH_TIMEOUT_MIN
@@ -1079,7 +1137,9 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
 
         # ジョブテーブルに登録（重複なら既存エントリを返す）
         cancel_token = CancellationToken(
-            timeout_seconds, stall_timeout=GENERATION_STALL_TIMEOUT, defer_stall=True
+            timeout_seconds,
+            stall_timeout=getattr(self.server, "generation_stall_timeout", GENERATION_STALL_TIMEOUT),
+            defer_stall=True,
         )
         try:
             fingerprint = (session_id, query, reasoning, timeout_seconds, mode)
@@ -1124,7 +1184,16 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
                         "session_id": session_id,
                         "evidence_registry": self.server.evidence_registry,
                     }
-                    if "mode" in inspect.signature(run_search).parameters:
+                    run_parameters = inspect.signature(run_search).parameters
+                    if "model_name" in run_parameters:
+                        kwargs["model_name"] = getattr(self.server, "chat_model", None)
+                    if "model_digest" in run_parameters:
+                        kwargs["model_digest"] = getattr(self.server, "model_digest", None)
+                    if "model_selection_source" in run_parameters:
+                        kwargs["model_selection_source"] = getattr(
+                            self.server, "model_selection_source", None
+                        )
+                    if "mode" in run_parameters:
                         run_search(
                             query, reasoning, bcast_queue, cancel_token, request_id,
                             **kwargs,
@@ -1185,6 +1254,8 @@ def run_page_presence_watchdog(server, monitor, stop_event, on_idle, *, interval
 
 def main():
     parser = argparse.ArgumentParser(description="offline-ai Web UI Server")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Chat model tag (CLI > OFFLINE_AI_CHAT_MODEL > _internal/.model)")
     parser.add_argument("--port", type=int, default=None,
                         help="バインドポート (default: 8080、競合時 8080-8089 自動探索)")
     parser.add_argument("--search-timeout", type=int, default=None,
@@ -1196,6 +1267,22 @@ def main():
     parser.add_argument("--exit-when-page-closed", action="store_true",
                         help="開いているWebページが無くなったらサーバーを停止する（web.bat非表示起動用）")
     args = parser.parse_args()
+
+    selection = resolve_model_selection(args.model, MODEL_CONFIG)
+    chat_model = selection.model
+    if sys.platform != "darwin" and selection.source == "model-file":
+        chat_model = detect_model()
+    model_digest = None
+    if sys.platform == "darwin":
+        if chat_model not in MAC_MODEL_DIGESTS:
+            parser.error("Mac起動では固定digestを持つqwen3.5:122bまたはgpt-oss:120bを選択してください")
+        try:
+            model_digest = get_model_identity(chat_model)["digest"]
+        except (OSError, TimeoutError, ModelConfigurationError) as exc:
+            parser.error(f"Macの選択モデルをdigestまで検証できません ({type(exc).__name__})")
+    generation_stall_timeout = model_call_timeout_seconds(
+        chat_model, GENERATION_STALL_TIMEOUT
+    )
 
     # ログ設定
     log_handlers = [logging.StreamHandler(sys.stderr)]
@@ -1234,6 +1321,10 @@ def main():
         search_timeout=search_timeout,
         bind_port=port,
         page_presence=PagePresenceMonitor() if args.exit_when_page_closed else None,
+        chat_model=chat_model,
+        model_selection_source=selection.source,
+        model_digest=model_digest,
+        generation_stall_timeout=generation_stall_timeout,
     )
     # 前回プロセスが所有者不在のまま残した building/cancelling を実測へ戻す（F-9）。
     server.index_coordinator.reconcile_orphaned_state()
@@ -1245,8 +1336,10 @@ def main():
 
     print(f"offline-ai Web UI started on port {port}", file=sys.stderr)
     print(f"URL: {display_url}", file=sys.stderr)
-    print(f"Search timeout: {search_timeout}s",
-          file=sys.stderr)
+    print(f"Search timeout: {search_timeout}s", file=sys.stderr)
+    print(f"Chat model: {chat_model}", file=sys.stderr)
+    if model_digest:
+        print(f"Chat model digest: {model_digest}", file=sys.stderr)
 
     # コンソール出力（web.bat から見える）
     print(f"\noffline-ai Web UI")

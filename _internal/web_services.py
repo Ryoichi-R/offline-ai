@@ -61,7 +61,7 @@ def _utc_now_iso() -> str:
 
 
 def create_evidence_registry(source_root: Path | None = None) -> EvidenceRegistry:
-    return EvidenceRegistry(source_root or (SCRIPT_DIR.parent / "skill-source"))
+    return EvidenceRegistry(source_root or SKILL_SOURCE_DIR)
 
 
 def view_evidence(registry: EvidenceRegistry, evidence_id: object, session_id: str) -> dict:
@@ -252,6 +252,22 @@ def build_deep_evidence_event(
         )
 
     answer_state = str(getattr(result, "answer_state", ANSWER_STATE_NOT_GENERATED))
+    answer_state_message = DEEP_ANSWER_STATE_MESSAGES.get(answer_state, "")
+    answer_quality = dict(getattr(result, "answer_quality", {}) or {})
+    if answer_quality:
+        # v2: generated は生成状態であり、品質合格とは別。要確認のときは合格と読める
+        # 文言を出さない。
+        answer_state_message = {
+            "passed": "回答生成済み（品質検査を通過。正確性の保証ではありません）",
+            "failed": "回答を作成できず参考の原文を表示（要確認）",
+        }.get(str(answer_quality.get("state")), "回答生成済み（要確認）")
+    if (
+        getattr(result, "status", "") == "completed"
+        and answer_state == ANSWER_STATE_NOT_GENERATED
+        and (getattr(result, "diagnostics", {}) or {}).get("final_answer", {}).get("result")
+        == "abstained_no_relevant_evidence"
+    ):
+        answer_state_message = "資料の確認を完了しましたが、質問に答える根拠はありません"
     event = {
         "type": "evidence",
         "evidenceStatus": str(getattr(result, "status", "partial")),
@@ -260,7 +276,7 @@ def build_deep_evidence_event(
         # 回答が実際に生成・検証されたかは answerState / answerStateMessage を見る。
         "confidence": None,
         "answerState": answer_state,
-        "answerStateMessage": DEEP_ANSWER_STATE_MESSAGES.get(answer_state, ""),
+        "answerStateMessage": answer_state_message,
         "route": "deep",
         "indexState": "deep",
         "routeReason": stop_reason,
@@ -270,6 +286,8 @@ def build_deep_evidence_event(
         "deepLedger": public_ledger,
         "deepDiagnostics": dict(getattr(result, "diagnostics", {}) or {}),
     }
+    if answer_quality:
+        event["answerQuality"] = answer_quality
     if warnings_truncated:
         event["deepWarningsTruncated"] = True
     if ledger_truncated:
@@ -618,15 +636,24 @@ try:
     import sys as _sys
     # search.py は sys.path.insert + prompt_templates import をモジュールレベルで実行
     _sys.path.insert(0, str(SCRIPT_DIR))
+    from model_config import (
+        MAC_MODEL_DIGESTS, ModelConfigurationError, resolve_model_reasoning,
+        model_call_timeout_seconds,
+    )
     from search import (
         PromptBudgetError,
         detect_model,
         iter_stream_events,
         build_chat_payload,
         RETRIEVAL_TIMEOUT,
+        EVIDENCE_VERIFY_GENERATION_RESERVE,
         GENERATION_STALL_TIMEOUT,
         run_retrieval_pipeline,
+        get_model_identity,
+        run_answer_v2,
+        SKILL_SOURCE_DIR,
     )
+    from answer_policy import POLICY_V2, resolve_policy_version
     from deep_research import (
         CANDIDATE_TRANSFER_LIMIT_CODE,
         CANDIDATE_TRANSFER_LIMIT_MESSAGE,
@@ -788,6 +815,7 @@ class PagePresenceMonitor:
 
 
 ERROR_CODES = {
+    "source_settings_unavailable": 500,
     "invalid_query": 400,
     "invalid_timeout": 400,
     "invalid_mode": 400,
@@ -840,7 +868,7 @@ def log_structured(request_id: str, **fields):
 # Health チェック
 # ---------------------------------------------------------------------------
 
-def check_health() -> dict:
+def check_health(configured_model: str | None = None) -> dict:
     """Ollama 接続状態と機能別ステータスを返す。"""
     ollama_ok = False
     model_name = ""
@@ -856,7 +884,7 @@ def check_health() -> dict:
             # モデル検出
             if _search_available:
                 try:
-                    model_name = detect_model()
+                    model_name = configured_model or detect_model()
                 except Exception:
                     pass
     except Exception:
@@ -888,7 +916,9 @@ def check_health() -> dict:
 def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                cancel_token: CancellationToken, request_id: str, *,
                mode: str = "answer", started_at: str | None = None,
-               session_id: str = "", evidence_registry: EvidenceRegistry | None = None):
+               session_id: str = "", evidence_registry: EvidenceRegistry | None = None,
+               model_name: str | None = None, model_digest: str | None = None,
+               model_selection_source: str | None = None):
     """検索処理をバックグラウンドスレッドで実行し、イベントを queue に put する。
 
     イベント形式: {"type": "status"|"chunk"|"done"|"error", ...}
@@ -905,18 +935,35 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
 
         cancel_token.check()
 
+        # 回答方針は要求ごとに一度だけ解決し、この要求の全経路を固定する。
+        try:
+            answer_policy = resolve_policy_version()
+        except ValueError:
+            event_queue.put({"type": "error", "code": "invalid_answer_policy",
+                             "message": "回答方針の設定が不正です"})
+            return
+
         # 1. 回答モードだけが chat model を検出する。検索専用はモデル通信を
         # 行わず、retrieval 内の keyword / optional embedding だけで完了する。
         model = None
         if mode == "answer":
             event_queue.put({"type": "status", "text": "モデルを検出しています..."})
-            model = detect_model()
+            model = model_name or detect_model()
             log_structured(request_id, phase="detect_model", model=model)
         elif mode == "deep":
             event_queue.put({"type": "status", "text": "深掘り調査用モデルを検出しています..."})
-            model = detect_deep_model()
+            model = model_name or detect_deep_model()
             log_structured(request_id, phase="detect_model", model=model, mode=mode)
 
+        if model_name is not None and model in MAC_MODEL_DIGESTS:
+            observed_identity = get_model_identity(model)
+            if model_digest is not None and observed_identity["digest"] != model_digest:
+                raise ModelConfigurationError("起動後に選択モデルのdigestが変わりました")
+            model_digest = observed_identity["digest"]
+        reasoning_contract = (
+            resolve_model_reasoning(model, reasoning if mode in {"answer", "deep"} else "off")
+            if model else None
+        )
         cancel_token.check()
 
         if mode == "deep":
@@ -927,21 +974,30 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
             deep_result = run_deep_research(
                 query,
                 model=model or "",
-                source_root=SCRIPT_DIR.parent / "skill-source",
+                reasoning=reasoning,
+                source_root=SKILL_SOURCE_DIR,
                 timeout_seconds=int(cancel_token.timeout_seconds),
                 emit_progress=emit_deep_progress,
                 cancel_check=cancel_token.check,
                 absolute_deadline=cancel_token.deadline,
+                answer_policy=answer_policy,
             )
             cancel_token.touch()
             event_queue.put({
                 "type": "result_meta",
                 "requestId": request_id,
+                "answerPolicy": answer_policy,
                 "mode": "deep",
                 "startedAt": started_at or _utc_now_iso(),
                 "chatModel": model,
-                "embeddingModel": None,
-                "reasoning": "off",
+                "embeddingModel": deep_result.diagnostics.get("embedding_model"),
+                "reasoning": reasoning_contract["requested"] if reasoning_contract else "off",
+                "requestedReasoning": reasoning_contract["requested"] if reasoning_contract else "off",
+                "effectiveReasoning": reasoning_contract["effective"] if reasoning_contract else "off",
+                "apiThinkValue": reasoning_contract["think"] if reasoning_contract else False,
+                "thinkingVisible": False,
+                "modelDigest": model_digest,
+                "modelSelectionSource": model_selection_source,
                 "deepStatus": deep_result.status,
                 "stopReason": deep_result.stop_reason,
                 "stopReasonMessage": stop_reason_message(deep_result.stop_reason),
@@ -972,13 +1028,16 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                     or "深掘り調査を確定できませんでした",
                 })
             else:
-                event_queue.put({
+                done_event = {
                     "type": "done",
                     "completedAt": _utc_now_iso(),
                     "status": deep_result.status,
                     "stopReason": deep_result.stop_reason,
                     "stopReasonMessage": stop_reason_message(deep_result.stop_reason),
-                })
+                }
+                if deep_result.answer_quality:
+                    done_event["answerQuality"] = dict(deep_result.answer_quality)
+                event_queue.put(done_event)
             log_structured(
                 request_id,
                 phase="complete",
@@ -994,9 +1053,20 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
         # Retrieval has its own child budget.  It can never extend the
         # request-wide deadline, and answer generation still uses the parent
         # token's remaining time if retrieval returns.
-        retrieval_token = CancellationToken(
-            min(RETRIEVAL_TIMEOUT, cancel_token.remaining())
-        )
+        request_remaining = max(0.0, cancel_token.remaining())
+        retrieval_limit = RETRIEVAL_TIMEOUT
+        if mode == "answer" and model in MAC_MODEL_DIGESTS:
+            # Cold large-model planning can exceed the legacy 120s budget.
+            # Keep generation time inside the unchanged request-wide deadline.
+            generation_reserve = min(EVIDENCE_VERIFY_GENERATION_RESERVE, request_remaining / 2)
+            retrieval_limit = min(
+                model_call_timeout_seconds(model, RETRIEVAL_TIMEOUT),
+                request_remaining - generation_reserve,
+            )
+        retrieval_token = CancellationToken(min(retrieval_limit, request_remaining))
+
+        def retrieval_remaining() -> float:
+            return min(cancel_token.remaining(), retrieval_token.remaining())
 
         def check_retrieval_cancel() -> None:
             cancel_token.check()
@@ -1018,8 +1088,10 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
         if "mode" in parameters:
             pipeline_kwargs["mode"] = mode
         if "remaining_seconds" in parameters:
-            # 案A（LLM根拠検証）の予算逆算用。request全体の残り秒数を渡す。
-            pipeline_kwargs["remaining_seconds"] = cancel_token.remaining
+            # Planning and evidence verification must respect both deadlines.
+            pipeline_kwargs["remaining_seconds"] = retrieval_remaining
+        if "answer_policy" in parameters:
+            pipeline_kwargs["answer_policy"] = answer_policy
         retrieval = run_retrieval_pipeline(query, **pipeline_kwargs)
         log_structured(
             request_id,
@@ -1037,11 +1109,22 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
         event_queue.put({
             "type": "result_meta",
             "requestId": request_id,
+            "answerPolicy": answer_policy if mode == "answer" else None,
             "mode": mode,
             "startedAt": started_at or _utc_now_iso(),
             "chatModel": model if mode == "answer" else None,
             "embeddingModel": getattr(retrieval, "embedding_model", None),
             "reasoning": "off" if mode == "search" else effective_reasoning,
+            "requestedReasoning": reasoning_contract["requested"] if reasoning_contract else "off",
+            "effectiveReasoning": reasoning_contract["effective"] if reasoning_contract else "off",
+            "apiThinkValue": reasoning_contract["think"] if reasoning_contract else False,
+        "thinkingVisible": (
+            reasoning_contract["thinking_visible"]
+            if reasoning_contract and mode == "answer"
+            else False
+        ),
+            "modelDigest": model_digest,
+            "modelSelectionSource": model_selection_source,
         })
         event_queue.put(build_evidence_event(
             retrieval,
@@ -1058,6 +1141,39 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                 phase="complete",
                 mode=mode,
                 match_count=len(retrieval.matches),
+            )
+            return
+
+        if mode == "answer" and answer_policy == POLICY_V2:
+            # 回答方針v2: 主張単位の草稿→原文・意味・質問適合・文章の検査→検査済みの主張だけを
+            # 一度に表示する（途中の未検査本文をストリーミングしない）。
+            cancel_token.start_stall_monitoring()
+            event_queue.put({"type": "status",
+                             "text": "回答を構成し、原文・意味・質問への適合を検査しています..."})
+            outcome = run_answer_v2(
+                query,
+                retrieval,
+                model=model,
+                reasoning=reasoning if reasoning in ("low", "medium", "high") else None,
+                total_seconds=float(cancel_token.timeout_seconds),
+                remaining_seconds=cancel_token.remaining,
+                cancel_check=cancel_token.check,
+                touch=cancel_token.touch,
+            )
+            cancel_token.touch()
+            event_queue.put({"type": "chunk", "text": _truncate_deep_text(outcome.answer)})
+            event_queue.put({
+                "type": "done",
+                "completedAt": _utc_now_iso(),
+                "answerQuality": outcome.quality,
+            })
+            log_structured(
+                request_id,
+                phase="complete",
+                answer_policy="v2",
+                quality_state=outcome.quality.get("state"),
+                kind=outcome.kind,
+                llm_calls=outcome.diagnostics.get("calls", {}).get("llm_calls"),
             )
             return
 
@@ -1121,20 +1237,20 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
             CancellationToken.check 側の stall メッセージと揃える。
             """
             return CancelledError(
-                f"モデルからの応答が{int(GENERATION_STALL_TIMEOUT)}秒途絶えました",
+                f"モデルからの応答が{int((cancel_token.stall_timeout or GENERATION_STALL_TIMEOUT))}秒途絶えました",
                 code="stall",
             )
 
         try:
             try:
                 with urllib.request.urlopen(
-                    req, timeout=min(remaining, GENERATION_STALL_TIMEOUT)
+                    req, timeout=min(remaining, (cancel_token.stall_timeout or GENERATION_STALL_TIMEOUT))
                 ) as resp:
                     stream_response(resp)
             except urllib.error.HTTPError as exc:
                 # think キーが原因で拒否された可能性がある場合のみ、除去して1回だけ再送する。
                 # 親 cancel_token の残時間内で行い、全体 deadline は延長しない。
-                if "think" in body and exc.code >= 400:
+                if model not in MAC_MODEL_DIGESTS and "think" in body and exc.code >= 400:
                     log_structured(request_id, phase="think_fallback", http_code=exc.code)
                     body.pop("think", None)
                     retry_remaining = cancel_token.remaining()
@@ -1147,7 +1263,7 @@ def run_search(query: str, reasoning: str, event_queue: queue.Queue,
                         method="POST",
                     )
                     with urllib.request.urlopen(
-                        retry_req, timeout=min(retry_remaining, GENERATION_STALL_TIMEOUT)
+                        retry_req, timeout=min(retry_remaining, (cancel_token.stall_timeout or GENERATION_STALL_TIMEOUT))
                     ) as resp:
                         stream_response(resp)
                 else:

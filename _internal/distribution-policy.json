@@ -21,6 +21,7 @@
     { "pattern": "download-package.bat", "distribution": "public-source", "reason": "developer/publisher向けpackage構築launcher。完全offline runtimeでは実行対象外", "boundary_row": "public-source-artifact" },
 
     { "pattern": "_internal/deep_candidate_selection.py", "distribution": "both", "reason": "deep候補転送契約・選別runtime実装", "boundary_row": "runtime-app-payload" },
+    { "pattern": "_internal/.source-folder*", "distribution": "excluded", "reason": "利用者が選択した参考資料パスと保存用一時file", "boundary_row": "generated-excluded" },
     { "pattern": "_internal/*.py", "distribution": "both", "reason": "検索・回答生成runtime実装", "boundary_row": "runtime-app-payload" },
     { "pattern": "_internal/ARCHITECTURE.md", "distribution": "public-source", "reason": "開発者向け内部設計文書。利用者向けruntimeには不要", "boundary_row": "public-source-artifact" },
     { "pattern": "_internal/OfflineAi.Common.psm1", "distribution": "both", "reason": "package/installer共有helper", "boundary_row": "runtime-app-payload" },
@@ -46,7 +47,19 @@
     { "pattern": ".test-results/**", "distribution": "excluded", "reason": "独立repository内の検証出力", "boundary_row": "generated-excluded" },
     { "pattern": "pyproject.toml", "distribution": "public-source", "reason": "test/dev toolchain設定", "boundary_row": "public-source-artifact" },
 
+    { "pattern": "scripts/macos-runtime.example.json", "distribution": "public-source", "reason": "Macローカル起動設定の雛形。実機固有値を含まない", "boundary_row": "public-source-artifact" },
+    { "pattern": "scripts/macos_runtime.py", "distribution": "public-source", "reason": "Mac開発・受入起動用のvolume/model検査。Windows runtimeでは使わない", "boundary_row": "public-source-artifact" },
+    { "pattern": "scripts/start-macos.sh", "distribution": "public-source", "reason": "Mac開発・受入用の手動CLI/Web launcher", "boundary_row": "public-source-artifact" },
+    { "pattern": "scripts/start-ollama-macos.sh", "distribution": "public-source", "reason": "Mac開発・受入用の手動Ollama launcher", "boundary_row": "public-source-artifact" },
     { "pattern": "scripts/**", "distribution": "public-source", "reason": "standalone開発bootstrap", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/unit/test_large_model_config.py", "distribution": "public-source", "reason": "Mac大型model設定契約のregression tests", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/unit/test_macos_runtime.py", "distribution": "public-source", "reason": "Mac local launcher検査のunit tests", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/unit/test_macos_large_model_compare.py", "distribution": "public-source", "reason": "Mac固定候補比較runnerのreceiptと接続境界tests", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/eval/macos_large_model_compare.py", "distribution": "public-source", "reason": "Mac固定候補比較runner。応答本文をreceiptへ保存しない", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/eval/macos-large-model-holdout/**", "distribution": "public-source", "reason": "Mac候補を調整用corpusから隔離する未実行の独立合成holdout", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/eval/macos_product_smoke.py", "distribution": "public-source", "reason": "Mac CLI/Web合成資料E2E検証。holdout・利用者資料を使用しない", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/unit/test_macos_product_smoke.py", "distribution": "public-source", "reason": "Mac CLI/Web合成資料E2E検証。holdout・利用者資料を使用しない", "boundary_row": "public-source-artifact" },
+    { "pattern": "tests/eval/macos-smoke-corpus/**", "distribution": "public-source", "reason": "Mac CLI/Web合成資料E2E検証。holdout・利用者資料を使用しない", "boundary_row": "public-source-artifact" },
     { "pattern": "tests/**", "distribution": "public-source", "reason": "test一式", "boundary_row": "public-source-artifact" },
     { "pattern": ".github/**", "distribution": "public-source", "reason": "CI定義・issue/PRテンプレート", "boundary_row": "public-source-artifact" },
 

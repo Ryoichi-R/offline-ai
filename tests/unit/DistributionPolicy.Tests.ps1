@@ -31,6 +31,12 @@ Describe "distribution-policy pattern matching" {
         Get-OfflineAiDistributionClassification -Policy $policy -RelativePath '_internal/embed_cache.json.tmp' | Should -Be 'excluded'
     }
 
+    It "excludes the saved reference folder and atomic temporary files" {
+        $policy = Import-OfflineAiDistributionPolicy -PolicyPath $script:PolicyPath
+        Get-OfflineAiDistributionClassification -Policy $policy -RelativePath '_internal/.source-folder.json' | Should -Be 'excluded'
+        Get-OfflineAiDistributionClassification -Policy $policy -RelativePath '_internal/.source-folder-test.tmp' | Should -Be 'excluded'
+    }
+
     It "gives excluded precedence over an overlapping allow pattern" {
         $policy = [PSCustomObject]@{
             entries = @(
@@ -118,7 +124,7 @@ Describe "distribution-policy coverage on the real offline-ai tree" {
         $catalog = Get-Content -LiteralPath (Join-Path $script:OfflineAiRoot '_internal\download-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $gate = Test-OfflineAiAppPayloadEstimate -Inventory $inventory -Expected $catalog.appPayloadEstimate
         $gate.passed | Should -BeTrue
-        $gate.actual.fileCount | Should -Be 40
+        $gate.actual.fileCount | Should -Be 43
     }
 
     It "fails closed when an unregistered file is added" {

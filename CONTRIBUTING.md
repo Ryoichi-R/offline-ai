@@ -19,6 +19,12 @@ pwsh -NoProfile -File scripts/bootstrap.ps1
 
 `-WhatIf`を付けると、実際の変更を行わずに検証内容を確認できる。
 
+## macOSローカル受入
+
+`scripts/start-macos.sh` はMac上の開発・受入用で、正式対応環境や配布packageをmacOSへ拡張するものではない。Python 3.11以降、Ollama 0.34.4、固定digest付きchat候補、指定exFATボリュームが必要。
+
+`scripts/macos-runtime.example.json` を `.test-results/macos-large-model/host-runtime.json` にコピーして実機値を設定し、`scripts/start-macos.sh web` または `scripts/start-macos.sh --model gpt-oss:120b cli -- "質問"` で手動起動する。設定・receiptは `.test-results/` 内に置き、commitしない。launcherはmodelを取得せず、外付けvolumeのUUID・空き容量・書込可否と既存Ollamaの所有情報を先に検証する。
+
 ## Test の実行
 
 ```powershell

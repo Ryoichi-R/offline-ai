@@ -301,7 +301,11 @@ def http_server(request, tmp_path):
 
 def test_page_presence_api_contract(http_server, monkeypatch):
     monitor, call = http_server
-    monkeypatch.setattr(web_server, "check_health", lambda: {"status": "ok", "features": {}})
+    monkeypatch.setattr(
+        web_server,
+        "check_health",
+        lambda _configured_model=None: {"status": "ok", "features": {}},
+    )
     heartbeat = json.dumps({"page_id": PAGE_A, "visible": True})
 
     assert call("POST", "/api/page/heartbeat", heartbeat, auth=False)[0] == 403

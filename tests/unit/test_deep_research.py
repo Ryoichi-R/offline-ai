@@ -288,6 +288,16 @@ def test_diagnostics_stage_seconds_include_final_integration_time(tmp_path, monk
 
     clock = {"now": 1000.0}
     monkeypatch.setattr(deep_research.time, "monotonic", lambda: clock["now"])
+    original_budget = deep_research.DeepBudget
+
+    def budget_at_fake_time(*args, **kwargs):
+        return original_budget(
+            *args, started_at=clock["now"], _stage_started_at=clock["now"], **kwargs
+        )
+
+    # Dataclass default factories retain the original monotonic callable.
+    # Inject both starts so host uptime cannot consume the test's time budget.
+    monkeypatch.setattr(deep_research, "DeepBudget", budget_at_fake_time)
 
     def slow_final(*args, **kwargs):
         clock["now"] += 7.0

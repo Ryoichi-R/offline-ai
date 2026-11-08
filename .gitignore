@@ -1,11 +1,13 @@
 # 利用者資料。非追跡・非配布（常に最優先で除外する）。
-/skill-source/
+/skill-source
 /infographic/
 /.test-results/
 .env
 .env.*
 
 # 実行時生成cache・利用者環境固有file
+_internal/.source-folder.json
+_internal/.source-folder-*
 _internal/embed_cache.json
 _internal/embed_cache.json.tmp
 _internal/embed_cache.checkpoints/**

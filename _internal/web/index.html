@@ -95,6 +95,7 @@ body {
     font-family: inherit;
 }
 .timeout-input:disabled { background: #f3f4f6; cursor: not-allowed; }
+.result-meta-summary { color: #52606d; font-size: .85em; margin: 6px 0; overflow-wrap: anywhere; }
 
 .btn {
     padding: 10px 20px;
@@ -250,6 +251,17 @@ body {
     border-radius: 6px;
     margin-bottom: 8px;
 }
+.quality-msg {
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-line;
+}
+.quality-msg.quality-ok { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; }
+.quality-msg.quality-review { background: #fffbeb; border: 1px solid #f59e0b; color: #92400e; font-weight: 600; }
+
 
 .error-msg {
     color: #ef4444;
@@ -259,6 +271,12 @@ body {
     margin-bottom: 8px;
 }
 
+.source-folder-panel { margin-bottom: 20px; padding: 16px; border: 1px solid #d1d5db; border-radius: 8px; }
+.source-folder-panel label { display: block; font-weight: 600; margin-bottom: 8px; }
+.source-folder-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.source-folder-controls input { flex: 1 1 280px; min-width: 0; padding: 9px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }
+.source-folder-current { margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
+.source-folder-note { margin: 8px 0 0; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -272,6 +290,18 @@ body {
 </div>
 
 <div class="container">
+    <section class="source-folder-panel" aria-labelledby="sourceFolderTitle">
+        <label id="sourceFolderTitle" for="sourceFolderInput">参考資料フォルダー</label>
+        <div class="source-folder-controls">
+            <input id="sourceFolderInput" type="text" autocomplete="off" spellcheck="false"
+                   aria-describedby="sourceFolderHint" placeholder="フォルダーの絶対パス">
+            <button class="btn btn-secondary" id="sourceFolderPickBtn" type="button">選択…</button>
+            <button class="btn btn-primary" id="sourceFolderSaveBtn" type="button">保存</button>
+        </div>
+        <p class="source-folder-note" id="sourceFolderHint">Google Driveは、このPCで開ける同期済みフォルダーを指定してください。変更はアプリの再起動後に反映されます。</p>
+        <div class="source-folder-current">現在の参照先：<span id="sourceFolderActive">確認中…</span></div>
+        <p class="source-folder-note" id="sourceFolderMessage" role="status" aria-live="polite"></p>
+    </section>
     <!-- Search Panel -->
 <div id="panel-search">
         <section class="index-panel" aria-labelledby="indexTitle">
@@ -311,6 +341,7 @@ body {
             <p class="mode-hint" id="searchModeHint">回答を生成し、根拠を表示します。</p>
         </div>
         <div id="searchStatus" class="status-msg" hidden></div>
+        <div id="resultMetaSummary" class="result-meta-summary" hidden></div>
         <div id="searchBudget" class="budget-msg" hidden></div>
         <details id="searchThinking" class="thinking-panel" hidden open>
             <summary id="searchThinkingSummary">思考中…</summary>
@@ -330,6 +361,7 @@ body {
             <p id="evidenceViewerNote" class="evidence-viewer-note"></p>
         </section>
         <div id="searchWarning" class="warning-msg" hidden></div>
+        <div id="answerQuality" class="quality-msg" role="status" hidden></div>
         <div id="searchError" class="error-msg" hidden></div>
         <div class="result-actions">
             <button class="btn btn-secondary" id="saveMarkdownBtn" type="button" hidden>Markdownで保存</button>
@@ -347,6 +379,7 @@ body {
 
 // --- state ---
 const state = {
+    sourceFolderBusy: false,
     searching: false,
     searchDisconnected: false,
     cancelPending: false,
@@ -370,6 +403,7 @@ const state = {
     resultCompletedAt: null,
     resultReceivedAt: null,
     resultAnswerEmpty: false,
+    resultAnswerQuality: null,
     evidenceFocusElement: null,
     evidenceViewSequence: 0,
     healthPollTimer: null,
@@ -452,6 +486,38 @@ const budgetCountdown = {
 };
 // --- budgetCountdown: END ---
 
+// 回答品質（回答方針v2）の表示文。画面と保存Markdownで同じ文言にする。
+// generated(生成済み)は品質合格ではない。passed以外は必ず「要確認」と理由・未確認範囲を示し、
+// 全ゲートが通過でも「正確性の保証」とは表示しない（文言はサーバーが固定で返す）。
+// --- answerQualityFormat: BEGIN (pure, DOM非依存 — testで抽出evalされる) ---
+const answerQualityFormat = {
+    GATE_STATUS_LABELS: { passed: "通過", failed: "不合格", uncertain: "判定不能", not_run: "未実施" },
+    needsReview(quality) {
+        return Boolean(quality && typeof quality === "object" && quality.state !== "passed");
+    },
+    lines(quality) {
+        if (!quality || typeof quality !== "object" || !quality.state) return [];
+        const label = String(quality.label || (quality.state === "passed" ? "検査済み" : "要確認"));
+        const out = [`品質状態: ${label}（${String(quality.message || "")}）`];
+        const unconfirmed = Array.isArray(quality.unconfirmedAspects) ? quality.unconfirmedAspects : [];
+        if (unconfirmed.length) out.push(`未確認の範囲: ${unconfirmed.map((a) => String(a)).join("／")}`);
+        const gates = quality.gates && typeof quality.gates === "object" ? quality.gates : null;
+        if (gates) {
+            const parts = ["G1", "G2", "G3", "G4"].filter((id) => gates[id]).map((id) => {
+                const gate = gates[id] || {};
+                return `${String(gate.label || id)} ${this.GATE_STATUS_LABELS[gate.status] || "不明"}`;
+            });
+            if (parts.length) out.push(`検査: ${parts.join(" / ")}`);
+        }
+        const removed = Number(quality.removedClaims);
+        if (Number.isFinite(removed) && removed > 0) out.push(`検査を通らず除いた主張: ${removed}件`);
+        const corrected = Number(quality.correctedQuotes);
+        if (Number.isFinite(corrected) && corrected > 0) out.push(`原文の範囲へ補正した引用: ${corrected}件`);
+        return out;
+    },
+};
+// --- answerQualityFormat: END ---
+
 // 深掘りの診断(サーバーの単調時計による全体経過・段階別時間・処理件数)を
 // 画面と保存Markdownで同じ文言にする。数値の許可項目だけを読み、本文は扱わない。
 // --- deepDiagnosticsFormat: BEGIN (pure, DOM非依存 — testで抽出evalされる) ---
@@ -469,6 +535,10 @@ const deepDiagnosticsFormat = {
         rejected_limitations: "根拠の限定の欠けで不合格",
         verification_incomplete: "照合を完了できず",
         not_generated: "回答未生成",
+        v2_passed: "品質検査を通過",
+        v2_partial: "一部の観点が未確認（要確認）",
+        v2_needs_review: "検査の一部が未完了または不合格（要確認）",
+        v2_fallback: "回答を作成できず参考の原文を表示（要確認）",
     },
     _seconds(value) {
         const n = Number(value);
@@ -497,6 +567,24 @@ const deepDiagnosticsFormat = {
         if (counts.length) out.push(`処理件数: ${counts.map(([label, value]) => `${label} ${Number(value)}`).join(" / ")}`);
         const finalAnswer = diag.final_answer && typeof diag.final_answer === "object" ? diag.final_answer : null;
         const attempts = finalAnswer && Array.isArray(finalAnswer.attempts) ? finalAnswer.attempts : [];
+        const v2 = finalAnswer && finalAnswer.v2 && typeof finalAnswer.v2 === "object" ? finalAnswer.v2 : null;
+        if (v2) {
+            const counts = v2.calls && v2.calls.counts && typeof v2.calls.counts === "object" ? v2.calls.counts : {};
+            const ok = (purpose) => {
+                const bucket = counts[purpose] && typeof counts[purpose] === "object" ? counts[purpose] : {};
+                return Object.keys(bucket).filter((key) => key !== "not_run").reduce((sum, key) => sum + (Number(bucket[key]) || 0), 0);
+            };
+            out.push(
+                `最終回答の検査(v2): ${this.FINAL_RESULT_LABELS[finalAnswer.result] || "不明"}`
+                + ` / 草稿 ${ok("draft")}回 / 意味照合 ${ok("g2")}回 / 評価 ${ok("g34")}回`
+                + ` / 再探索 ${v2.reexplored ? "あり" : "なし"}`
+            );
+        }
+        const policyV2 = diag.answer_policy_v2 && typeof diag.answer_policy_v2 === "object" ? diag.answer_policy_v2 : null;
+        if (policyV2 && policyV2.role_deferred && typeof policyV2.role_deferred === "object") {
+            const deferred = Object.values(policyV2.role_deferred).reduce((sum, value) => sum + (Number(value) || 0), 0);
+            if (deferred > 0) out.push(`質問の粒度に合わせて展開しなかった詳細の範囲: ${deferred}件（詳しく知りたいときは準備・詳細を指定してお尋ねください）`);
+        }
         if (attempts.length) {
             const last = attempts[attempts.length - 1] || {};
             const n = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -606,7 +694,17 @@ const md = {
             if (/^[-*_]{3,}\s*$/.test(line)) { flushList(); html += "<hr>"; continue; }
 
             // blockquote
-            if (/^>\s?/.test(line)) { flushList(); html += `<blockquote><p>${this.inline(esc(line.replace(/^>\s?/, "")))}</p></blockquote>`; continue; }
+            if (/^>\s?/.test(line)) {
+                flushList();
+                const para = `<p>${this.inline(esc(line.replace(/^>\s?/, "")))}</p>`;
+                // 連続する引用行（原文の項目行の列挙など）は一つの引用枠にまとめる。
+                if (/^>/.test(lines[i - 1] || "") && html.endsWith("</blockquote>")) {
+                    html = html.slice(0, -"</blockquote>".length) + para + "</blockquote>";
+                } else {
+                    html += `<blockquote>${para}</blockquote>`;
+                }
+                continue;
+            }
 
             // unordered list
             const ulm = line.match(/^(\s*)[-*+]\s+(.*)/);
@@ -687,6 +785,26 @@ const md = {
 
 // --- api ---
 const api = {
+    async sourceFolder(path) {
+        const options = path === undefined ? {} : {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({path}),
+        };
+        const response = await fetch("/api/source-folder", options);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
+        return data;
+    },
+
+    async pickSourceFolder() {
+        const response = await fetch("/api/source-folder/pick", {
+            method: "POST", headers: {"Content-Type": "application/json"}, body: "{}",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
+        return data;
+    },
+
     async health() {
         try {
             const res = await fetch("/api/health");
@@ -893,6 +1011,11 @@ const ui = {
 
     init() {
         this.els = {
+            sourceFolderInput: document.getElementById("sourceFolderInput"),
+            sourceFolderPickBtn: document.getElementById("sourceFolderPickBtn"),
+            sourceFolderSaveBtn: document.getElementById("sourceFolderSaveBtn"),
+            sourceFolderActive: document.getElementById("sourceFolderActive"),
+            sourceFolderMessage: document.getElementById("sourceFolderMessage"),
             statusDot: document.getElementById("statusDot"),
             statusText: document.getElementById("statusText"),
             indexStatus: document.getElementById("indexStatus"),
@@ -908,6 +1031,7 @@ const ui = {
             cancelSearchBtn: document.getElementById("cancelSearchBtn"),
             reconnectSearchBtn: document.getElementById("reconnectSearchBtn"),
             searchStatus: document.getElementById("searchStatus"),
+            resultMetaSummary: document.getElementById("resultMetaSummary"),
             searchBudget: document.getElementById("searchBudget"),
             searchThinking: document.getElementById("searchThinking"),
             searchThinkingSummary: document.getElementById("searchThinkingSummary"),
@@ -923,6 +1047,7 @@ const ui = {
             evidenceViewerNote: document.getElementById("evidenceViewerNote"),
             searchError: document.getElementById("searchError"),
             searchWarning: document.getElementById("searchWarning"),
+            answerQuality: document.getElementById("answerQuality"),
             saveMarkdownBtn: document.getElementById("saveMarkdownBtn"),
             saveMarkdownHint: document.getElementById("saveMarkdownHint"),
             searchResult: document.getElementById("searchResult"),
@@ -930,6 +1055,7 @@ const ui = {
         };
 
         this.bindEvents();
+        this.loadSourceFolder();
         this.updateSearchModeUI();
         pagePresence.start();
         this.pollHealth();
@@ -968,7 +1094,55 @@ const ui = {
         hint.hidden = !hint.textContent;
     },
 
+    renderSourceFolder(data) {
+        this.els.sourceFolderActive.textContent = data.activePath;
+        this.els.sourceFolderMessage.textContent = data.restartRequired
+            ? "保存したフォルダーは、アプリの再起動後に使用します。再起動後はインデックスの状態も確認してください。"
+            : data.available ? "" : "現在のフォルダーを開けません。接続や設定を確認してください。";
+        this.els.sourceFolderPickBtn.hidden = !data.pickerAvailable;
+    },
+
+    async loadSourceFolder() {
+        try {
+            const data = await api.sourceFolder();
+            if (!this.els.sourceFolderInput.value) this.els.sourceFolderInput.value = data.savedPath;
+            this.renderSourceFolder(data);
+        } catch (error) {
+            this.els.sourceFolderMessage.textContent = error.message;
+        }
+    },
+
+    async changeSourceFolder(pick = false) {
+        if (state.sourceFolderBusy) return;
+        state.sourceFolderBusy = true;
+        this.els.sourceFolderInput.disabled = true;
+        this.els.sourceFolderPickBtn.disabled = true;
+        this.els.sourceFolderSaveBtn.disabled = true;
+        this.els.sourceFolderMessage.textContent = pick ? "フォルダーを選択してください…" : "保存中…";
+        try {
+            if (pick) {
+                const data = await api.pickSourceFolder();
+                if (!data.cancelled && data.path) this.els.sourceFolderInput.value = data.path;
+                this.els.sourceFolderMessage.textContent = data.cancelled ? "選択をキャンセルしました。" : "選択したフォルダーを使用するには保存してください。";
+            } else {
+                const data = await api.sourceFolder(this.els.sourceFolderInput.value);
+                this.els.sourceFolderInput.value = data.savedPath;
+                this.renderSourceFolder(data);
+                if (!data.restartRequired) this.els.sourceFolderMessage.textContent = "保存しました。現在のフォルダーを引き続き使用します。";
+            }
+        } catch (error) {
+            this.els.sourceFolderMessage.textContent = error.message;
+        } finally {
+            state.sourceFolderBusy = false;
+            this.els.sourceFolderInput.disabled = false;
+            this.els.sourceFolderPickBtn.disabled = false;
+            this.els.sourceFolderSaveBtn.disabled = false;
+        }
+    },
+
     bindEvents() {
+        this.els.sourceFolderPickBtn.addEventListener("click", () => this.changeSourceFolder(true));
+        this.els.sourceFolderSaveBtn.addEventListener("click", () => this.changeSourceFolder());
         this.els.indexStartBtn.addEventListener("click", () => this.startIndex());
         this.els.indexFullBtn.addEventListener("click", () => this.startIndex("full"));
         this.els.indexCancelBtn.addEventListener("click", () => this.cancelIndex());
@@ -1203,6 +1377,8 @@ const ui = {
         state.resultCompletedAt = null;
         state.resultReceivedAt = null;
         state.resultAnswerEmpty = false;
+        state.resultAnswerQuality = null;
+        this.renderAnswerQuality();
         if (resume) {
             this.els.searchInput.value = query;
             this.els.searchModeSelect.value = mode;
@@ -1308,9 +1484,19 @@ const ui = {
                     this.startBudgetDisplay(ev.timeoutSeconds, ev.remainingSeconds);
                 } else if (ev.type === "result_meta") {
                     state.resultMeta = JSON.parse(JSON.stringify(ev));
+                    const model = ev.chatModel || "未使用";
+                    const digest = ev.modelDigest ? ` / sha256 ${ev.modelDigest.slice(0, 12)}…` : "";
+                    const modelSource = ev.modelSelectionSource ? " / 選択元 " + ev.modelSelectionSource : "";
+                    const think = ev.apiThinkValue ?? "未使用";
+                    this.els.resultMetaSummary.textContent = "モデル " + model + digest + modelSource + " ・ requested " + (ev.requestedReasoning || "off") + " ・ effective " + (ev.effectiveReasoning || "off") + " ・ think " + think + " ・ 思考表示 " + (ev.thinkingVisible ? "あり" : "なし");
+                    this.els.resultMetaSummary.hidden = false;
                 } else if (ev.type === "evidence") {
                     state.resultEvidence = JSON.parse(JSON.stringify(ev));
                     this.renderEvidence(ev);
+                    if (ev.answerQuality) {
+                        state.resultAnswerQuality = JSON.parse(JSON.stringify(ev.answerQuality));
+                        this.renderAnswerQuality();
+                    }
                 } else if (ev.type === "deep_progress") {
                     const remaining = Number.isFinite(ev.remainingSeconds) ? ` 残り${ev.remainingSeconds}秒` : "";
                     const counts = ` 資料${ev.documents || 0}件・読取${ev.units || 0}単位`;
@@ -1372,6 +1558,10 @@ const ui = {
                     // 受信時刻へフォールバックしていたため切り分けできなかった)。
                     state.resultCompletedAt = ev.completedAt || "";
                     state.resultReceivedAt = new Date().toISOString();
+                    if (ev.answerQuality) {
+                        state.resultAnswerQuality = JSON.parse(JSON.stringify(ev.answerQuality));
+                        this.renderAnswerQuality();
+                    }
                     if (state.activeMode === "search") {
                         this.els.searchResult.textContent = state.resultEvidence?.items?.length
                             ? "検索が完了しました。根拠一覧を確認してください。"
@@ -1389,6 +1579,8 @@ const ui = {
                     this.clearBudgetTimer();
                     state.resultMeta = null;
                     state.resultEvidence = null;
+                    state.resultAnswerQuality = null;
+                    this.renderAnswerQuality();
                     state.resultCompletedAt = null;
                     state.resultReceivedAt = null;
                     this.els.saveMarkdownBtn.hidden = true;
@@ -1401,6 +1593,8 @@ const ui = {
                 this.els.searchError.hidden = false;
                 state.resultMeta = null;
                 state.resultEvidence = null;
+                state.resultAnswerQuality = null;
+                this.renderAnswerQuality();
                 state.resultCompletedAt = null;
                 state.resultReceivedAt = null;
                 this.els.saveMarkdownBtn.hidden = true;
@@ -1448,6 +1642,21 @@ const ui = {
     _expansionLabel(item) {
         // 親子展開（見出しだけの検索候補から配下本文を追加した根拠）の由来と部分展開の表示。
         return item.groupPartial ? "見出し配下の本文を展開（部分展開）" : "見出し配下の本文を展開";
+    },
+
+    renderAnswerQuality() {
+        const quality = state.resultAnswerQuality;
+        const box = this.els.answerQuality;
+        const lines = answerQualityFormat.lines(quality);
+        if (!lines.length) {
+            box.hidden = true;
+            box.textContent = "";
+            box.className = "quality-msg";
+            return;
+        }
+        box.textContent = lines.join("\n");
+        box.className = answerQualityFormat.needsReview(quality) ? "quality-msg quality-review" : "quality-msg quality-ok";
+        box.hidden = false;
     },
 
     renderEvidence(ev) {
@@ -1621,6 +1830,7 @@ const ui = {
             `- UI受信時刻（UTC、参考値・サーバー完了時刻ではない）: ${this._markdownMeta(receivedAt)}`,
             `- UI受信時刻（JST、参考値・サーバー完了時刻ではない）: ${this._markdownMeta(this._formatJst(receivedAt))}`,
             `- モード: ${this._markdownMeta(modeLabel)}`,
+            ...answerQualityFormat.lines(state.resultAnswerQuality).map((line) => `- ${this._markdownMeta(line)}`),
             "",
             this._markdownTextBlock("質問", state.activeQuery),
             "",
@@ -1656,6 +1866,12 @@ const ui = {
             `- chatモデル: ${this._markdownMeta(meta.chatModel || "未使用")}`,
             `- Embeddingモデル: ${this._markdownMeta(meta.embeddingModel || "未使用")}`,
             `- 適用reasoning: ${this._markdownMeta(meta.reasoning || "off")}`,
+            `- requested reasoning: ${this._markdownMeta(meta.requestedReasoning || "off")}`,
+            `- effective reasoning: ${this._markdownMeta(meta.effectiveReasoning || meta.reasoning || "off")}`,
+            `- API think値: ${this._markdownMeta(meta.apiThinkValue)}`,
+            `- 思考表示: ${this._markdownMeta(meta.thinkingVisible ? "あり" : "なし")}`,
+            `- chat model digest: ${this._markdownMeta(meta.modelDigest || "未確認")}`,
+            `- chat model selection source: ${this._markdownMeta(meta.modelSelectionSource || "未確認")}`,
             `- route: ${this._markdownMeta(evidence.route)}`,
             `- indexState: ${this._markdownMeta(evidence.indexState)}`,
             `- 根拠ステータス: ${this._markdownMeta(evidence.evidenceStatus)}`,

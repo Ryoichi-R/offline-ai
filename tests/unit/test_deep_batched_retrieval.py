@@ -247,3 +247,10 @@ def test_core_document_is_read_even_if_five_other_documents_rank_first_in_one_vi
     assert "core.md" in read_paths
     assert result.diagnostics["documents"] <= deep_research.DEEP_MAX_DOCUMENTS
     assert any(e["reason"] == "document_limit" for e in result.ledger)
+
+
+def test_many_lower_ranked_chunks_do_not_outrank_a_concise_core_document():
+    ranked = [_ref("core.md", 1)] + [_ref("long-background.md", n) for n in range(1, 30)]
+    ordered = list(deep_research._order_by_document_relevance([ranked, ranked]))
+    assert ordered[0] == ("core.md", 1, 1)
+    assert len(ordered) == 30  # No candidates are dropped to improve rank.

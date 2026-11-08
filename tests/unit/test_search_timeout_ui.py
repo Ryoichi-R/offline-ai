@@ -359,7 +359,7 @@ function page(storage, behavior, storageFails = false) {
     });
     vm.runInContext(storageCode + '\nconst api = {' + apiCode + '};\nconst ui = {' +
         startCode + resumeCode + cancelCode + modeCode + `
-        els, clearBudgetTimer(){}, closeEvidenceViewer(){},pollHealthUpdate(){},updateSaveButton(){}
+        els, clearBudgetTimer(){}, closeEvidenceViewer(){},pollHealthUpdate(){},updateSaveButton(){},renderAnswerQuality(){}
     };`, context);
     return {requests,reads,els,context,run:code=>vm.runInContext(code,context)};
 }

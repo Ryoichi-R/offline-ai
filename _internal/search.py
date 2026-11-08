@@ -46,6 +46,7 @@ from prompt_templates import (
     SOURCE_INSTRUCTION_IMMUNITY_RESERVE_CHARS,
     KEYWORD_EXTRACTION_SYSTEM,
     SEARCH_PLAN_SYSTEM,
+    SEARCH_PLAN_SYSTEM_V2,
     SYSTEM_PROMPT,
     build_evidence_verification_prompt,
     build_user_prompt,
@@ -58,6 +59,13 @@ from model_config import (
     LEGACY_MODELS as _LEGACY_MODELS,
     detect_model_config,
     migrate_model_file,
+    MAC_MODEL_DIGESTS,
+    ModelConfigurationError,
+    canonical_model_reference,
+    model_call_timeout_seconds,
+    resolve_model_reasoning,
+    resolve_model_selection,
+    validate_model_digest,
 )
 
 try:
@@ -82,15 +90,19 @@ except ValueError as exc:
 from document_schema import load_metadata_sidecar, metadata_for_line_range
 from rerank import rerank_candidates
 import source_structure as _source_structure
+import answer_pipeline as _answer_pipeline  # noqa: E402
+import answer_policy as _answer_policy  # noqa: E402
 
 # --- 定数 ---
 COLLECT_SCRIPT = SCRIPT_DIR / "scripts" / "collect_skill_source.ps1"
-SKILL_SOURCE_DIR = SCRIPT_DIR.parent / "skill-source"
+from source_folder import load_source_root
+
+SKILL_SOURCE_DIR = load_source_root(SCRIPT_DIR.parent)
 MODEL_CONFIG = SCRIPT_DIR / ".model"
 
 logger = logging.getLogger("offlineai.search")
 
-COLLECT_SOURCES_TIMEOUT_S = 30  # PowerShell 実行タイムアウト（秒）
+COLLECT_SOURCES_TIMEOUT_S = 120 if sys.platform == "darwin" else 30  # PowerShell 実行タイムアウト（秒）
 
 # 機能フラグ: 環境変数で新機能の有効/無効を制御
 SEARCH_PHRASE_BONUS_ENABLED = os.environ.get(
@@ -333,9 +345,12 @@ def normalize_source_path(path: str | Path) -> str:
     text = str(path).replace("\\", "/").strip()
     marker = "skill-source/"
     lower = text.lower()
-    marker_index = lower.rfind(marker)
-    if marker_index >= 0:
-        text = text[marker_index + len(marker) :]
+    if lower.startswith(marker):
+        text = text[len(marker) :]
+    elif text.startswith("/") or re.match(r"^[A-Za-z]:/", text):
+        marker_index = lower.rfind(marker)
+        if marker_index >= 0:
+            text = text[marker_index + len(marker) :]
     text = text.lstrip("/")
     parts = []
     for part in text.split("/"):
@@ -373,12 +388,26 @@ def iter_source_files(source_root: Path | None = None) -> list[tuple[Path, str]]
     if not root.exists():
         return []
     files: list[tuple[Path, str]] = []
-    for source_file in root.rglob("*"):
-        if not source_file.is_file():
-            continue
-        rel = normalize_source_path(source_file.relative_to(root))
-        if is_allowed_source_path(rel):
-            files.append((source_file, rel))
+    # Prune before path normalization: an archive may itself contain a
+    # skill-source/ segment, which must not hide its .research-policy ancestor.
+    def scan_error(error):
+        raise error
+
+    for directory, names, filenames in os.walk(root, onerror=scan_error):
+        names[:] = sorted(
+            name
+            for name in names
+            if not name.startswith(".") and name.lower() not in EXCLUDED_SOURCE_DIRS
+        )
+        for name in sorted(filenames):
+            source_file = Path(directory) / name
+            if source_file.is_symlink() or not source_file.is_file():
+                continue
+            # Keep paths relative to this selected root, including visible
+            # directories literally named skill-source.
+            rel = source_file.relative_to(root).as_posix()
+            if is_allowed_source_path(rel):
+                files.append((source_file, rel))
     return files
 
 
@@ -395,13 +424,8 @@ def _migrate_model_file(model_path: Path, current_model: str) -> str:
 
 
 def _canonical_model_reference(model: str) -> str:
-    """Ollama の省略タグを ``:latest`` として正規化する。"""
-    normalized = model.strip()
-    last_segment = normalized.rsplit("/", 1)[-1]
-    if ":" not in last_segment and "@" not in last_segment:
-        return f"{normalized}:latest"
-    return normalized
-
+    """Ollamaの省略タグを共通resolverで正規化する。"""
+    return canonical_model_reference(model)
 
 def _is_model_available(model: str, timeout: float = 2.0) -> ModelStatus:
     """Ollama API でモデルの可用性を3状態で判定する。"""
@@ -425,6 +449,15 @@ def _is_model_available(model: str, timeout: float = 2.0) -> ModelStatus:
         return ModelStatus.UNKNOWN
     except Exception:
         return ModelStatus.UNKNOWN
+
+
+def get_model_identity(model: str, timeout: float = 5.0) -> dict:
+    """Ollama /api/tagsから選択モデルのタグとdigestを確認する。"""
+    request = urllib.request.Request(f"{OLLAMA_HOST}/api/tags", method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    digest = validate_model_digest(model, payload.get("models", []))
+    return {"model": model, "digest": digest}
 
 
 def _resolve_reasoning(cli_arg: Optional[str]) -> str:
@@ -483,10 +516,12 @@ def resolve_query(
     sys.exit(2)
 
 
-def detect_model() -> str:
-    """セットアップ時に記録されたモデル名を読み取る。旧モデルは自動移行する。"""
+def detect_model(cli_argument: str | None = None) -> str:
+    """共通優先順位でモデルを解決し、Macでは設定ファイルを書き換えない。"""
+    selection = resolve_model_selection(cli_argument, MODEL_CONFIG)
+    if sys.platform == "darwin" or selection.source != "model-file":
+        return selection.model
     return detect_model_config(MODEL_CONFIG)
-
 
 def find_powershell() -> str:
     """利用可能な PowerShell コマンドを返す。"""
@@ -689,7 +724,14 @@ def extract_matches_with_logging(response: dict) -> list:
 # ---------------------------------------------------------------------------
 
 
-def extract_keywords_via_llm(query: str, model: str) -> str:
+def extract_keywords_via_llm(
+    query: str,
+    model: str,
+    *,
+    timeout: float | None = None,
+    reasoning: str | None = None,
+    cancel_check=None,
+) -> str:
     """Ollama でキーワード抽出を行う。失敗時は元クエリをフォールバックとして返す。"""
     url = f"{OLLAMA_HOST}/api/chat"
     body = {
@@ -699,12 +741,25 @@ def extract_keywords_via_llm(query: str, model: str) -> str:
             {"role": "user", "content": extract_keywords_prompt(query)},
         ],
         "stream": False,
+        "think": resolve_model_reasoning(model, reasoning)["think"],
         "options": {
             "num_ctx": 2048,
             "num_batch": NUM_BATCH,
             "num_gpu": NUM_GPU,
         },
     }
+    if cancel_check is not None:
+        from deep_transport import run_worker
+        call_timeout = timeout or model_call_timeout_seconds(model, KEYWORD_EXTRACT_TIMEOUT)
+        try:
+            raw = run_worker({"operation": "chat", "host": OLLAMA_HOST, "body": body,
+                              "timeout": call_timeout, "retry_without_think": model not in MAC_MODEL_DIGESTS},
+                             timeout=call_timeout,
+                             cancel_check=cancel_check)
+            return raw.strip() or query
+        except Exception:
+            cancel_check()
+            return query
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -713,7 +768,10 @@ def extract_keywords_via_llm(query: str, model: str) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=KEYWORD_EXTRACT_TIMEOUT) as resp:
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout or model_call_timeout_seconds(model, KEYWORD_EXTRACT_TIMEOUT),
+        ) as resp:
             raw = resp.read()
             if not raw:
                 print(
@@ -3254,6 +3312,10 @@ def _split_terms(text: str) -> list[str]:
         cleaned = term.strip().lower()
         if len(cleaned) >= 2:
             terms.append(cleaned)
+        # Japanese questions do not normally separate nouns with spaces.
+        # Keep the original phrase (mixed-script names/inflections), and add
+        # contiguous Han/Katakana runs so a subject is not lost inside prose.
+        terms.extend(re.findall(r"[\u3400-\u9fff々]{2,}|[ァ-ヶー]{2,}", cleaned))
     return list(dict.fromkeys(terms))
 
 
@@ -3321,14 +3383,21 @@ def keyword_search_chunks(
                 continue
             hit_terms.append(term)
             idf = math.log((total + 1) / (df.get(term, 0) + 1)) + 1.0
-            score += count * idf
+            # Saturate repetitions: boilerplate repeated in a long chunk must
+            # not overwhelm a rare subject mentioned once in a short chunk.
+            specificity = (
+                min(len(term), 8)
+                if re.fullmatch(r"[\u3400-\u9fff々]{2,}|[ァ-ヶー]{2,}", term)
+                else 1.0
+            )
+            score += (2.0 * count / (count + 1.0)) * idf * specificity
             if term in chunk.get("heading", "").lower():
                 score += 3.0
             if term in Path(chunk.get("path", "")).stem.lower():
                 score += 2.0
-        for phrase in phrase_terms:
-            if phrase in haystack:
-                score += 0.4
+        # Overlapping n-grams of polite request text are not independent
+        # evidence. Keep them as a bounded fallback for mixed-script words.
+        score += min(1.0, 0.1 * sum(phrase in haystack for phrase in phrase_terms))
         if score <= 0:
             continue
         snippet = text[:SNIPPET_CHAR_LIMIT]
@@ -3467,31 +3536,54 @@ def _parse_json_object(text: str) -> dict | None:
         return None
 
 
-def create_search_plan(query: str, model: str) -> dict:
-    """検索計画JSONをLLMに要求する。失敗時は従来キーワード抽出へ戻す。"""
+def create_search_plan(
+    query: str,
+    model: str,
+    *,
+    timeout: float | None = None,
+    reasoning: str | None = None,
+    with_intent: bool = False,
+    cancel_check=None,
+) -> dict:
+    """検索計画JSONをLLMに要求する。失敗時は従来キーワード抽出へ戻す。
+
+    ``with_intent`` (回答方針v2) では、同じ1回の要求で質問の意図(answer_intent)も受け取り、
+    計画の ``answer_intent`` に検証済みの意図を入れる。計画の失敗・無効時は明示要求だけの
+    保守的な意図（暗黙の詳細要求を足さない）になる。
+    """
+    explicit_intent = _answer_policy.extract_explicit_intent(query) if with_intent else None
+
+    def with_intent_key(plan: dict, intent=None) -> dict:
+        if with_intent:
+            plan["answer_intent"] = (intent or explicit_intent).to_dict()
+        return plan
+
     if not _agentic_lite_enabled():
-        keywords = extract_keywords_via_llm(query, model)
-        return {
+        options = {"timeout": timeout}
+        if model in MAC_MODEL_DIGESTS:
+            options["reasoning"] = reasoning
+        if cancel_check is not None:
+            options["cancel_check"] = cancel_check
+        keywords = extract_keywords_via_llm(query, model, **options)
+        return with_intent_key({
             "keywords": _split_terms(keywords),
             "search_queries": [query],
             "must_find_terms": [],
             "query_type": "standard",
             "answer_should_compare": False,
             "fallback": "agentic_disabled",
-        }
+        })
 
     url = f"{OLLAMA_HOST}/api/chat"
     body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SEARCH_PLAN_SYSTEM},
+            {"role": "system", "content": SEARCH_PLAN_SYSTEM_V2 if with_intent else SEARCH_PLAN_SYSTEM},
             {"role": "user", "content": search_plan_prompt(query)},
         ],
         "stream": False,
-        # 検索計画は短いJSONを返す補助処理であり、thinking tokenは不要。
-        # Qwen3.5等で既定thinkingが有効だと30秒timeout内にモデル出力へ
-        # 到達できないため、明示的に無効化する。
-        "think": False,
+        # 固定大型モデル比較では通常回答・deepと同じ要求推論設定を使う。
+        "think": resolve_model_reasoning(model, reasoning)["think"],
         "keep_alive": OLLAMA_KEEP_ALIVE,
         # 補助chatも回答chatと同じcontext/load契約を明示する。Ollamaが
         # 4096等のモデル既定へ戻ると、keep_aliveが有効でもchat間で再loadが
@@ -3505,9 +3597,16 @@ def create_search_plan(query: str, model: str) -> dict:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=KEYWORD_EXTRACT_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        parsed = _parse_json_object(data.get("message", {}).get("content", ""))
+        if cancel_check is not None:
+            from deep_transport import run_worker
+            call_timeout = timeout or model_call_timeout_seconds(model, KEYWORD_EXTRACT_TIMEOUT)
+            raw = run_worker({"operation": "chat", "host": OLLAMA_HOST, "body": body,
+                              "timeout": call_timeout}, timeout=call_timeout, cancel_check=cancel_check)
+            parsed = _parse_json_object(raw)
+        else:
+            with urllib.request.urlopen(req, timeout=timeout or model_call_timeout_seconds(model, KEYWORD_EXTRACT_TIMEOUT)) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            parsed = _parse_json_object(data.get("message", {}).get("content", ""))
         if parsed:
             keywords = parsed.get("keywords", [])
             if isinstance(keywords, str):
@@ -3521,28 +3620,375 @@ def create_search_plan(query: str, model: str) -> dict:
             ]
             if not parsed["search_queries"]:
                 parsed["search_queries"] = [query]
+            if with_intent:
+                try:
+                    intent = _answer_policy.parse_intent_json(
+                        parsed.get("answer_intent"), query, explicit_intent
+                    )
+                except ValueError:
+                    intent = _answer_policy.AnswerIntent.from_dict(
+                        {**explicit_intent.to_dict(), "source": "plan_failed"}
+                    )
+                parsed = with_intent_key(parsed, intent)
             return parsed
     except Exception:
+        if cancel_check is not None:
+            cancel_check()
         # search plan が timeout / transport error になった直後に同じ chat model へ
         # keyword抽出を再送すると、失敗時の待ち時間が最大2倍になる。元クエリを使う
         # 決定的fallbackへ直行し、bounded retrieval の上限を維持する。
-        return {
+        return with_intent_key({
             "keywords": [query],
             "search_queries": [query],
             "must_find_terms": [],
             "query_type": "standard",
             "answer_should_compare": False,
             "fallback": "plan_request_failed",
-        }
+        })
 
-    return {
+    return with_intent_key({
         "keywords": [query],
         "search_queries": [query],
         "must_find_terms": [],
         "query_type": "standard",
         "answer_should_compare": False,
         "fallback": "plan_parse_failed",
+    })
+
+
+# ---------------------------------------------------------------------------
+# 回答方針v2: 通常回答の共通実行（CLI/Web）
+# ---------------------------------------------------------------------------
+
+# 回答草稿・検査JSONの出力上限（tokens）。本文のストリーミングとは別の非表示生成。
+ANSWER_JSON_NUM_PREDICT = 8192
+# 新回答品質経路でCLIに時間上限が無い場合に付ける品質処理用の予算（秒）。
+ANSWER_V2_DEFAULT_SECONDS = 300
+ANSWER_V2_NO_EVIDENCE_TEXT = "ローカル資料に該当する情報が見つかりませんでした。"
+# 検索チャンクは前チャンク末尾の重複(CHUNK_OVERLAP_CHARS)を保持するが、start_lineは見出し行になる
+# （既存仕様）。重複部分は数行前の本文なので、原本との行範囲照合はその分だけ広げる。ファイルの
+# SHA-256一致は別に確認するため、引用が現在の原本に存在することの保証は変わらない。
+CHUNK_OVERLAP_LINE_ALLOWANCE = 20
+
+
+def _role_sort_key(order: int, match: dict, intent) -> tuple:
+    """役割の優先度→見出しが求める情報の名詞句か→確信度→元の順位。"""
+    verdict = _answer_policy.classify_role(
+        str(match.get("snippet") or match.get("text") or ""),
+        str(match.get("heading") or ""),
+        intent=intent,
+    )
+    return (
+        _answer_policy.role_priority(verdict.role, intent.granularity),
+        0 if "heading_answer_noun" in verdict.reasons else 1,
+        -round(verdict.confidence, 2),
+        order,
+    ), verdict
+
+
+def _aspect_order(matches: list[dict], intent, exclude: set[int]) -> list[int]:
+    """必須観点ごとに、その観点の根拠になり得る最上位の候補（元の順位）を1件ずつ選ぶ。
+
+    「期限・時期」のような並べた観点は語ごとに枠を分け、見出しの一致を本文の一致より先に探す。
+    """
+    units = [
+        unit
+        for aspect in tuple(getattr(intent, "required_aspects", ()) or ())
+        for unit in _answer_policy.aspect_units(aspect)
+    ][:ANSWER_V2_ASPECT_SLOTS]
+    described = []
+    for match in matches:
+        text = str(match.get("snippet") or match.get("text") or "")
+        heading = str(match.get("heading") or "")
+        described.append((heading, text, _answer_policy.classify_role(text, heading, intent=intent).role))
+    overview = getattr(intent, "granularity", "overview") == "overview"
+    picked: list[int] = []
+    for unit in units:
+        for heading_only in (True, False):
+            found = next(
+                (
+                    order
+                    for order, (heading, text, role) in enumerate(described)
+                    if order not in exclude
+                    and order not in picked
+                    # 概要質問では、実務詳細（チェック表・様式）を観点の枠へ上げない。
+                    and not (overview and role == _answer_policy.ROLE_PRACTICAL)
+                    and _answer_policy.matches_aspect(unit, heading, text, role, intent, heading_only=heading_only)
+                ),
+                None,
+            )
+            if found is not None:
+                picked.append(found)
+                break
+    return picked
+
+
+def prioritize_matches_by_role(matches: list[dict], intent) -> list[dict]:
+    """採用前の候補を役割別に安定ソートする（回答方針v2）。
+
+    直接回答・限定の根拠を、実務詳細の表より先に件数枠へ入れる。同じ役割の中では、
+    見出しが求める情報そのもの（「審査する案件」等）の候補と確信度の高い候補を先にする
+    （P4実資料: 確信度の二値だけでは、手続の節が直接規定より先に根拠枠を使った）。
+    直接回答の上位2件の直後には、必須観点（背景・時期等）ごとの根拠を1件ずつ置き、最終の件数枠で
+    観点の根拠が落ちないようにする（P4実資料: 背景・審査時期の根拠が最終5件に入らなかった）。
+    判定できない候補は元の順位のまま並ぶ（捨てない）。
+    """
+    decorated = [(_role_sort_key(order, match, intent)[0], match) for order, match in enumerate(matches)]
+    decorated.sort(key=lambda item: item[0])
+    ranked = [item[1] for item in decorated]
+    head = min(ANSWER_V2_ASPECT_HEAD, len(ranked))
+    promoted = _aspect_order(ranked, intent, set(range(head)))
+    rest = [match for order, match in enumerate(ranked) if order >= head and order not in promoted]
+    return ranked[:head] + [ranked[order] for order in promoted] + rest
+
+
+# v2の通常回答: 候補の件数枠に入れる前に役割判定する候補群の大きさと、役割で先に埋める割合。
+# 旧経路は検索viewごとの上位8件で打ち切るため、下位の直接規定は後段の並べ替えでは救えない
+# （P4実資料: 設置要綱第3条は質問viewで31位・根拠規定viewで26位）。
+ANSWER_V2_ROLE_POOL = env_int("OFFLINE_AI_ANSWER_V2_ROLE_POOL", 40, min_value=1)
+ANSWER_V2_ROLE_SLOT_SHARE = 0.6
+# 必須観点の根拠枠（観点ごとに1件、最大3観点）と、その前に置く直接回答の件数。
+ANSWER_V2_ASPECT_SLOTS = 3
+ANSWER_V2_ASPECT_HEAD = 2
+
+
+def select_matches_by_role(matches: list[dict], intent, limit: int) -> list[dict]:
+    """広い候補群から件数枠を選ぶ（回答方針v2の通常回答）。
+
+    枠の6割を直接回答・限定の候補（見出し・確信度の強い順）へ先に配り、次に必須観点ごとの根拠を
+    1件ずつ、残りは元の順位で埋める。役割判定の誤りで関連候補を失わないよう、元順位の枠を必ず残す。
+    LLMは呼ばない。
+    """
+    if limit <= 0:
+        return []
+    keyed = [_role_sort_key(order, match, intent) for order, match in enumerate(matches)]
+    preferred = sorted(
+        (key, order)
+        for order, (key, verdict) in enumerate(keyed)
+        if verdict.role in _answer_policy.PRIORITY_ROLES
+    )
+    slots = min(limit, max(1, math.ceil(limit * ANSWER_V2_ROLE_SLOT_SHARE)))
+    chosen = [order for _, order in preferred[:slots]]
+    taken = set(chosen)
+    for order in _aspect_order(matches, intent, taken):
+        if len(chosen) < limit:
+            chosen.append(order)
+            taken.add(order)
+    for order in range(len(matches)):
+        if len(chosen) >= limit:
+            break
+        if order not in taken:
+            chosen.append(order)
+            taken.add(order)
+    return [matches[order] for order in chosen]
+
+
+def chat_json_stream(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    timeout: float,
+    reasoning: str | None = None,
+    cancel_check=None,
+    touch=None,
+) -> dict:
+    """非表示のJSON生成。ストリームで受けて、トークンごとに中止・期限を確認する。
+
+    不正なJSON・出力上限(length)・JSON以外はValueError。期限超過はTimeoutError。
+    回答本文のストリーミング(stream_ollama_chat)とは別で、思考は保持しない。
+    """
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": True,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "think": resolve_model_reasoning(model, reasoning)["think"],
+        "options": {**build_chat_options(temperature=0), "num_predict": ANSWER_JSON_NUM_PREDICT},
     }
+    if cancel_check is not None:
+        # A disposable process owns the HTTP connection. Terminate and reap it
+        # even while waiting for headers/first token; never stop shared Ollama.
+        from deep_transport import run_worker
+
+        def check_control():
+            cancel_check()
+
+        raw = run_worker(
+            {"operation": "chat", "host": OLLAMA_HOST, "body": body,
+             "timeout": timeout, "retry_without_think": model not in MAC_MODEL_DIGESTS},
+            timeout=timeout, cancel_check=check_control, touch=touch,
+        )
+        parsed = _parse_json_object(raw)
+        if parsed is None:
+            raise ValueError("model output is not a JSON object")
+        return parsed
+
+    deadline = time.monotonic() + timeout
+    url = f"{OLLAMA_HOST}/api/chat"
+
+    def request(payload: dict):
+        return urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=timeout,
+        )
+
+    parts: list[str] = []
+    done_reason = "stop"
+    try:
+        response = request(body)
+    except urllib.error.HTTPError as exc:
+        if model in MAC_MODEL_DIGESTS or "think" not in body or exc.code < 400:
+            raise
+        body.pop("think", None)
+        response = request(body)
+    with response as resp:
+        for kind, text in iter_stream_events(resp):
+            if cancel_check:
+                cancel_check()
+            if touch:
+                touch()
+            if time.monotonic() > deadline:
+                raise TimeoutError("answer call timeout")
+            if kind == "content":
+                parts.append(text)
+            elif kind == "done":
+                done_reason = text
+    if done_reason == "length":
+        raise ValueError("model output incomplete")
+    parsed = _parse_json_object("".join(parts))
+    if parsed is None:
+        raise ValueError("model output is not a JSON object")
+    return parsed
+
+
+class SkillSourceLineReader:
+    """原本の行を返す（G1用）。ハッシュが検索時と違えば原本変更として取得不能。"""
+
+    def __init__(self, root: Path | None = None):
+        self.root = (root or SKILL_SOURCE_DIR).resolve()
+        self._cache: dict[str, tuple[str, list[str]] | None] = {}
+
+    def __call__(self, path: str, sha256: str) -> list[str] | None:
+        if path not in self._cache:
+            entry = None
+            try:
+                resolved = (self.root / path).resolve()
+                if resolved.is_relative_to(self.root):
+                    data = resolved.read_bytes()
+                    entry = (
+                        hashlib.sha256(data).hexdigest(),
+                        data.decode("utf-8", errors="replace").splitlines(),
+                    )
+            except (OSError, ValueError):
+                entry = None
+            self._cache[path] = entry
+        entry = self._cache[path]
+        if entry is None or (sha256 and entry[0] != sha256):
+            return None
+        return entry[1]
+
+
+def answer_v2_note_lines(retrieval) -> list[str]:
+    """検索段階の不足・矛盾の信号を、草稿生成へ伝える注記にする（旧promptの契約を移す）。"""
+    lines: list[str] = []
+    matches = list(getattr(retrieval, "matches", []) or [])
+    status = str(getattr(retrieval, "evidence_status", "sufficient"))
+    if status != "sufficient":
+        lines.append(
+            f"根拠ステータス: {status}。根拠が質問の対象・限定条件に対応する項目だけを書き、"
+            "対応しない観点はunanswered_aspectsへ入れてください（関連語や別対象の数値を流用しない）。"
+        )
+    if any(m.get("constraint_conflict") for m in matches):
+        lines.append(
+            "限定条件の明示的な矛盾: あり。対象外の資料に記載された数値・期限・割合を引用・比較せず、"
+            "該当情報なしとしてunanswered_aspectsへ入れてください。"
+        )
+    if any(m.get("source") == "expanded" and m.get("group_partial") for m in matches):
+        lines.append("部分展開の根拠は、手順・一覧・条件の全体を網羅したと述べないでください。")
+    return lines
+
+
+def run_answer_v2(
+    query: str,
+    retrieval,
+    *,
+    model: str,
+    reasoning: str | None = None,
+    total_seconds: float = ANSWER_V2_DEFAULT_SECONDS,
+    remaining_seconds=None,
+    cancel_check=None,
+    touch=None,
+    source_root: Path | None = None,
+):
+    """検索済みの根拠から、検査済みの主張だけで回答を構成する（通常回答・回答方針v2）。
+
+    retrieval は RetrievalResult。意図は検索計画の answer_intent（無ければ明示要求だけ）。
+    戻り値は answer_pipeline.PipelineResult。中止・全体期限はそのまま例外で伝わる。
+    """
+    plan = getattr(retrieval, "plan", None) or {}
+    try:
+        intent = _answer_policy.AnswerIntent.from_dict(plan.get("answer_intent"))
+    except (ValueError, TypeError):
+        intent = _answer_policy.extract_explicit_intent(query)
+    evidence = _answer_pipeline.evidence_from_matches(list(getattr(retrieval, "matches", []) or []))
+    if not evidence:
+        quality = _answer_policy.build_quality(
+            {}, kind="fallback", unconfirmed_aspects=intent.required_aspects,
+            message="質問に該当する資料を確認できませんでした。",
+        )
+        return _answer_pipeline.PipelineResult(
+            ANSWER_V2_NO_EVIDENCE_TEXT, "fallback", quality,
+            {"policy": _answer_policy.POLICY_V2, "result": "no_evidence"}, [],
+        )
+
+    def is_control(exc: BaseException) -> bool:
+        if getattr(exc, "code", "") in {"cancelled", "timeout", "stall"}:
+            return True
+        if cancel_check is None:
+            return False
+        try:
+            cancel_check()
+        except Exception:
+            return True
+        return False
+
+    clock = _answer_policy.StageClock(total_seconds, "normal", remaining_fn=remaining_seconds)
+    clock.enter("generate")
+    ledger = _answer_policy.CallLedger()
+    if getattr(intent, "source", "") == "llm":
+        ledger.record("intent", "ok", code="search_plan")
+
+    def call_json(system: str, user: str, *, timeout: float) -> dict:
+        return chat_json_stream(
+            model, system, user, timeout=timeout, reasoning=reasoning,
+            cancel_check=cancel_check, touch=touch,
+        )
+
+    env = _answer_pipeline.PipelineEnv(
+        call_json=call_json,
+        clock=clock,
+        ledger=ledger,
+        is_control_error=is_control,
+        check=cancel_check,
+        source_lines_for=SkillSourceLineReader(source_root),
+        window_slack=CHUNK_OVERLAP_LINE_ALLOWANCE,
+        check_cap_seconds=_answer_policy.CHECK_CALL_CAP_SECONDS["normal"],
+        draft_cap_seconds=model_call_timeout_seconds(model, 60),
+    )
+    return _answer_pipeline.run_answer_pipeline(
+        query, intent, evidence, env,
+        fallback_reason="検査済みの説明を構成できませんでした。",
+        note_lines=answer_v2_note_lines(retrieval) or None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3655,6 +4101,7 @@ def verify_evidence_support(
     *,
     cancel_check=None,
     timeout: float,
+    reasoning: str | None = None,
 ) -> dict:
     """採用根拠が質問に答えているかをLLMへ判定させる（案A）。
 
@@ -3664,8 +4111,8 @@ def verify_evidence_support(
     そのまま呼び出し元へ伝播させる（検証の失敗として扱わない契約）。
 
     検索計画（``create_search_plan``）と同じ ``num_ctx``・``num_batch``・
-    ``num_gpu``・``keep_alive``・``think=False`` を使い、モデルの再ロードを
-    起こさない。
+    ``num_gpu``・``keep_alive`` を使い、モデルの再ロードを起こさない。固定大型
+    モデルでは通常回答・deepと同じ要求推論設定を適用する。
     """
     if cancel_check:
         cancel_check()
@@ -3678,7 +4125,7 @@ def verify_evidence_support(
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "think": False,
+        "think": resolve_model_reasoning(model, reasoning)["think"],
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": build_chat_options(temperature=0),
     }
@@ -5261,6 +5708,7 @@ def run_retrieval_pipeline(
     cancel_check=None,
     mode: str = "answer",
     remaining_seconds=None,
+    answer_policy: str | None = None,
 ) -> RetrievalResult:
     """CLI/Web 共通の bounded retrieval pipeline。
 
@@ -5276,6 +5724,12 @@ def run_retrieval_pipeline(
     if mode not in {"answer", "search"}:
         raise ValueError("invalid retrieval mode")
     search_only = mode == "search"
+    # 回答方針v2は要求ごとに一度だけ解決し、検索・選別・回答の全経路を固定する。
+    policy_v2 = (
+        not search_only
+        and _answer_policy.resolve_policy_version(answer_policy) == _answer_policy.POLICY_V2
+    )
+    answer_intent = None
 
     def status(text: str) -> None:
         if emit_status:
@@ -5299,11 +5753,36 @@ def run_retrieval_pipeline(
         }
     else:
         status("検索計画を作成しています...")
-        plan = create_search_plan(query, model)
+        plan_timeout = model_call_timeout_seconds(model, KEYWORD_EXTRACT_TIMEOUT)
+        if remaining_seconds is not None:
+            plan_timeout = min(plan_timeout, max(0.0, float(remaining_seconds())))
+        if plan_timeout <= 0:
+            check_cancel()
+            raise TimeoutError("search deadline expired")
+        # with_intentはv2のときだけ渡し、旧経路の呼出シグネチャを保つ。
+        intent_kwargs = {"with_intent": True} if policy_v2 else {}
+        if cancel_check is not None:
+            intent_kwargs["cancel_check"] = check_cancel
+        if model in MAC_MODEL_DIGESTS:
+            plan = create_search_plan(
+                query, model, timeout=plan_timeout, reasoning=reasoning, **intent_kwargs
+            )
+        else:
+            plan = create_search_plan(query, model, **intent_kwargs)
     keywords = [str(x) for x in plan.get("keywords", []) if str(x).strip()]
     queries = [str(x) for x in plan.get("search_queries", []) if str(x).strip()]
     if query not in queries:
         queries.insert(0, query)
+    if policy_v2:
+        try:
+            answer_intent = _answer_policy.AnswerIntent.from_dict(plan.get("answer_intent"))
+        except (ValueError, TypeError):
+            answer_intent = _answer_policy.extract_explicit_intent(query)
+        plan = {**plan, "answer_intent": answer_intent.to_dict()}
+        # 質問そのものとは別に、根拠規定を探す検索viewを候補数制限の前に加える。
+        rule_query = _answer_policy.rule_finding_query(answer_intent)
+        if rule_query and rule_query not in queries:
+            queries.insert(1 if queries and queries[0] == query else 0, rule_query)
     queries = list(dict.fromkeys(queries))[:MAX_QUERY_VARIANTS]
     if search_only:
         queries = [query]
@@ -5382,6 +5861,12 @@ def run_retrieval_pipeline(
     candidate_limit = (
         RERANK_CONFIG.top_n if rerank_enabled else RETRIEVAL_CANDIDATE_LIMIT
     )
+    # v2: 件数枠の前に広い候補群で役割判定する（再順位付けがある場合はその上限に従う）。
+    role_pool = (
+        max(candidate_limit, ANSWER_V2_ROLE_POOL)
+        if answer_intent is not None and not rerank_enabled
+        else candidate_limit
+    )
 
     for attempt_index in range(max_attempts):
         check_cancel()
@@ -5399,7 +5884,7 @@ def run_retrieval_pipeline(
                     queries,
                     embed_model,
                     embed_index,
-                    top_k=candidate_limit,
+                    top_k=role_pool,
                     raise_on_error=search_only,
                 )
             except Exception as e:
@@ -5424,6 +5909,8 @@ def run_retrieval_pipeline(
             extra: dict = {}
             if search_query in precomputed_by_query:
                 extra["precomputed_embed_matches"] = precomputed_by_query[search_query]
+            if role_pool != candidate_limit:
+                extra["candidate_limit"] = role_pool
             attempt_matches.extend(
                 _run_single_retrieval(
                     search_query,
@@ -5437,8 +5924,11 @@ def run_retrieval_pipeline(
         combined = merge_and_filter_matches(
             combined,
             attempt_matches,
-            candidate_limit=candidate_limit,
+            candidate_limit=role_pool,
         )
+        if role_pool != candidate_limit:
+            # 旧経路と同じ件数（merge_and_filter_matchesの上限=枠の2倍）へ役割優先で絞る。
+            combined = select_matches_by_role(combined, answer_intent, candidate_limit * 2)
         if rerank_enabled:
             check_cancel()
             status("検索結果を再順位付けしています...")
@@ -5456,9 +5946,13 @@ def run_retrieval_pipeline(
         # 検索候補へ書き戻すと再統合を招くため）。
         attempt_trace: dict = {"attempt": attempt_index + 1}
         attempt_traces.append(attempt_trace)
+        # v2: 直接回答・限定の根拠を、実務詳細の表より先に件数枠へ入れる（捨てない安定ソート）。
+        ranked_input = (
+            prioritize_matches_by_role(combined, answer_intent) if answer_intent is not None else combined
+        )
         ranked_evidence, _, _ = finalize_ranked_matches(
             query,
-            combined,
+            ranked_input,
             must_find_terms=plan.get("must_find_terms", []),
             source_chunks=source_chunks if expansion_enabled else None,
             source_root=SKILL_SOURCE_DIR,
@@ -5532,6 +6026,13 @@ def run_retrieval_pipeline(
     )
     evidence_char_limit = compute_evidence_char_limit(shell_chars)
     final_trace: dict = {"stage": "prompt_budget", "evidence_char_limit": evidence_char_limit}
+    if answer_intent is not None:
+        final_trace["answer_policy"] = {
+            "version": _answer_policy.POLICY_V2,
+            "granularity": answer_intent.granularity,
+            "intent_source": answer_intent.source,
+            "required_aspects": len(answer_intent.required_aspects),
+        }
     # 最終出力時の根拠予算。制限前に検出済みの矛盾は維持したまま、実際に
     # 採用した本文だけで信頼度・sufficient判定（完全構造根拠の経路を含む）を
     # 再照合する。切り詰めが無ければループ内の判定と同じ結果になる。
@@ -5564,17 +6065,27 @@ def run_retrieval_pipeline(
                 verify_timeout = (
                     EVIDENCE_VERIFY_TIMEOUT
                     if budget is None
-                    else min(EVIDENCE_VERIFY_TIMEOUT, budget)
+                    else min(model_call_timeout_seconds(model, EVIDENCE_VERIFY_TIMEOUT), budget)
                 )
                 verify_started = time.perf_counter()
                 try:
-                    answer_support = verify_evidence_support(
-                        query,
-                        matches,
-                        model,
-                        cancel_check=check_cancel,
-                        timeout=verify_timeout,
-                    )
+                    if model in MAC_MODEL_DIGESTS:
+                        answer_support = verify_evidence_support(
+                            query,
+                            matches,
+                            model,
+                            cancel_check=check_cancel,
+                            timeout=verify_timeout,
+                            reasoning=reasoning,
+                        )
+                    else:
+                        answer_support = verify_evidence_support(
+                            query,
+                            matches,
+                            model,
+                            cancel_check=check_cancel,
+                            timeout=verify_timeout,
+                        )
                 except EvidenceVerificationError as exc:
                     # 検証専用のtimeout・接続失敗・JSON不正・矛盾拒否は failed
                     # として回答を継続する（利用者キャンセル・全体タイムアウト
@@ -5645,12 +6156,7 @@ def run_retrieval_pipeline(
 def build_chat_payload(
     model: str, system_prompt: str, user_prompt: str, reasoning: Optional[str] = None
 ) -> dict:
-    """Ollama Chat API 用のリクエストボディを構築する。
-
-    think は常に明示送信する契約とする。reasoning が None / "" / "off" なら
-    通常はFalse、内部推論を無効化できないgpt-ossは最小のlowを送る。
-    low/medium/highの明示指定はそのまま送る（F-7: 未送信による既定値復帰を防ぐ）。
-    """
+    """Ollama Chat API用payload。thinkの型はモデルfamilyごとに解決する。"""
     body = {
         "model": model,
         "messages": [
@@ -5661,16 +6167,8 @@ def build_chat_payload(
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": build_chat_options(),
     }
-    if reasoning in ("low", "medium", "high"):
-        body["think"] = reasoning
-    elif model.rsplit("/", 1)[-1].split(":", 1)[0].lower() == "gpt-oss":
-        # GPT-OSS cannot disable internal reasoning; use its supported minimum.
-        # The Web service independently hides thinking events for reasoning=off.
-        body["think"] = "low"
-    else:
-        body["think"] = False
+    body["think"] = resolve_model_reasoning(model, reasoning)["think"]
     return body
-
 
 VERIFICATION_DOWNGRADE_NOTE = (
     "根拠検証: 採用根拠は質問に十分答えていないと判定したため、"
@@ -5814,12 +6312,14 @@ def iter_stream_chunks(resp):
             yield text
 
 
-def _iter_stream(resp, *, show_thinking: bool = False) -> list[str]:
+def _iter_stream(resp, *, show_thinking: bool = False, cancel_check=None) -> list[str]:
     """Ollama ストリーミングレスポンスを逐次パースし表示する。"""
     full_response = []
     thinking_open = False
     done_reason = "stop"
     for kind, text in iter_stream_events(resp):
+        if cancel_check:
+            cancel_check()
         if kind == "thinking":
             if show_thinking:
                 if not thinking_open:
@@ -5849,16 +6349,21 @@ def stream_ollama_chat(
     reasoning: Optional[str] = None,
     *,
     show_thinking: bool = False,
+    cancel_check=None,
+    remaining_seconds=None,
 ) -> str:
     """Ollama Chat API にストリーミングリクエストを送信し、応答を逐次表示する。
 
     reasoning が指定されている場合、think パラメータを付与する。
-    think パラメータでエラーが発生した場合は除去して1回だけ再送を試行する
+    固定Mac候補以外は、think パラメータでエラーが発生した場合に除去して1回だけ再送を試行する
     （送信した think の値に関わらず、body に think キーが含まれていれば対象）。
     ソケットの読取タイムアウトは生成フェーズの stall 上限と揃える。
     """
     url = f"{OLLAMA_HOST}/api/chat"
     body = build_chat_payload(model, system_prompt, user_prompt, reasoning)
+    call_timeout = model_call_timeout_seconds(model, GENERATION_STALL_TIMEOUT)
+    if remaining_seconds is not None:
+        call_timeout = min(call_timeout, max(0.001, float(remaining_seconds())))
     payload = json.dumps(body).encode("utf-8")
 
     req = urllib.request.Request(
@@ -5871,10 +6376,10 @@ def stream_ollama_chat(
     full_response = []
 
     try:
-        with urllib.request.urlopen(req, timeout=GENERATION_STALL_TIMEOUT) as resp:
-            full_response = _iter_stream(resp, show_thinking=show_thinking)
+        with urllib.request.urlopen(req, timeout=call_timeout) as resp:
+            full_response = _iter_stream(resp, show_thinking=show_thinking, cancel_check=cancel_check)
     except urllib.error.HTTPError as e:
-        if "think" in body and e.code >= 400:
+        if model not in MAC_MODEL_DIGESTS and "think" in body and e.code >= 400:
             # think パラメータを除去して再試行
             print(
                 f"[WARN] think パラメータでエラー({e.code})。通常モードで再試行します",
@@ -5888,8 +6393,8 @@ def stream_ollama_chat(
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(retry_req, timeout=GENERATION_STALL_TIMEOUT) as resp:
-                full_response = _iter_stream(resp, show_thinking=show_thinking)
+            with urllib.request.urlopen(retry_req, timeout=call_timeout) as resp:
+                full_response = _iter_stream(resp, show_thinking=show_thinking, cancel_check=cancel_check)
         else:
             raise
     except urllib.error.URLError as e:
@@ -5897,6 +6402,8 @@ def stream_ollama_chat(
         print(msg, flush=True)
         full_response.append(msg)
     except TimeoutError:
+        if cancel_check:
+            cancel_check()
         msg = "\n\n[タイムアウト] Ollama からの応答がタイムアウトしました。"
         print(msg, flush=True)
         full_response.append(msg)
@@ -5928,6 +6435,12 @@ def main():
         "--query-file", type=str, default=None, help="Path to file containing query"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Chat model tag (CLI > OFFLINE_AI_CHAT_MODEL > _internal/.model)",
+    )
+    parser.add_argument(
         "--reasoning",
         type=str,
         default=None,
@@ -5955,7 +6468,31 @@ def main():
     args = parser.parse_args()
 
     query = resolve_query(query_file=args.query_file, query_positional=args.query)
+    selection = resolve_model_selection(args.model, MODEL_CONFIG)
+    selected_model = selection.model
+    if sys.platform != "darwin" and selection.source == "model-file":
+        # Keep the established Windows migration for legacy values in .model.
+        selected_model = detect_model()
     reasoning = _resolve_reasoning(args.reasoning)
+    try:
+        policy = _answer_policy.resolve_policy_version()
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+    model_digest = None
+    if args.mode != "search" and sys.platform == "darwin":
+        if selected_model not in MAC_MODEL_DIGESTS:
+            print(
+                "[ERROR] Macの通常・deep実行では固定digest付き候補だけを使用できます",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        try:
+            model_digest = get_model_identity(selected_model)["digest"]
+        except (OSError, TimeoutError, urllib.error.URLError, ModelConfigurationError, json.JSONDecodeError) as exc:
+            print(f"[ERROR] 選択モデルをdigestまで検証できません: {type(exc).__name__}", file=sys.stderr)
+            raise SystemExit(2) from None
 
     if args.mode == "deep":
         from deep_research import (
@@ -5963,7 +6500,6 @@ def main():
             DEEP_TIMEOUT_MIN,
             DEEP_TIMEOUT_MAX,
             run_deep_research,
-            detect_deep_model,
             stop_reason_message,
             validate_deep_timeout_seconds,
         )
@@ -5977,13 +6513,21 @@ def main():
         except ValueError as exc:
             parser.error(str(exc))
         started = time.monotonic()
-        model = detect_deep_model()
+        model = selected_model
 
         def deep_cancel_check() -> None:
             if time.monotonic() - started >= timeout_seconds:
                 raise TimeoutError("deep timeout")
 
         print(f"モデル: {model}")
+        deep_reasoning = resolve_model_reasoning(model, reasoning)
+        print(
+            "推論設定: requested="
+            f"{deep_reasoning['requested']} / effective={deep_reasoning['effective']} / "
+            f"think={deep_reasoning['think']} / 思考表示=なし"
+        )
+        if model_digest:
+            print(f"モデルdigest: {model_digest}")
         print(f"クエリ: {query}")
         print(f"モード: deep（上限 {timeout_seconds} 秒、範囲 {DEEP_TIMEOUT_MIN}〜{DEEP_TIMEOUT_MAX} 秒）")
         print()
@@ -5991,6 +6535,7 @@ def main():
             result = run_deep_research(
                 query,
                 model=model,
+                reasoning=reasoning,
                 timeout_seconds=timeout_seconds,
                 emit_progress=lambda event: print(
                     f"[{event.get('stage')}] {event.get('message', '')} "
@@ -5998,6 +6543,7 @@ def main():
                 ),
                 cancel_check=deep_cancel_check,
                 absolute_deadline=started + timeout_seconds,
+                answer_policy=policy,
             )
         except KeyboardInterrupt:
             print("中断しました。", file=sys.stderr)
@@ -6006,16 +6552,35 @@ def main():
         reason = result.stop_reason + (f"（{reason_message}）" if reason_message else "")
         print(f"状態: {result.status} / 終了理由: {reason}")
         print(f"根拠: {len(result.evidence)}件、読み取り単位: {result.diagnostics.get('units', 0)}件")
+        for line in _answer_policy.quality_text_lines(result.answer_quality):
+            print(line)
         print()
         print(result.answer or "確認済みの根拠がありません。")
         return
 
-    model = "" if args.mode == "search" else detect_model()
+    model = "" if args.mode == "search" else selected_model
 
+    v2_answer = args.mode == "answer" and policy == _answer_policy.POLICY_V2
     if args.timeout_seconds is not None:
         timeout_seconds = validate_mode_timeout_seconds(args.timeout_seconds, args.mode)
+    elif sys.platform == "darwin" and model in MAC_MODEL_DIGESTS:
+        timeout_seconds = 300
+    elif v2_answer:
+        # 回答品質(v2)の検査は有限の呼出しと時間枠が前提のため、上限が無いCLIにも
+        # 品質処理用の予算を明示して付与する（旧経路は従来どおり無期限）。
+        timeout_seconds = ANSWER_V2_DEFAULT_SECONDS
+        print(f"[INFO] 回答品質(v2)のため時間上限 {ANSWER_V2_DEFAULT_SECONDS} 秒を既定にします。")
     else:
         timeout_seconds = None
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    def check_cli_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("search deadline expired")
+
+    def remaining_cli_seconds():
+        return None if deadline is None else max(0.0, deadline - time.monotonic())
 
     # モデル可用性チェック
     model_status = _is_model_available(model) if model else ModelStatus.AVAILABLE
@@ -6032,6 +6597,8 @@ def main():
         )
 
     print(f"モデル: {model or '(未使用)'}")
+    if model_digest:
+        print(f"モデルdigest: {model_digest}")
     print(f"クエリ: {query}")
     print(f"モード: {args.mode}")
     print(f"リーズニング: {reasoning}")
@@ -6068,6 +6635,8 @@ def main():
                 reasoning="off",
                 emit_status=lambda text: print(text),
                 mode="search",
+                cancel_check=check_cli_deadline,
+                remaining_seconds=remaining_cli_seconds,
             )
             print(f"最終マッチ: {len(retrieval.matches)} 件")
             print(build_evidence_summary(
@@ -6081,6 +6650,9 @@ def main():
             model=model,
             reasoning=reasoning,
             emit_status=lambda text: print(text),
+            cancel_check=check_cli_deadline,
+            remaining_seconds=remaining_cli_seconds,
+            answer_policy=policy,
         )
     except KeyboardInterrupt:
         print(
@@ -6115,8 +6687,31 @@ def main():
     print("=" * 50)
     print()
 
+    if v2_answer:
+        # 回答方針v2: 主張単位の草稿→原文・意味・質問適合・文章の検査→検査済みの主張だけを表示。
+        try:
+            outcome = run_answer_v2(
+                query,
+                retrieval,
+                model=model,
+                reasoning=reasoning,
+                total_seconds=timeout_seconds,
+                remaining_seconds=remaining_cli_seconds,
+                cancel_check=check_cli_deadline,
+            )
+        except KeyboardInterrupt:
+            print("中断しました。", file=sys.stderr)
+            raise SystemExit(130) from None
+        print(outcome.answer)
+        print()
+        for line in _answer_policy.quality_text_lines(outcome.quality):
+            print(line)
+        return
+
     stream_ollama_chat(
-        model, SYSTEM_PROMPT, user_prompt, reasoning=reasoning, show_thinking=args.show_thinking
+        model, SYSTEM_PROMPT, user_prompt, reasoning=reasoning,
+        show_thinking=args.show_thinking, cancel_check=check_cli_deadline,
+        remaining_seconds=remaining_cli_seconds,
     )
 
 

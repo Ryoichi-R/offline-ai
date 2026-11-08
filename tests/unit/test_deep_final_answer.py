@@ -104,6 +104,7 @@ def test_answer_with_unconfirmed_section_is_accepted_without_a_rewrite(tmp_path,
             "uncited_lines": 0,
             "unknown_id_lines": 0,
             "limitation_lines": 0,
+            "unmatched_limited_lines": 0,
             "enumeration_gaps": 0,
         }
     ]
@@ -761,3 +762,30 @@ def test_final_prompt_limits_the_answer_to_what_the_question_asks():
     assert "質問が直接問う事項" in prompt_templates.DEEP_FINAL_SYSTEM
     assert "所管範囲の説明は書かないでください" in prompt_templates.DEEP_FINAL_SYSTEM
     assert "主語と述語のある文にしてください" in prompt_templates.DEEP_FINAL_SYSTEM
+
+
+def test_source_repair_counts_only_surviving_unique_source_lines():
+    metrics = deep._SourceRepairMetrics("## 見出し\n主張A。[E1]\n主張B。[E2]")
+    metrics.record("原文A。[E1]")
+    metrics.record("原文A。[E2]", added=True)
+    metrics.record("原文B。[E2]", added=True)
+    report = metrics.summary("原文A。[E1]\n主張B。[E2]", removed=1, duplicates=1)
+    assert report == {
+        "before_claim_lines": 2, "replaced_lines": 1, "added_source_lines": 2,
+        "support_removed_lines": 1, "duplicate_removed_lines": 1,
+        "final_claim_lines": 2, "final_source_derived_unique_lines": 1,
+        "source_dependence_ratio": 0.5,
+    }
+    assert "原文" not in json.dumps(report, ensure_ascii=False)
+    assert metrics.summary("")["source_dependence_ratio"] is None
+
+
+def test_generated_answer_emits_source_repair_counts_without_text(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    _text_calls(monkeypatch, "対象である。[E1]")
+    result = research(tmp_path)
+    metrics = result.diagnostics["final_answer"]["source_repair"]
+    assert metrics["before_claim_lines"] == 1
+    assert metrics["final_claim_lines"] == 1
+    assert metrics["source_dependence_ratio"] == 0.0
+    assert metrics["answer_state"] == deep.ANSWER_STATE_GENERATED

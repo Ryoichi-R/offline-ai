@@ -18,7 +18,10 @@ import urllib.error
 from pathlib import Path
 from typing import Callable, Any
 
+import answer_pipeline as apipe
+import answer_policy as ap
 from config import OLLAMA_HOST
+from model_config import model_call_timeout_seconds, resolve_model_reasoning
 from deep_transport import DeepWorkerError, run_worker
 from deep_candidate_selection import (
     CANDIDATE_TRANSFER_LIMIT_CODE,
@@ -30,6 +33,7 @@ from deep_candidate_selection import (
 from prompt_templates import (
     DEEP_FINAL_SYSTEM,
     DEEP_SECTION_SYSTEM,
+    DEEP_RELEVANCE_SYSTEM,
     DEEP_VERIFY_SYSTEM,
     DEEP_LINE_VERIFY_SYSTEM,
     DEEP_GAPS_SYSTEM,
@@ -71,7 +75,9 @@ DEEP_FINAL_RETRY_MIN_SECONDS = 30
 DEEP_LINE_CHECK_RESERVE_SECONDS = 60
 # Ledger reasons that report what was done to the final answer; they are shown
 # to the user but do not explain why exploration stopped.
-DEEP_FINAL_ANSWER_NOTE_REASONS = frozenset({"limitation_repaired", "enumeration_repaired", "line_unsupported"})
+DEEP_FINAL_ANSWER_NOTE_REASONS = frozenset(
+    {"limitation_repaired", "enumeration_repaired", "line_unsupported", "answer_quality"}
+)
 # Reasons that can fire once per candidate/unit and dominate a large corpus run
 # (hundreds of thousands of characters observed in practice). These are
 # collapsed to a count in the final-answer prompt; individual entries stay in
@@ -93,6 +99,9 @@ STOP_REASONS = frozenset(
         "source_changed",
         CANDIDATE_TRANSFER_LIMIT_CODE,
         "model_error",
+        "extraction_unsupported",
+        "relevance_disputed",
+        "relevance_uncertain",
         "unresolved_scope",
         "cancelled",
     }
@@ -100,6 +109,9 @@ STOP_REASONS = frozenset(
 
 STOP_REASON_MESSAGES = {
     CANDIDATE_TRANSFER_LIMIT_CODE: CANDIDATE_TRANSFER_LIMIT_MESSAGE,
+    "extraction_unsupported": "抽出内容が原文に支持されていません",
+    "relevance_disputed": "原文の関連性について判定が一致していません",
+    "relevance_uncertain": "原文の関連性を確認できていません",
 }
 
 
@@ -118,6 +130,9 @@ _STOP_REASON_PRIORITY = (
     "document_limit",
     "round_limit",
     "model_error",
+    "extraction_unsupported",
+    "relevance_disputed",
+    "relevance_uncertain",
 )
 
 
@@ -132,6 +147,14 @@ def _select_stop_reason(initial: str, reasons: set[str]) -> str:
     if reasons and initial == "scope_processed":
         return "unresolved_scope"
     return initial
+
+
+class ExtractionRejected(ValueError):
+    """A semantic verdict, distinct from transport/schema model failures."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(STOP_REASON_MESSAGES[code])
 
 
 class DeepExplorationFinished(RuntimeError):
@@ -153,6 +176,7 @@ class _FinalAnswerRejected(ValueError):
 @dataclass
 class DeepBudget:
     timeout_seconds: float
+    reasoning: str = "off"
     cancel_check: Callable[[], None] | None = None
     # Resolve time.monotonic at call time (not at class definition) so every
     # budget reading uses the same clock source, including patched test clocks.
@@ -221,6 +245,9 @@ class DeepResearchResult:
     progress: list[dict] = field(default_factory=list)
     ledger: list[dict] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
+    # Answer policy v2: gate states and the user-facing quality label. Empty for
+    # legacy results; `answer_state` (generated) is never a quality verdict.
+    answer_quality: dict = field(default_factory=dict)
 
     def to_public_dict(self) -> dict:
         """本文は利用者向け、diagnostics/ledgerは許可項目だけに限定する。"""
@@ -249,6 +276,7 @@ class DeepResearchResult:
                         "references",
                         "verification_status",
                         "context",
+                        "role",
                     )
                     if key in item
                 }
@@ -257,6 +285,7 @@ class DeepResearchResult:
             "unconfirmed": list(self.unconfirmed),
             "ledger": list(self.ledger),
             "diagnostics": dict(self.diagnostics),
+            "answer_quality": dict(self.answer_quality),
         }
 
 
@@ -481,6 +510,7 @@ def _call_ollama_json(
     *,
     timeout: float,
     cancel_check: Callable[[], None] | None = None,
+    reasoning: str = "off",
 ) -> dict:
     content = _call_ollama_content(
         model,
@@ -489,6 +519,7 @@ def _call_ollama_json(
         timeout=timeout,
         cancel_check=cancel_check,
         num_predict=DEEP_JSON_NUM_PREDICT,
+        reasoning=reasoning,
     )
     parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I | re.S))
     if not isinstance(parsed, dict):
@@ -503,6 +534,7 @@ def _call_ollama_text(
     *,
     timeout: float,
     cancel_check: Callable[[], None] | None = None,
+    reasoning: str = "off",
 ) -> str:
     return _call_ollama_content(
         model,
@@ -510,6 +542,7 @@ def _call_ollama_text(
         user,
         timeout=timeout,
         cancel_check=cancel_check,
+        reasoning=reasoning,
     )
 
 
@@ -550,6 +583,8 @@ def _exception_stop_reason(exc: BaseException) -> str:
     if isinstance(exc, PromptBudgetError):
         return "evidence_budget"
     code = str(getattr(exc, "code", "") or "")
+    if code in {"extraction_unsupported", "relevance_disputed", "relevance_uncertain"}:
+        return code
     if code == "cancelled":
         return "cancelled"
     if code in {"timeout", "stall"}:
@@ -578,14 +613,10 @@ def _check_prompt(
 
 
 def detect_deep_model():
-    """Read the selected model without migrating or rewriting protected settings."""
-    from search import MODEL_CONFIG
-    from model_config import DEFAULT_MODEL
+    """通常CLI/Webと同じモデル選択resolverを使う。"""
+    from search import detect_model
 
-    return (
-        MODEL_CONFIG.read_text(encoding="utf-8-sig").strip() if MODEL_CONFIG.exists() else ""
-    ) or DEFAULT_MODEL
-
+    return detect_model()
 
 def _call_ollama_content(
     model,
@@ -595,6 +626,7 @@ def _call_ollama_content(
     timeout,
     cancel_check=None,
     num_predict=DEEP_TEXT_NUM_PREDICT,
+    reasoning="off",
 ):
     _check_prompt(system, user, reserve_tokens=num_predict)
     return run_worker(
@@ -609,7 +641,7 @@ def _call_ollama_content(
                     {"role": "user", "content": user},
                 ],
                 "stream": True,
-                "think": False,
+                "think": resolve_model_reasoning(model, reasoning)["think"],
                 "options": {
                     "num_ctx": DEEP_NUM_CTX,
                     "num_predict": num_predict,
@@ -622,19 +654,33 @@ def _call_ollama_content(
     )
 
 
-def _retrieve_candidates(query, chunks, *, timeout, cancel_check):
+def _retrieve_candidates(
+    query, chunks, *, timeout, cancel_check, embedding_context=None, intent=None
+):
+    payload = {"operation": "retrieve", "query": query, "chunks": chunks}
+    if embedding_context is not None:
+        payload["isolated_embedding"] = embedding_context
+    if intent is not None:
+        payload["intent"] = intent
     return validate_response(run_worker(
-        {"operation": "retrieve", "query": query, "chunks": chunks},
+        payload,
         timeout=timeout,
         cancel_check=cancel_check,
     ))
 
 
-def _retrieve_candidates_many(queries, chunks, *, timeout, cancel_check):
+def _retrieve_candidates_many(
+    queries, chunks, *, timeout, cancel_check, embedding_context=None, intent=None
+):
     """Rank every viewpoint of a round in one worker call."""
+    payload = {"operation": "retrieve_many", "queries": list(queries), "chunks": chunks}
+    if embedding_context is not None:
+        payload["isolated_embedding"] = embedding_context
+    if intent is not None:
+        payload["intent"] = intent
     return validate_many_response(
         run_worker(
-            {"operation": "retrieve_many", "queries": list(queries), "chunks": chunks},
+            payload,
             timeout=timeout,
             cancel_check=cancel_check,
         ),
@@ -642,16 +688,20 @@ def _retrieve_candidates_many(queries, chunks, *, timeout, cancel_check):
     )
 
 
-def _retrieve_round(queries, chunks, budget, reserve):
+def _retrieve_round(queries, chunks, budget, reserve, *, embedding_context=None, intent=None):
     """One batched worker call per round; per-viewpoint calls only if the batch is too large."""
 
     def timeout(count):
         return min(60 * count, budget.remaining() - reserve)
 
+    # `intent` (answer policy v2) is passed only when set, so legacy calls keep
+    # the exact seam signature the fakes and older workers expect.
+    extra = {} if intent is None else {"intent": intent}
     if len(queries) > 1:
         try:
             return _retrieve_candidates_many(
-                queries, chunks, timeout=timeout(len(queries)), cancel_check=budget.check
+                queries, chunks, timeout=timeout(len(queries)), cancel_check=budget.check,
+                embedding_context=embedding_context, **extra,
             )
         except DeepWorkerError as exc:
             if exc.code != CANDIDATE_TRANSFER_LIMIT_CODE:
@@ -659,7 +709,10 @@ def _retrieve_round(queries, chunks, budget, reserve):
     responses = []
     for query in queries:
         responses.append(
-            _retrieve_candidates(query, chunks, timeout=timeout(1), cancel_check=budget.check)
+            _retrieve_candidates(
+                query, chunks, timeout=timeout(1), cancel_check=budget.check,
+                embedding_context=embedding_context, **extra,
+            )
         )
     return responses
 
@@ -667,9 +720,9 @@ def _retrieve_round(queries, chunks, budget, reserve):
 def _order_by_document_relevance(selected_lists, extra_by_path=None):
     """Order candidates document by document, most relevant document first.
 
-    A document's relevance is the sum of 1/(k + rank) over its selected
-    candidates in every viewpoint; candidates inside a document follow their
-    own summed score. Heading-derived candidates (no rank) follow the ranked
+    A document contributes its best 1/(k + rank) once per viewpoint, so
+    many low-ranked chunks cannot crowd out a concise relevant document.
+    Candidates inside a document follow their own summed score. Heading-derived candidates (no rank) follow the ranked
     candidates of their document. Ties keep first-seen order.
     """
     document_scores: dict[str, float] = {}
@@ -678,10 +731,13 @@ def _order_by_document_relevance(selected_lists, extra_by_path=None):
     first_seen: dict[tuple, int] = {}
     document_first_seen: dict[str, int] = {}
     for selected in selected_lists:
+        viewpoint_documents = set()
         for rank, candidate in enumerate(selected, start=1):
             key = _candidate_key(candidate)
             weight = 1.0 / (DEEP_DOCUMENT_RRF_K + rank)
-            document_scores[key[0]] = document_scores.get(key[0], 0.0) + weight
+            if key[0] not in viewpoint_documents:
+                document_scores[key[0]] = document_scores.get(key[0], 0.0) + weight
+                viewpoint_documents.add(key[0])
             document_first_seen.setdefault(key[0], len(document_first_seen))
             candidate_scores[key] = candidate_scores.get(key, 0.0) + weight
             candidates.setdefault(key, candidate)
@@ -701,6 +757,53 @@ def _order_by_document_relevance(selected_lists, extra_by_path=None):
         for extra in (extra_by_path or {}).get(path, []):
             ordered.setdefault(_candidate_key(extra), extra)
     return ordered
+
+
+def _heading_path_for(nodes, line):
+    """Heading texts from the document root to the section containing `line`."""
+    node = node_for_line(nodes, line)
+    path = []
+    while node is not None:
+        path.append(node.heading_text)
+        node = nodes[node.parent_index] if node.parent_index is not None else None
+    return tuple(reversed(path))
+
+
+def _prioritize_by_role(batch, sources, intent, node_cache):
+    """Stable-sort the read order by evidence role (answer policy v2).
+
+    Direct-answer and qualifier candidates are read before detail tables, so a
+    long checklist cannot consume the evidence frame first. Candidates that
+    cannot be classified keep their relevance order among themselves. Returns
+    the reordered mapping and role counts (numbers only).
+    """
+    decorated, counts = [], {}
+    for order, (key, candidate) in enumerate(batch.items()):
+        path = str(candidate.get("path") or "").replace("\\", "/")
+        source = sources.get(path)
+        role = ap.ROLE_UNCLASSIFIED
+        if source is not None:
+            start = int(candidate.get("start_line") or 1)
+            end = int(candidate.get("end_line") or start)
+            text = "\n".join(source[3][start - 1 : min(end, start + 59)])[:3000]
+            nodes = node_cache.get(path)
+            if nodes is None:
+                nodes = node_cache[path] = parse_heading_tree(source[2])
+            head_path = _heading_path_for(nodes, start)
+            verdict = ap.classify_role(
+                text, head_path[-1] if head_path else "", heading_path=head_path[:-1], intent=intent
+            )
+            role, strong = verdict.role, verdict.confidence >= ap.STRONG_ROLE_CONFIDENCE
+        else:
+            strong = False
+        counts[role] = counts.get(role, 0) + 1
+        # Within one role, a confidently classified candidate precedes a weak one;
+        # otherwise the upstream document-relevance order is kept.
+        decorated.append(
+            (ap.role_priority(role, intent.granularity), 0 if strong else 1, order, key, candidate)
+        )
+    decorated.sort(key=lambda item: item[:3])
+    return {key: candidate for _, _, _, key, candidate in decorated}, counts
 
 
 def _prepare_retrieve_response(response, chunks):
@@ -735,14 +838,23 @@ def _json_stage(model, system, user, budget, validator, *, reserve):
                 model,
                 system,
                 user,
-                timeout=min(60, available),
+                timeout=min(model_call_timeout_seconds(model, 60), available),
                 cancel_check=budget.check,
+                **({"reasoning": budget.reasoning} if budget.reasoning != "off" else {}),
             )
             budget.check()
             return validator(result)
         except (ValueError, TypeError, KeyError):
             if attempt:
                 raise ValueError("invalid model schema") from None
+
+
+def _relevance_verdict(data):
+    if not isinstance(data, dict) or data.get("relevance") not in {
+        "relevant", "irrelevant", "uncertain"
+    }:
+        raise ValueError("invalid relevance verdict")
+    return data["relevance"]
 
 
 def _verification(data):
@@ -796,30 +908,98 @@ def _line_verdict(data):
 
 
 def _gaps(data):
+    if not isinstance(data, dict) or any(
+        key not in data or not isinstance(data[key], list)
+        or any(not isinstance(value, str) for value in data[key])
+        for key in ("queries", "unresolved")
+    ):
+        raise ValueError("gap assessment requires explicit string arrays")
     return {key: _trim_strings(data.get(key)) for key in ("queries", "unresolved")}
 
 
 def _ranges_with_context(text, start, end):
-    """Prioritize the hit's own section; parent introductions follow as lower-priority context.
+    """Read substantive ranges; carry bodyless container headings as context.
 
-    The hit section must reach extraction/verification before budget runs out,
-    so it is processed first. Parent introductions remain separate, real
-    ranges (not merged into one oversized prompt) but are queued after it.
+    A container selected directly expands to its children. Its heading is
+    retained by _parent_heading_context, never treated as absent/irrelevant.
+    Parent introductions with any body text remain independent source ranges.
     """
     nodes = parse_heading_tree(text)
     node = node_for_line(nodes, start)
+    if node is None:
+        return [_section_range(text, start, end)]
+    lines = text.splitlines()
+
+    def intro_end(item):
+        return (nodes[item.children_indices[0]].heading_line - 1
+                if item.children_indices else item.section_end_line)
+
+    def bodyless(item):
+        return bool(item.children_indices) and not any(
+            line.strip() for line in lines[item.heading_line:intro_end(item)]
+        )
+
+    ranges = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if bodyless(current):
+            pending.extend(nodes[index] for index in reversed(current.children_indices))
+        else:
+            ranges.append((current.heading_line, intro_end(current), current.heading_text))
     parent_ranges = []
-    while node is not None and node.parent_index is not None:
+    while node.parent_index is not None:
         parent = nodes[node.parent_index]
-        stop = nodes[parent.children_indices[0]].heading_line - 1
-        if stop >= parent.heading_line:
-            parent_ranges.append((parent.heading_line, stop, parent.heading_text))
+        if not bodyless(parent):
+            parent_ranges.append((parent.heading_line, intro_end(parent), parent.heading_text))
         node = parent
     if nodes and nodes[0].heading_line > 1:
         parent_ranges.append((1, nodes[0].heading_line - 1, ""))
-    parent_ranges.reverse()
-    ranges = [_section_range(text, start, end), *parent_ranges]
+    ranges.extend(reversed(parent_ranges))
     return list(dict.fromkeys(ranges))
+
+
+def _all_source_units_irrelevant(sources, ledger):
+    """A no-evidence result requires complete, independently checked scope.
+
+    File counts or candidate exhaustion are not proof. Match exact reviewed
+    units, including character slices of long lines; unseen units fail closed.
+    """
+    checked = {
+        (row["path"], row.get("start_line"), row.get("end_line"),
+         row.get("char_start"), row.get("char_end"))
+        for row in ledger if row.get("status") == "irrelevant"
+    }
+    if not sources or not checked:
+        return False
+    for path, source in sources.items():
+        text, lines = source[2], source[3]
+        starts = {1} | {node.heading_line for node in parse_heading_tree(text)}
+        required = set()
+        for start in starts:
+            for first, last, _ in _ranges_with_context(text, start, len(lines)):
+                for unit in _split_line_range(lines, first, last):
+                    required.add((path, unit["start_line"], unit["end_line"],
+                                  unit["char_start"], unit["char_end"]))
+        if not required or not required.issubset(checked):
+            return False
+    return True
+
+
+def _parent_heading_context(text, start, path):
+    """Exact ancestor heading bytes and line locations, not model conclusions."""
+    nodes = parse_heading_tree(text)
+    node = node_for_line(nodes, start)
+    lines = text.splitlines()
+    context = []
+    while node is not None and node.parent_index is not None:
+        parent = nodes[node.parent_index]
+        context.append({
+            "path": path, "start_line": parent.heading_line,
+            "end_line": parent.heading_line, "text": lines[parent.heading_line - 1],
+        })
+        node = parent
+    return list(reversed(context))
 
 
 def _snapshot(root, budget, note):
@@ -1055,8 +1235,8 @@ _LIMITING_WORD_RE = re.compile(r"除く|除き|含む|含み|限る|限り|ほ�
 # comma up to the word must survive. 2026-09-24: all three runs of the 予定価格
 # question dropped such wording with the parenthesis-only check reporting none.
 _QUALIFIER_RE = re.compile(
-    r"必要に応じ|なるべく|原則として|できる限り|やむを得ない|著しく困難|支障がないと認め"
-    r"|(?:場合|とき|もの)に限り|を除き"
+    r"必要に応じ|なるべく|原則(?:として)?|できる限り|やむを得ない|著しく困難|支障がないと認め"
+    r"|(?:場合|とき|もの)に限り|を除き|[\u3400-\u9fff々ァ-ヶー]+に配慮"
 )
 DEEP_QUALIFIER_MAX_CHARS = 40
 # One source line enumerating items inline ("…とする。 ⑴ … ⑵ …").
@@ -1116,8 +1296,15 @@ def _qualifier_limits(body, spans):
     for match in _QUALIFIER_RE.finditer(body):
         if any(start <= match.start() <= end for start, end, _ in spans):
             continue
-        start = max(body.rfind("、", 0, match.start()), body.rfind("。", 0, match.start())) + 1
+        start = max(
+            body.rfind("、", 0, match.start()), body.rfind("。", 0, match.start()),
+            body.rfind("|", 0, match.start()),
+        ) + 1
         clause = body[max(start, match.end() - DEEP_QUALIFIER_MAX_CHARS) : match.end()]
+        if match.group(0).startswith("原則") or match.group(0).endswith("に配慮"):
+            # These short safeguards must survive in their own right; surrounding
+            # words must not hide their omission through high bigram overlap.
+            clause = match.group(0)
         norm = _normalize_for_match(clause)
         if norm:
             limits.append((norm, clause))
@@ -1126,6 +1313,32 @@ def _qualifier_limits(body, spans):
 
 def _source_segments(display):
     """A source line as (text, is_inline_item) segments, split at inline ⑴⑵ items."""
+    if display.startswith("|"):
+        # Compare cells independently: a condition in the neighbouring column
+        # must not be attached to a different claim. Keep source bytes intact.
+        cells, start, index, fence = [], 1, 1, ""
+        while index < len(display):
+            char = display[index]
+            if char == "\\":
+                index += 2
+                continue
+            if char == "`":
+                end = index + 1
+                while end < len(display) and display[end] == "`":
+                    end += 1
+                run = display[index:end]
+                if not fence:
+                    fence = run
+                elif fence == run:
+                    fence = ""
+                index = end
+                continue
+            if char == "|" and not fence:
+                cells.append(display[start:index].strip())
+                start = index + 1
+            index += 1
+        cells.append(display[start:].strip())
+        return [(cell, False) for cell in cells if cell]
     marks = [match.start() for match in _INLINE_ITEM_RE.finditer(display)]
     if len(marks) < 2:
         return [(display, False)]
@@ -1159,7 +1372,49 @@ def _is_verbatim_source_line(line, rows):
     return any(sentence == _normalize_for_match(row["raw"]) for row in rows)
 
 
-def _check_lines_support(candidate, evidence, *, query, model, budget, record):
+def _claim_keys(answer):
+    """Non-heading claim lines, with citation/format differences normalized."""
+    return [
+        _normalize_for_match(line)
+        for line in answer.splitlines()
+        if line.strip() and not _is_heading_like(_dequote(line.strip()))
+        and _normalize_for_match(line)
+    ]
+
+
+class _SourceRepairMetrics:
+    """Track provenance in memory; emit counts only, never claim text."""
+
+    def __init__(self, candidate):
+        self.before = len(_claim_keys(candidate))
+        self.replaced = 0
+        self.added = 0
+        self.source_keys = set()
+
+    def record(self, text, *, added=False):
+        keys = _claim_keys(text)
+        if added:
+            self.added += len(keys)
+        else:
+            self.replaced += len(keys)
+        self.source_keys.update(keys)
+
+    def summary(self, answer, *, removed=0, duplicates=0):
+        keys = _claim_keys(answer)
+        surviving = len(set(keys) & self.source_keys)
+        return {
+            "before_claim_lines": self.before,
+            "replaced_lines": self.replaced,
+            "added_source_lines": self.added,
+            "support_removed_lines": removed,
+            "duplicate_removed_lines": duplicates,
+            "final_claim_lines": len(keys),
+            "final_source_derived_unique_lines": surviving,
+            "source_dependence_ratio": surviving / len(keys) if keys else None,
+        }
+
+
+def _check_lines_support(candidate, evidence, *, query, model, budget, record, provenance=None):
     """Check each cited answer line alone against only the evidence it cites.
 
     The whole-answer check passed a line that overgeneralized one clause
@@ -1229,12 +1484,27 @@ def _check_lines_support(candidate, evidence, *, query, model, budget, record):
         row = _best_source_row(_normalize_for_match(stripped), set(cited), rows)
         if row is not None:
             counts["replaced"] += 1
-            kept.append(_cite_verbatim(row["raw"], row["evidence_id"]))
+            replacement = _cite_verbatim(row["raw"], row["evidence_id"])
+            if row.get("table_scope"):
+                replacement = _cite_verbatim(row["scope"][2], row["evidence_id"]) + "：" + replacement
+            kept.append(replacement)
+            if provenance is not None:
+                provenance.record(replacement)
             notes.append(f"最終回答の{number}行目は根拠に支持されないと照合されたため、原文の文言に置き換えた")
         else:
             counts["dropped"] += 1
             notes.append(f"最終回答の{number}行目は根拠に支持されないと照合されたため、回答から除いた")
     return "\n".join(kept), notes
+
+
+def _update_heading_stack(stack, text):
+    match = re.fullmatch(r"(#{1,6})\s+([^\n]+)", text.strip())
+    if not match:
+        return False
+    level, label = len(match.group(1)), match.group(2).strip()
+    stack[:] = [(depth, value) for depth, value in stack if depth < level]
+    stack.append((level, label))
+    return True
 
 
 def _source_limits(evidence):
@@ -1248,15 +1518,29 @@ def _source_limits(evidence):
     for item in evidence:
         lead_scope = None
         group = None
-        for raw in str(item.get("excerpt") or "").splitlines():
+        source_headings = []
+        for context in item.get("context", []):
+            text = str(context.get("text") or "").strip()
+            if item.get("path") and context.get("path") == item["path"]:
+                _update_heading_stack(source_headings, text)
+        source_lines = str(item.get("excerpt") or "").splitlines()
+        for source_index, raw in enumerate(source_lines):
             display = raw.lstrip("> ").strip()
             if display.startswith("#"):
+                _update_heading_stack(source_headings, display)
                 display = display.lstrip("#").strip()
                 if len(display) < DEEP_HEADING_BODY_MIN_CHARS and "。" not in display:
                     group = None
                     continue
-            if not display or display.startswith("|"):
+            if not display or re.fullmatch(r"[|\s:\-]+", display):
                 continue
+            if (display.startswith("|") and source_index + 1 < len(source_lines)
+                    and re.fullmatch(r"\s*\|[|\s:\-]+", source_lines[source_index + 1])):
+                # Column labels are structure, not statements to substitute into answers.
+                continue
+            table_heading = " / ".join(label for _, label in source_headings)
+            # Table cells contain real conditions too. Preserve their literal
+            # text for source-backed repair, excluding only delimiter rows.
             for segment, inline_item in _source_segments(display):
                 line = unicodedata.normalize("NFKC", segment)
                 is_item = inline_item or bool(_LIST_ITEM_RE.match(line))
@@ -1292,7 +1576,16 @@ def _source_limits(evidence):
                             # (e.g. the definition of 基金事業), so it is a match target too.
                             "match_texts": [core, *(norm for norm, _ in limits)],
                             "limits": limits,
-                            "scope": lead_scope if is_item else None,
+                            "scope": (
+                                lead_scope if is_item and lead_scope else
+                                (table_heading, table_heading, table_heading)
+                                if display.startswith("|") and table_heading else None
+                            ),
+                            "table_scope_parts": [label for _, label in source_headings],
+                            "table_scope": bool(
+                                display.startswith("|") and table_heading
+                                and not (is_item and lead_scope)
+                            ),
                             "group": group if is_item else None,
                             # Source text as written, minus a bullet, for verbatim repair.
                             "raw": re.sub(r"^[-*・]\s*", "", segment),
@@ -1314,6 +1607,10 @@ def _match_strength(sentence, core):
     """
     if core in sentence:
         return len(core)
+    if len(sentence) >= 8 and sentence in core:
+        # A short exact restatement can omit a leading qualifier while staying
+        # below the fuzzy matching threshold. Require literal containment here.
+        return len(sentence)
     match = difflib.SequenceMatcher(None, sentence, core, autojunk=False).find_longest_match(
         0, len(sentence), 0, len(core)
     )
@@ -1336,8 +1633,11 @@ def _limitation_findings(answer, evidence):
         return []
     answer_norm = _normalize_for_match(answer)
     findings, scopes_reported = [], set()
+    answer_headings = []
     for index, line in enumerate(answer.splitlines()):
         stripped = line.strip()
+        _update_heading_stack(answer_headings, stripped)
+        current_heading = _normalize_for_match(" / ".join(label for _, label in answer_headings))
         cited = set(re.findall(r"\[(E\d+)\]", stripped))
         if not cited or _is_heading_like(_dequote(stripped)):
             continue
@@ -1353,7 +1653,16 @@ def _limitation_findings(answer, evidence):
         scope_missing = None
         if best["scope"] is not None:
             phrase, lead, _ = best["scope"]
-            if (
+            if best.get("table_scope"):
+                # A heading somewhere else in the answer is not this claim's
+                # scope. Require the source label locally or on its current heading.
+                if any(
+                    _normalize_for_match(part) not in sentence
+                    and _normalize_for_match(part) not in current_heading
+                    for part in best["table_scope_parts"]
+                ):
+                    scope_missing = phrase
+            elif (
                 _bigram_coverage(answer_norm, _normalize_for_match(phrase)) < DEEP_LIMITATION_COVERAGE
                 and lead not in scopes_reported
             ):
@@ -1502,9 +1811,14 @@ def _repair_limitations(answer, findings):
                 + "）が欠けていたため、原文の文言に置き換えた"
             )
         if finding["scope_missing"]:
-            inserts.setdefault(index, []).append(_cite_verbatim(row["scope"][2], row["evidence_id"]))
+            if row.get("table_scope"):
+                # Attach the exact source label to this line. A detached heading
+                # could be deduplicated later and attach the claim to another scope.
+                lines[index] = _cite_verbatim(row["scope"][2], row["evidence_id"]) + "：" + lines[index]
+            else:
+                inserts.setdefault(index, []).append(_cite_verbatim(row["scope"][2], row["evidence_id"]))
             notes.append(
-                f"最終回答の{finding['line']}行目の前に、欠けていた原文の適用範囲（{_shorten(finding['scope_missing'])}）を補った"
+                f"最終回答の{finding['line']}行目に、欠けていた原文の適用範囲（{_shorten(finding['scope_missing'])}）を補った"
             )
     repaired = []
     for index, line in enumerate(lines):
@@ -1530,10 +1844,26 @@ def _shorten(text, limit=60):
     return text[: limit - 1] + "…"
 
 
+def _unmatched_limited_lines(answer, evidence):
+    """Do not treat an unaligned claim as passing the source-limit check."""
+    rows = _source_limits(evidence)
+    limited_ids = {row["evidence_id"] for row in rows if row["limits"] or row["scope"]}
+    missing = []
+    for number, line in enumerate(answer.splitlines(), 1):
+        stripped = line.strip()
+        cited = set(re.findall(r"\[(E\d+)\]", stripped))
+        if not cited.intersection(limited_ids) or _is_heading_like(_dequote(stripped)):
+            continue
+        if _best_source_row(_normalize_for_match(stripped), cited, rows) is None:
+            missing.append(number)
+    return missing
+
+
 def _check_final_candidate(candidate, evidence, record):
     """Prepare one final-answer attempt, check citations and limits, and record counts only."""
     prepared, changes = _prepare_final_answer(candidate)
     issues = _final_answer_issues(prepared, {e["evidence_id"] for e in evidence})
+    issues["unmatched_limited_lines"] = _unmatched_limited_lines(prepared, evidence)
     issues["limitation_lines"] = _limitation_issues(prepared, evidence)
     issues["enumeration_gaps"] = _enumeration_issues(prepared, evidence)
     record["attempts"].append(
@@ -1542,6 +1872,7 @@ def _check_final_candidate(candidate, evidence, record):
             "uncited_lines": len(issues["uncited_lines"]),
             "unknown_id_lines": len(issues["unknown_id_lines"]),
             "limitation_lines": len(issues["limitation_lines"]),
+            "unmatched_limited_lines": len(issues["unmatched_limited_lines"]),
             "enumeration_gaps": sum(len(texts) for _, texts in issues["enumeration_gaps"]),
         }
     )
@@ -1556,6 +1887,8 @@ def _final_retry_prompt(prompt, candidate, issues):
         problems.append("提示していない根拠IDを使った行: " + "、".join(f"{n}行目" for n in issues["unknown_id_lines"][:20]))
     if not issues["has_citation"]:
         problems.append("根拠IDが1つもありません")
+    for line_no in issues.get("unmatched_limited_lines", [])[:20]:
+        problems.append(f"{line_no}行目は限定付き根拠の原文行と対応できません。該当する原文を条件・適用範囲とともに引用し、対応できない主張は書かないでください")
     for line_no, missing in issues.get("limitation_lines", [])[:20]:
         problems.append(f"{line_no}行目で根拠の限定が抜けています（原文: {'／'.join(missing)}）")
     for evidence_id, missing in issues.get("enumeration_gaps", [])[:20]:
@@ -1671,6 +2004,7 @@ def run_deep_research(
     query: str,
     *,
     model: str,
+    reasoning: str | None = "off",
     source_root: Path | None = None,
     timeout_seconds: int = DEEP_TIMEOUT_DEFAULT,
     max_rounds: int = DEEP_MAX_ROUNDS,
@@ -1679,24 +2013,85 @@ def run_deep_research(
     emit_progress=None,
     cancel_check=None,
     absolute_deadline: float | None = None,
+    isolate_retrieval_embedding: bool = False,
+    retrieval_embedding_model: str | None = None,
+    retrieval_embedding_cache_path: Path | None = None,
+    retrieval_embedding_cache_sha256: str | None = None,
+    answer_policy: str | None = None,
 ) -> DeepResearchResult:
     timeout_seconds = validate_deep_timeout_seconds(timeout_seconds)
+    # Resolved once per request: every path inside this request is fixed to it.
+    policy_version = ap.resolve_policy_version(answer_policy)
+    v2 = policy_version == ap.POLICY_V2
+    reasoning_contract = resolve_model_reasoning(model, reasoning)
     for value in (max_rounds, max_documents, max_units):
         if type(value) is not int or value < 1:
             raise ValueError("deep limits must be positive integers")
+    embedding_context = None
+    if isolate_retrieval_embedding:
+        if retrieval_embedding_model is None:
+            if retrieval_embedding_cache_path is not None or retrieval_embedding_cache_sha256 is not None:
+                raise ValueError("disabled isolated embedding must not specify a cache")
+            embedding_context = {"model": None, "cache_path": None, "cache_sha256": None}
+        else:
+            if retrieval_embedding_cache_path is None or not retrieval_embedding_cache_sha256:
+                raise ValueError("isolated embedding requires a cache path and digest")
+            cache_path = Path(retrieval_embedding_cache_path).expanduser().resolve(strict=True)
+            if not cache_path.is_file():
+                raise ValueError("isolated embedding cache must be a file")
+            if not re.fullmatch(r"[0-9a-f]{64}", retrieval_embedding_cache_sha256):
+                raise ValueError("isolated embedding cache digest is invalid")
+            embedding_context = {
+                "model": retrieval_embedding_model,
+                "cache_path": str(cache_path),
+                "cache_sha256": retrieval_embedding_cache_sha256,
+            }
+    elif any(value is not None for value in (
+        retrieval_embedding_model, retrieval_embedding_cache_path, retrieval_embedding_cache_sha256
+    )):
+        raise ValueError("retrieval embedding overrides require isolation mode")
+
+    requested_reasoning = reasoning_contract["requested"]
     budget = DeepBudget(
-        timeout_seconds, cancel_check=cancel_check, absolute_deadline=absolute_deadline
+        timeout_seconds,
+        reasoning=requested_reasoning,
+        cancel_check=cancel_check,
+        absolute_deadline=absolute_deadline,
     )
-    root = (source_root or Path(__file__).resolve().parent.parent / "skill-source").resolve()
+    if source_root is None:
+        from source_folder import load_source_root
+        source_root = load_source_root(Path(__file__).resolve().parent.parent)
+    root = source_root.resolve()
     evidence, progress, ledger, unconfirmed = [], [], [], []
     seen, searched, references, resolved_references = set(), set(), set(), set()
     sources = {}
+    chunks = []
     retrieval_counts = []
+    embedding_model_used = retrieval_embedding_model if isolate_retrieval_embedding else None
     stop_reason, answer = "scope_processed", ""
+    abstained_after_full_review = False
     answer_state = ANSWER_STATE_NOT_GENERATED
     # Numbers and fixed codes only: never answer text (diagnostics contract).
     final_answer = {"attempts": []}
+    source_repair = None
     note_keys = set()
+    current_gaps = {"queries": [], "unresolved": []}
+    gap_checks = []
+    # Answer policy v2 state (unused by legacy).
+    intent = ap.extract_explicit_intent(query) if v2 else None
+    answer_quality: dict = {}
+    role_caps = ap.role_budget_caps(intent.granularity, DEEP_MAX_EVIDENCE_CHARS) if v2 else {}
+    role_chars: dict[str, int] = {}
+    role_deferred: dict[str, int] = {}
+    role_selection: dict[str, int] = {}
+    node_cache: dict = {}
+    checked_sources: dict[str, bool] = {}
+    call_ledger = ap.CallLedger()
+    stage_clock = (
+        ap.StageClock(min(float(timeout_seconds), budget.remaining()), "deep", remaining_fn=budget.remaining)
+        if v2
+        else None
+    )
 
     def note(reason, path="", unit=None, detail=""):
         entry = {"reason": reason, "path": path, "status": "unconfirmed"}
@@ -1720,6 +2115,313 @@ def run_deep_research(
             unconfirmed.append(f"{reason}: {path}{location}" + (f" — {detail}" if detail else ""))
 
     reserve = DEEP_INTEGRATION_RESERVE_SECONDS + DEEP_FINALIZATION_RESERVE_SECONDS
+    if v2:
+        # Exploration stops early enough for generation, checks and finishing
+        # (the plan's stage shares), never below the legacy reserve.
+        reserve = max(reserve, ap.downstream_reserve_seconds(stage_clock.total, "deep"))
+
+    def _is_control(exc):
+        """Cancellation or an expired run deadline; a single call timing out is not."""
+        if isinstance(exc, (DeepExplorationFinished, DeepBudgetExpired)):
+            return True
+        if getattr(exc, "code", "") == "cancelled":
+            return True
+        try:
+            budget.check()
+        except Exception:
+            return True
+        return False
+
+    def call_json_v2(system, user, *, timeout):
+        # One attempt only: the answer pipeline owns the call budget, so the
+        # inner malformed-output retry of `_json_stage` must not double it.
+        return _call_ollama_json(
+            model,
+            system,
+            user,
+            timeout=timeout,
+            cancel_check=budget.check,
+            **({"reasoning": requested_reasoning} if requested_reasoning != "off" else {}),
+        )
+
+    def source_lines_for(path, sha256):
+        source = sources.get(path)
+        if source is None or (sha256 and sha256 != source[1]):
+            return None
+        if path not in checked_sources:
+            checked_sources[path] = _source_unchanged(source, budget)
+        return source[3] if checked_sources[path] else None
+
+    def reexplore_v2(missing_aspects):
+        """At most one extra, bounded round aimed at aspects the first answer could not cover."""
+        target = " ".join(intent.target_terms[:3])
+        views = []
+        for aspect in list(missing_aspects)[:2]:
+            for view in (f"{target} {aspect}".strip(), f"{query} {aspect}"):
+                if view not in searched and view not in views:
+                    views.append(view)
+        if not views:
+            return []
+        draft_cap = model_call_timeout_seconds(model, 60) if model else 60.0
+        needed_after = draft_cap + 2 * ap.CHECK_CALL_CAP_SECONDS["deep"] + DEEP_FINALIZATION_RESERVE_SECONDS
+        slack = budget.remaining() - needed_after
+        if slack < DEEP_FINAL_RETRY_MIN_SECONDS:
+            return []
+        local_reserve = budget.remaining() - slack
+        searched.update(views)
+        before_count = len(evidence)
+        try:
+            selected_lists = []
+            for response in _retrieve_round(
+                views, chunks, budget, local_reserve,
+                embedding_context=embedding_context, intent=intent.to_dict(),
+            ):
+                hydrated = _prepare_retrieve_response(response, chunks)
+                retrieval_counts.append(dict(hydrated["counts"]))
+                for excluded in hydrated["excluded"]:
+                    note("candidate_limit", excluded["path"], excluded)
+                selected_lists.append(hydrated["selected"])
+            batch = _order_by_document_relevance(selected_lists, {})
+            batch, _ = _prioritize_by_role(batch, sources, intent, node_cache)
+            read_batch(batch, local_reserve)
+        except DeepExplorationFinished:
+            pass
+        except Exception as exc:
+            if _is_control(exc):
+                raise
+            note(_exception_stop_reason(exc), detail="不足観点の追加探索を完了できませんでした")
+        return list(evidence[before_count:])
+
+    def pipeline_env():
+        return apipe.PipelineEnv(
+            call_json=call_json_v2,
+            clock=stage_clock,
+            ledger=call_ledger,
+            is_control_error=_is_control,
+            check=budget.check,
+            source_lines_for=source_lines_for,
+            window_slack=0,
+            reexplore=reexplore_v2,
+            check_cap_seconds=ap.CHECK_CALL_CAP_SECONDS["deep"],
+            draft_cap_seconds=model_call_timeout_seconds(model, 60) if model else 60.0,
+        )
+
+    def read_batch(batch, reserve):
+        """Read ranked candidates section by section into verified evidence."""
+        for candidate in batch.values():
+            budget.check()
+            path = str(candidate.get("path") or "").replace("\\", "/")
+            source = sources.get(path)
+            if source is None:
+                note("source_missing", path)
+                continue
+            expected = candidate.get("source_sha256") or candidate.get("file_sha256")
+            if (expected and expected != source[1]) or not _source_unchanged(
+                source, budget
+            ):
+                note("source_changed", path)
+                continue
+            if path not in budget.documents and len(budget.documents) >= min(
+                max_documents, DEEP_MAX_DOCUMENTS
+            ):
+                note("document_limit", path, candidate)
+                continue
+            start, end = (
+                int(candidate.get("start_line") or 1),
+                int(candidate.get("end_line") or 1),
+            )
+            for section_start, section_end, heading in _ranges_with_context(
+                source[2], start, end
+            ):
+                units = _split_line_range(source[3], section_start, section_end)
+                # Table headings remain separate source ranges, not synthetic text in a quoted range.
+                headers = [
+                    (n, n + 1)
+                    for n in range(section_start, section_end)
+                    if "|" in source[3][n - 1] and re.fullmatch(r"[\s|:\-]+", source[3][n])
+                ]
+                for unit in units:
+                    budget.check()
+                    key = (
+                        path,
+                        source[1],
+                        unit["start_line"],
+                        unit["end_line"],
+                        unit["char_start"],
+                        unit["char_end"],
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if budget.units >= min(max_units, DEEP_MAX_UNITS):
+                        note("unit_limit", path, unit)
+                        continue
+                    if not budget.can_start_work(reserve=reserve + 1):
+                        note("time_budget", path, unit)
+                        raise DeepExplorationFinished("reserved time")
+                    budget.documents.add(path)
+                    budget.units += 1
+                    _record_progress(
+                        budget,
+                        progress,
+                        emit_progress,
+                        stage="read",
+                        message="節を読んで原文と照合しています",
+                        path=path,
+                        heading=heading,
+                    )
+                    extracted = {
+                        "subject": "",
+                        "scope": "",
+                        "conditions": [],
+                        "exceptions": [],
+                        "references": [],
+                    }
+                    verification = "raw_unverified"
+                    try:
+                        context = _parent_heading_context(source[2], section_start, path)
+                        for a, b in headers:
+                            if b < unit["start_line"]:
+                                context.append(
+                                    {
+                                        "path": path,
+                                        "start_line": a,
+                                        "end_line": b,
+                                        "text": "\n".join(source[3][a - 1 : b]),
+                                    }
+                                )
+                        user = build_deep_section_prompt(
+                            query,
+                            path,
+                            heading,
+                            unit["start_line"],
+                            unit["end_line"],
+                            unit["text"],
+                        )
+                        if context:
+                            user += "\n親見出し・表の補助文脈（別範囲）:\n" + json.dumps(
+                                context, ensure_ascii=False
+                            )
+                        if (
+                            len(unit["text"]) + sum(len(c["text"]) for c in context)
+                            > DEEP_MAX_UNIT_CHARS
+                        ):
+                            note("context_budget", path, unit)
+                            context = []
+                            raise ValueError("context limit")
+                        if not model:
+                            raise ValueError("no model")
+                        extracted = _json_stage(
+                            model,
+                            DEEP_SECTION_SYSTEM,
+                            user,
+                            budget,
+                            _validate_section_json,
+                            reserve=reserve,
+                        )
+                        if extracted["relevance"] == "uncertain":
+                            raise ExtractionRejected("relevance_uncertain")
+                        if extracted["relevance"] == "irrelevant":
+                            # Independently assess the original unit, not invented
+                            # extraction fields. Never discard on one model verdict.
+                            relevance = _json_stage(
+                                model,
+                                DEEP_RELEVANCE_SYSTEM,
+                                json.dumps({"question": query, "source": unit["text"], "context": context}, ensure_ascii=False),
+                                budget,
+                                _relevance_verdict,
+                                reserve=reserve,
+                            )
+                            if relevance != "irrelevant":
+                                raise ExtractionRejected(
+                                    "relevance_uncertain" if relevance == "uncertain" else "relevance_disputed"
+                                )
+                            ledger.append({
+                                "path": path, "status": "irrelevant", "reason": "irrelevant",
+                                "start_line": unit["start_line"], "end_line": unit["end_line"],
+                                "char_start": unit["char_start"], "char_end": unit["char_end"],
+                            })
+                            continue
+                        verify_input = json.dumps(
+                            {
+                                "verification_scope": "source_extraction",
+                                "source": unit["text"],
+                                "context": context,
+                                "claims": extracted,
+                            },
+                            ensure_ascii=False,
+                        )
+                        supported = _json_stage(
+                            model,
+                            DEEP_VERIFY_SYSTEM,
+                            verify_input,
+                            budget,
+                            _verification,
+                            reserve=reserve,
+                        )
+                        if not supported:
+                            raise ExtractionRejected("extraction_unsupported")
+                        verification = "semantic_checked"
+                    except Exception as exc:
+                        _raise_control(exc)
+                        note(_exception_stop_reason(exc), path, unit)
+                        extracted = {
+                            "subject": "",
+                            "scope": "",
+                            "conditions": [],
+                            "exceptions": [],
+                            "references": [],
+                        }
+                    record = _evidence_record(
+                        evidence_number=len(evidence) + 1,
+                        path=path,
+                        source_sha256=source[1],
+                        heading=heading,
+                        unit=unit,
+                        extracted=extracted,
+                        verification_status=verification,
+                    )
+                    if context:
+                        record["context"] = context
+                    role = ap.ROLE_UNCLASSIFIED
+                    if v2:
+                        role = ap.classify_role(
+                            unit["text"],
+                            heading,
+                            heading_path=[str(c.get("text") or "") for c in context],
+                            intent=intent,
+                        ).role
+                        record["role"] = role
+                    chars = len(json.dumps(record, ensure_ascii=False))
+                    if (
+                        v2
+                        and role in role_caps
+                        and role_chars.get(role, 0) + chars > role_caps[role]
+                        and role_chars.get(ap.ROLE_DIRECT, 0) + role_chars.get(ap.ROLE_QUALIFIER, 0) > 0
+                    ):
+                        # Deliberately not expanded: the asked granularity needs less
+                        # of this kind than the unit holds. Deferred, not unconfirmed.
+                        role_deferred[role] = role_deferred.get(role, 0) + 1
+                        ledger.append(
+                            {
+                                "path": path,
+                                "status": "deferred",
+                                "reason": "role_deferred",
+                                "role": role,
+                                "start_line": unit["start_line"],
+                                "end_line": unit["end_line"],
+                            }
+                        )
+                        continue
+                    if budget.evidence_chars + chars > DEEP_MAX_EVIDENCE_CHARS:
+                        note("evidence_budget", path, unit)
+                        continue
+                    budget.evidence_chars += chars
+                    role_chars[role] = role_chars.get(role, 0) + chars
+                    evidence.append(record)
+                    if verification == "semantic_checked":
+                        references.update(extracted["references"])
+
     try:
         budget.check()
         _record_progress(
@@ -1729,12 +2431,44 @@ def run_deep_research(
             stage="planning",
             message="資料と調査観点を確認しています",
         )
+        if v2:
+            stage_clock.enter("intent")
+            # One intent call at most; agentic-lite off, failure or no time keep
+            # the explicit-request intent (overview unless the question says more).
+            from search import _agentic_lite_enabled
+
+            intent = apipe.plan_intent(
+                query, intent, pipeline_env(), enabled=bool(model) and _agentic_lite_enabled()
+            )
+            role_caps = ap.role_budget_caps(intent.granularity, DEEP_MAX_EVIDENCE_CHARS)
+            stage_clock.enter("retrieve")
         try:
             sources, chunks = _snapshot(root, budget, note)
-            pending = _initial_viewpoints(query)
+            if not isolate_retrieval_embedding:
+                try:
+                    import search as _search
+                    configured_embedding = _search.detect_embed_model()
+                    if configured_embedding:
+                        configured_cache = _search.load_embed_cache()
+                        configured_identity = _search.get_embed_model_identity(configured_embedding)
+                        if _search._cache_compatibility_matches(
+                            configured_cache, configured_embedding, configured_identity
+                        ) and any(
+                            _search._entry_matches_chunk(
+                                configured_cache.get("entries", {}).get(chunk.get("chunk_id")), chunk
+                            )
+                            for chunk in chunks
+                        ):
+                            embedding_model_used = configured_embedding
+                except Exception:
+                    embedding_model_used = None
+            pending = (
+                ap.initial_viewpoints(query, intent, limit=DEEP_MAX_VIEWPOINTS)
+                if v2
+                else _initial_viewpoints(query)
+            )
             for round_index in range(1, min(max_rounds, DEEP_MAX_ROUNDS) + 1):
                 budget.rounds = round_index
-                round_queries = list(dict.fromkeys(pending))
                 queries = []
                 for viewpoint in dict.fromkeys(pending):
                     budget.check()
@@ -1753,7 +2487,14 @@ def run_deep_research(
                         stage="search",
                         message=f"候補を検索しています（巡回{round_index}、{len(queries)}観点）",
                     )
-                    for retrieve_response in _retrieve_round(queries, chunks, budget, reserve):
+                    for retrieve_response in _retrieve_round(
+                        queries,
+                        chunks,
+                        budget,
+                        reserve,
+                        embedding_context=embedding_context,
+                        intent=intent.to_dict() if v2 else None,
+                    ):
                         retrieve_response = _prepare_retrieve_response(
                             retrieve_response, chunks
                         )
@@ -1783,177 +2524,12 @@ def run_deep_research(
                                 }
                             )
                 batch = _order_by_document_relevance(selected_lists, headings_by_path)
+                if v2:
+                    batch, round_roles = _prioritize_by_role(batch, sources, intent, node_cache)
+                    for role, count in round_roles.items():
+                        role_selection[role] = role_selection.get(role, 0) + count
                 before = len(evidence)
-                for candidate in batch.values():
-                    budget.check()
-                    path = str(candidate.get("path") or "").replace("\\", "/")
-                    source = sources.get(path)
-                    if source is None:
-                        note("source_missing", path)
-                        continue
-                    expected = candidate.get("source_sha256") or candidate.get("file_sha256")
-                    if (expected and expected != source[1]) or not _source_unchanged(
-                        source, budget
-                    ):
-                        note("source_changed", path)
-                        continue
-                    if path not in budget.documents and len(budget.documents) >= min(
-                        max_documents, DEEP_MAX_DOCUMENTS
-                    ):
-                        note("document_limit", path, candidate)
-                        continue
-                    start, end = (
-                        int(candidate.get("start_line") or 1),
-                        int(candidate.get("end_line") or 1),
-                    )
-                    for section_start, section_end, heading in _ranges_with_context(
-                        source[2], start, end
-                    ):
-                        units = _split_line_range(source[3], section_start, section_end)
-                        # Table headings remain separate source ranges, not synthetic text in a quoted range.
-                        headers = [
-                            (n, n + 1)
-                            for n in range(section_start, section_end)
-                            if "|" in source[3][n - 1] and re.fullmatch(r"[\s|:\-]+", source[3][n])
-                        ]
-                        for unit in units:
-                            budget.check()
-                            key = (
-                                path,
-                                source[1],
-                                unit["start_line"],
-                                unit["end_line"],
-                                unit["char_start"],
-                                unit["char_end"],
-                            )
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            if budget.units >= min(max_units, DEEP_MAX_UNITS):
-                                note("unit_limit", path, unit)
-                                continue
-                            if not budget.can_start_work(reserve=reserve + 1):
-                                note("time_budget", path, unit)
-                                raise DeepExplorationFinished("reserved time")
-                            budget.documents.add(path)
-                            budget.units += 1
-                            _record_progress(
-                                budget,
-                                progress,
-                                emit_progress,
-                                stage="read",
-                                message="節を読んで原文と照合しています",
-                                path=path,
-                                heading=heading,
-                            )
-                            extracted = {
-                                "subject": "",
-                                "scope": "",
-                                "conditions": [],
-                                "exceptions": [],
-                                "references": [],
-                            }
-                            verification = "raw_unverified"
-                            try:
-                                context = []
-                                for a, b in headers:
-                                    if b < unit["start_line"]:
-                                        context.append(
-                                            {
-                                                "path": path,
-                                                "start_line": a,
-                                                "end_line": b,
-                                                "text": "\n".join(source[3][a - 1 : b]),
-                                            }
-                                        )
-                                user = build_deep_section_prompt(
-                                    query,
-                                    path,
-                                    heading,
-                                    unit["start_line"],
-                                    unit["end_line"],
-                                    unit["text"],
-                                )
-                                if context:
-                                    user += "\n表の補助文脈（別範囲）:\n" + json.dumps(
-                                        context, ensure_ascii=False
-                                    )
-                                if (
-                                    len(unit["text"]) + sum(len(c["text"]) for c in context)
-                                    > DEEP_MAX_UNIT_CHARS
-                                ):
-                                    note("context_budget", path, unit)
-                                    context = []
-                                    raise ValueError("context limit")
-                                if not model:
-                                    raise ValueError("no model")
-                                extracted = _json_stage(
-                                    model,
-                                    DEEP_SECTION_SYSTEM,
-                                    user,
-                                    budget,
-                                    _validate_section_json,
-                                    reserve=reserve,
-                                )
-                                verify_input = json.dumps(
-                                    {
-                                        "question": query,
-                                        "source": unit["text"],
-                                        "context": context,
-                                        "claims": extracted,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                supported = _json_stage(
-                                    model,
-                                    DEEP_VERIFY_SYSTEM,
-                                    verify_input,
-                                    budget,
-                                    _verification,
-                                    reserve=reserve,
-                                )
-                                if not supported or extracted["relevance"] == "uncertain":
-                                    raise ValueError("unsupported extraction")
-                                if extracted["relevance"] == "irrelevant":
-                                    ledger.append(
-                                        {
-                                            "path": path,
-                                            "status": "irrelevant",
-                                            "reason": "irrelevant",
-                                            "start_line": unit["start_line"],
-                                            "end_line": unit["end_line"],
-                                        }
-                                    )
-                                    continue
-                                verification = "semantic_checked"
-                                references.update(extracted["references"])
-                            except Exception as exc:
-                                _raise_control(exc)
-                                note(_exception_stop_reason(exc), path, unit)
-                                extracted = {
-                                    "subject": "",
-                                    "scope": "",
-                                    "conditions": [],
-                                    "exceptions": [],
-                                    "references": [],
-                                }
-                            record = _evidence_record(
-                                evidence_number=len(evidence) + 1,
-                                path=path,
-                                source_sha256=source[1],
-                                heading=heading,
-                                unit=unit,
-                                extracted=extracted,
-                                verification_status=verification,
-                            )
-                            if context:
-                                record["context"] = context
-                            chars = len(json.dumps(record, ensure_ascii=False))
-                            if budget.evidence_chars + chars > DEEP_MAX_EVIDENCE_CHARS:
-                                note("evidence_budget", path, unit)
-                                continue
-                            budget.evidence_chars += chars
-                            evidence.append(record)
+                read_batch(batch, reserve)
                 # References are resolved only by actually retained source text, never by a search hit alone.
                 for reference in references:
                     if any(
@@ -1964,29 +2540,36 @@ def run_deep_research(
                     ):
                         resolved_references.add(reference)
                 pending.extend(sorted(references - resolved_references - searched))
-                if evidence and len(evidence) > before and model:
+                if evidence and model and (len(evidence) > before or round_index > 1):
                     try:
                         data = _json_stage(
                             model,
                             DEEP_GAPS_SYSTEM,
                             json.dumps(
-                                {"question": query, "evidence": evidence},
+                                {
+                                    "question": query, "evidence": evidence,
+                                    "previous_gaps": current_gaps,
+                                    "searched_queries": sorted(searched),
+                                    "new_evidence_count": len(evidence) - before,
+                                },
                                 ensure_ascii=False,
                             ),
                             budget,
                             _gaps,
                             reserve=reserve,
                         )
-                        for issue in data["unresolved"]:
-                            note("unresolved", detail=issue)
+                        current_gaps = data
+                        gap_checks.append({
+                            "round": round_index,
+                            "unresolved_count": len(data["unresolved"]),
+                            "query_count": len(data["queries"]),
+                            "new_evidence_count": len(evidence) - before,
+                        })
                         pending.extend(q for q in data["queries"] if q not in searched)
                     except Exception as exc:
                         _raise_control(exc)
                         note("model_error", detail="追加観点の確認に失敗")
                 pending = list(dict.fromkeys(pending))
-                if round_index > 1 and len(evidence) == before:
-                    for viewpoint in round_queries:
-                        note("unresolved_query", detail=viewpoint)
                 if len(pending) > DEEP_MAX_VIEWPOINTS:
                     for viewpoint in pending[DEEP_MAX_VIEWPOINTS:]:
                         note("viewpoint_limit", detail=viewpoint)
@@ -2011,6 +2594,11 @@ def run_deep_research(
                 raise
             note("time_budget", detail="モデル呼出が時間内に終わらず探索を終了")
 
+        for issue in current_gaps["unresolved"]:
+            note("unresolved", detail=issue)
+        for viewpoint in current_gaps["queries"]:
+            note("unresolved_query", detail=viewpoint)
+
         def revalidate():
             invalid = {
                 e["path"] for e in evidence if not _source_unchanged(sources[e["path"]], budget)
@@ -2022,7 +2610,51 @@ def run_deep_research(
 
         revalidate()
         verified = [e for e in evidence if e["verification_status"] == "semantic_checked"]
-        if verified:
+        if verified and v2:
+            _record_progress(
+                budget,
+                progress,
+                emit_progress,
+                stage="integrate",
+                message="回答を構成し、原文・意味・質問への適合を検査しています",
+            )
+            outcome = None
+            try:
+                budget.check()
+                outcome = apipe.run_answer_pipeline(
+                    query,
+                    intent,
+                    evidence,
+                    pipeline_env(),
+                    fallback_reason="検査済みの説明を構成できませんでした。",
+                    note_lines=[
+                        "未確認事項（回答で断定しない）:",
+                        *[f"- {line}" for line in _summarize_unconfirmed_for_prompt(unconfirmed, ledger)],
+                    ]
+                    if unconfirmed
+                    else None,
+                )
+            except Exception as exc:
+                _raise_control(exc)
+                note(_exception_stop_reason(exc), detail="最終回答を構成できず参考の原文を表示")
+                final_answer["result"] = "not_generated"
+            if outcome is not None:
+                answer = outcome.answer
+                answer_quality = outcome.quality
+                # Kept apart from the legacy `attempts` list the UI formats.
+                final_answer["v2"] = outcome.diagnostics
+                if outcome.kind == "fallback":
+                    answer_state = ANSWER_STATE_VERIFICATION_FAILED
+                    final_answer["result"] = "v2_fallback"
+                else:
+                    answer_state = ANSWER_STATE_GENERATED
+                    final_answer["result"] = f"v2_{answer_quality['state']}"
+                if answer_quality["state"] != ap.QUALITY_PASSED:
+                    detail = answer_quality["message"]
+                    if answer_quality["unconfirmedAspects"]:
+                        detail += "（未確認の範囲: " + "／".join(answer_quality["unconfirmedAspects"]) + "）"
+                    note("answer_quality", detail=detail)
+        elif verified:
             # Distinguishes "the model never returned an answer" (timeout,
             # connection error, prompt budget) from "an answer came back but
             # failed citation/support checks".
@@ -2052,14 +2684,16 @@ def run_deep_research(
                     model,
                     DEEP_FINAL_SYSTEM,
                     prompt,
-                    timeout=min(60, available / 2),
+                    timeout=min(model_call_timeout_seconds(model, 60), available / 2),
                     cancel_check=budget.check,
+                    **({"reasoning": requested_reasoning} if requested_reasoning != "off" else {}),
                 )
                 budget.check()
                 candidate, issues = _check_final_candidate(candidate, evidence, final_answer)
                 retry_available = budget.remaining() - DEEP_FINALIZATION_RESERVE_SECONDS
                 needs_rewrite = (
                     not _final_answer_passes(issues) or issues["limitation_lines"] or issues["enumeration_gaps"]
+                    or issues["unmatched_limited_lines"]
                 )
                 if needs_rewrite and retry_available >= DEEP_FINAL_RETRY_MIN_SECONDS:
                     # One rewrite with the failing line numbers, inside the same deadline.
@@ -2070,8 +2704,9 @@ def run_deep_research(
                             model,
                             DEEP_FINAL_SYSTEM,
                             retry_prompt,
-                            timeout=min(60, retry_available / 2),
+                            timeout=min(model_call_timeout_seconds(model, 60), retry_available / 2),
                             cancel_check=budget.check,
+                            **({"reasoning": requested_reasoning} if requested_reasoning != "off" else {}),
                         )
                     except Exception as exc:
                         # Cancellation still propagates; a rewrite that times out
@@ -2086,6 +2721,7 @@ def run_deep_research(
                 if not _final_answer_passes(issues):
                     final_answer["result"] = "rejected_citations"
                     raise _FinalAnswerRejected("最終回答の根拠IDが不足または不正のため原文抜粋を表示")
+                source_repair = _SourceRepairMetrics(candidate)
                 if issues["limitation_lines"]:
                     # Still dropping limits after the rewrite: put the cited source
                     # text back verbatim on those lines instead of discarding the answer.
@@ -2103,6 +2739,12 @@ def run_deep_research(
                             + "）"
                         )
                     candidate = repaired
+                    for finding in findings:
+                        row = finding["row"]
+                        if finding["limits_missing"]:
+                            source_repair.record(_cite_verbatim(row["raw"], row["evidence_id"]))
+                        if finding["scope_missing"]:
+                            source_repair.record(_cite_verbatim(row["scope"][2], row["evidence_id"]), added=True)
                     final_answer["repaired_lines"] = len(findings)
                     for text in repair_notes:
                         note("limitation_repaired", detail=text)
@@ -2110,6 +2752,9 @@ def run_deep_research(
                 if enumeration:
                     # Still leaving out items of a list it uses: add them verbatim.
                     candidate, enumeration_notes = _repair_enumerations(candidate, enumeration)
+                    for finding in enumeration:
+                        for row in finding["missing"]:
+                            source_repair.record(_cite_verbatim(row["raw"], row["evidence_id"]), added=True)
                     final_answer["added_items"] = sum(len(f["missing"]) for f in enumeration)
                     for text in enumeration_notes:
                         note("enumeration_repaired", detail=text)
@@ -2123,6 +2768,7 @@ def run_deep_research(
                     model=model,
                     budget=budget,
                     record=final_answer,
+                    provenance=source_repair,
                 )
                 for text in line_notes:
                     note("line_unsupported", detail=text)
@@ -2137,8 +2783,23 @@ def run_deep_research(
                     raise _FinalAnswerRejected(
                         "最終回答の各行が根拠に支持されないと照合されたため原文抜粋を表示"
                     )
+                # A later line replacement or deduplication must not undo the
+                # source limits already checked before line-by-line verification.
+                unmatched = _unmatched_limited_lines(candidate, evidence)
+                final_answer["unmatched_limited_lines"] = len(unmatched)
+                if unmatched:
+                    excluded = set(unmatched)
+                    candidate = "\n".join(line for number, line in enumerate(candidate.splitlines(), 1) if number not in excluded).strip()
+                    final_answer["unmatched_limited_lines_removed"] = len(unmatched)
+                    note("model_error", detail=f"限定付き根拠との対応を確認できない回答{len(unmatched)}行を除外")
+                    if not _final_answer_passes(_final_answer_issues(candidate, {e["evidence_id"] for e in evidence})):
+                        final_answer["result"] = "rejected_unmatched_limits"
+                        raise _FinalAnswerRejected("限定付き根拠と回答の対応を確認できないため原文抜粋を表示")
+                if _limitation_issues(candidate, evidence):
+                    final_answer["result"] = "rejected_limitations"
+                    raise _FinalAnswerRejected("行単位の照合後に原文の限定・適用範囲が欠けたため原文抜粋を表示")
                 check_input = json.dumps(
-                    {"question": query, "source": evidence, "claims": candidate},
+                    {"verification_scope": "final_answer", "question": query, "source": evidence, "claims": candidate},
                     ensure_ascii=False,
                 )
                 if not _json_stage(
@@ -2172,8 +2833,25 @@ def run_deep_research(
                         else "最終回答の照合を完了できず原文抜粋を表示",
                     )
                     answer_state = ANSWER_STATE_VERIFICATION_FAILED
+        if (
+            not evidence and not unconfirmed
+            and _all_source_units_irrelevant(sources, ledger)
+        ):
+            # Irrelevant units are not retained as answer evidence. Revalidate
+            # them too before declaring a completed information-insufficiency result.
+            for path, source in sources.items():
+                if not _source_unchanged(source, budget):
+                    note("source_changed", path)
+            if not unconfirmed:
+                answer = (
+                    "今回確認した資料の範囲では、質問に直接答える根拠を確認できません。"
+                    "該当情報なし。資料の範囲外については判断できません。"
+                )
+                final_answer["result"] = "abstained_no_relevant_evidence"
+                abstained_after_full_review = True
         if revalidate():
             answer = ""
+            answer_quality = {}
             answer_state = ANSWER_STATE_VERIFICATION_FAILED
         budget.check()
     except Exception as exc:
@@ -2181,17 +2859,22 @@ def run_deep_research(
         note(stop_reason)
         # Never display an answer whose final validation was interrupted.
         answer = ""
+        answer_quality = {}
         answer_state = ANSWER_STATE_NOT_GENERATED
+        abstained_after_full_review = False
 
     reasons = {
         e["reason"]
         for e in ledger
-        if e["status"] != "irrelevant" and e["reason"] not in DEEP_FINAL_ANSWER_NOTE_REASONS
+        if e["status"] not in {"irrelevant", "deferred"}
+        and e["reason"] not in DEEP_FINAL_ANSWER_NOTE_REASONS
     }
     stop_reason = _select_stop_reason(stop_reason, reasons)
     status = (
         "cancelled"
         if stop_reason == "cancelled"
+        else "completed"
+        if abstained_after_full_review
         else "partial"
         if evidence and (unconfirmed or not answer)
         else "completed"
@@ -2199,7 +2882,27 @@ def run_deep_research(
         else "failed"
     )
     if not answer:
-        answer = _fallback_answer(evidence, unconfirmed, ledger, stop_reason)
+        if v2:
+            message = stop_reason_message(stop_reason)
+            display_reason = f"{stop_reason}（{message}）" if message else stop_reason
+            answer = ap.render_fallback(
+                evidence,
+                roles={e["evidence_id"]: e.get("role", ap.ROLE_UNCLASSIFIED) for e in evidence},
+                granularity=intent.granularity,
+                reason=f"調査終了理由: {display_reason}",
+            )
+            answer_quality = ap.build_quality(
+                {}, kind="fallback", unconfirmed_aspects=intent.required_aspects
+            )
+        else:
+            answer = _fallback_answer(evidence, unconfirmed, ledger, stop_reason)
+    if source_repair is not None:
+        final_answer["source_repair"] = source_repair.summary(
+            answer if answer_state == ANSWER_STATE_GENERATED else "",
+            removed=final_answer.get("line_checks", {}).get("dropped", 0),
+            duplicates=final_answer.get("duplicate_lines", 0),
+        )
+        final_answer["source_repair"]["answer_state"] = answer_state
     # Entering "complete" charges the last working stage (usually integrate,
     # the longest one) to stage_seconds, so it must precede the snapshot below.
     _record_progress(
@@ -2210,6 +2913,7 @@ def run_deep_research(
         message=f"調査状態: {status} / {stop_reason}",
     )
     diagnostics = {
+        "gap_checks": gap_checks,
         "schema_version": DEEP_SCHEMA_VERSION,
         "timeout_seconds": timeout_seconds,
         # Monotonic total elapsed time, independent of any single call's
@@ -2225,7 +2929,15 @@ def run_deep_research(
         "units": budget.units,
         "evidence_count": len(evidence),
         "evidence_chars": budget.evidence_chars,
+        "embedding_model": embedding_model_used,
+        "embedding_isolated": isolate_retrieval_embedding,
+        "requested_reasoning": reasoning_contract["requested"],
+        "effective_reasoning": reasoning_contract["effective"],
+        "api_think_value": reasoning_contract["think"],
+        "thinking_enabled": reasoning_contract["effective"] != "off",
+        "thinking_visible": False,
         "retrieval_counts": retrieval_counts,
+        "answer_policy": policy_version,
         "final_answer": final_answer,
         # Units the model judged unrelated to the question: read, but not used.
         # Paths and line ranges only (bounded by the unit limit), so a reader can
@@ -2239,6 +2951,21 @@ def run_deep_research(
             r: sum(e["reason"] == r for e in ledger) for r in sorted({e["reason"] for e in ledger})
         },
     }
+    if v2:
+        diagnostics["answer_policy_v2"] = {
+            # Numbers and fixed codes only (no question or source text).
+            "intent": {
+                "granularity": intent.granularity,
+                "source": intent.source,
+                "required_aspects": len(intent.required_aspects),
+            },
+            "role_selection": dict(role_selection),
+            "role_chars": dict(role_chars),
+            "role_deferred": dict(role_deferred),
+            "llm_calls": call_ledger.summary(),
+            "stage_seconds": stage_clock.summary(),
+            "downstream_reserve_seconds": round(reserve, 1),
+        }
     return DeepResearchResult(
         status,
         stop_reason,
@@ -2249,4 +2976,5 @@ def run_deep_research(
         progress,
         ledger,
         diagnostics,
+        answer_quality,
     )

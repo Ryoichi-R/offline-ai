@@ -36,6 +36,8 @@ def backend(monkeypatch, *, extract=None, answer="対象である。[E1]", verdi
         )
 
     def model(name, system, user, **kwargs):
+        if system == deep.DEEP_RELEVANCE_SYSTEM:
+            return {"relevance": "irrelevant"}
         if system == deep.DEEP_VERIFY_SYSTEM:
             return verdict(user) if verdict else dict(VERDICT)
         if system == deep.DEEP_GAPS_SYSTEM:
