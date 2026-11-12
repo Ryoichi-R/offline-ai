@@ -47,6 +47,24 @@ def test_deep_json_verification_has_a_separate_output_budget(monkeypatch):
     assert payloads[0]["body"]["options"]["num_predict"] == deep_research.DEEP_TEXT_NUM_PREDICT
 
 
+def test_deep_json_sends_a_draft_larger_than_the_previous_input_limit(monkeypatch):
+    monkeypatch.setattr(search, "PROMPT_CHARS_PER_TOKEN", 1.4)
+    payloads = []
+
+    def fake_worker(payload, **kwargs):
+        payloads.append(payload)
+        return '{"supported": true}'
+
+    monkeypatch.setattr(deep_research, "run_worker", fake_worker)
+    user = "あ" * 34_300
+
+    assert deep_research._call_ollama_json("model", "system", user, timeout=1) == {
+        "supported": True
+    }
+    assert payloads[0]["body"]["messages"][1]["content"] == user
+    assert payloads[0]["body"]["options"]["num_ctx"] == 40_960
+
+
 def test_split_line_range_keeps_long_line_character_offsets():
     line = "あ" * 8500
     units = deep_research._split_line_range([line], 1, 1, max_chars=4000)

@@ -1822,8 +1822,24 @@ const ui = {
                 : point.text;
             const meta = document.createElement("div");
             meta.className = "guided-point-meta";
-            meta.textContent = `${point.heading ? point.heading + " / " : ""}行 ${point.startLine}-${point.endLine}`;
+            meta.textContent = `${point.heading ? point.heading + " / " : ""}行 ${point.startLine}-${point.endLine}${point.truncated ? "（一部）" : ""}`;
             li.append(text, meta);
+            if (point.evidenceId) {
+                li.appendChild(this.evidenceButton({ ...point, sourceTitle: g.document?.title }));
+            }
+            // 別紙に添えた注記（除外・限定）。原則と例外を切り離さずに示す。
+            for (const note of point.notes || []) {
+                const noteText = document.createElement("div");
+                noteText.className = "guided-point-text";
+                noteText.textContent = note.text;
+                const noteMeta = document.createElement("div");
+                noteMeta.className = "guided-point-meta";
+                noteMeta.textContent = `注記 / 行 ${note.startLine}-${note.endLine}`;
+                li.append(noteText, noteMeta);
+                if (note.evidenceId) {
+                    li.appendChild(this.evidenceButton({ ...note, sourceTitle: g.document?.title }));
+                }
+            }
             els.guidedPoints.appendChild(li);
         }
         els.guidedOptions.replaceChildren();
@@ -1973,12 +1989,7 @@ const ui = {
             row.appendChild(meta);
 
             if (item.evidenceId && item.viewable) {
-                const viewButton = document.createElement("button");
-                viewButton.type = "button";
-                viewButton.className = "btn btn-secondary";
-                viewButton.textContent = "該当箇所を表示";
-                viewButton.addEventListener("click", () => this.openEvidence(item, viewButton));
-                row.appendChild(viewButton);
+                row.appendChild(this.evidenceButton(item));
             } else if (item.viewReason) {
                 const unavailable = document.createElement("div");
                 unavailable.className = "evidence-meta";
@@ -2006,6 +2017,15 @@ const ui = {
         const notes = [...(ev.verificationNote ? [String(ev.verificationNote)] : []), ...diagnostics, ...warnings];
         this.els.searchEvidenceWarnings.textContent = notes.length ? `検索時の注意:\n${notes.map((warning) => `- ${warning}`).join("\n")}` : "";
         this.els.searchEvidence.hidden = false;
+    },
+
+    evidenceButton(item) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn btn-secondary";
+        button.textContent = "該当箇所を表示";
+        button.addEventListener("click", () => this.openEvidence(item, button));
+        return button;
     },
 
     async openEvidence(item, sourceButton) {
@@ -2068,6 +2088,15 @@ const ui = {
     // 根拠範囲より抜粋が短いとき、抜粋自体の行範囲と省略を示す（画面と保存で同じ文言）。
     _excerptRangeLabel(item) {
         if (!item || !item.snippetTruncated) return "";
+        if (Array.isArray(item.snippetSegments) && item.snippetSegments.length > 1) {
+            // 複数区間の抜粋。区間の間は「…」で省略している。
+            const ranges = item.snippetSegments
+                .filter((segment) => segment.startLine !== null && segment.startLine !== undefined)
+                .map((segment) => `${segment.startLine}-${segment.endLine}`);
+            if (ranges.length === item.snippetSegments.length) {
+                return `抜粋 行 ${ranges.join("、")}（根拠範囲の一部。区間の間と前後を省略）`;
+            }
+        }
         const hasRange = item.snippetStartLine !== null && item.snippetStartLine !== undefined
             && item.snippetEndLine !== null && item.snippetEndLine !== undefined;
         return hasRange

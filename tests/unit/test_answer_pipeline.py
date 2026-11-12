@@ -934,3 +934,29 @@ def test_g2_rejects_widened_numbered_precedence_before_the_model_can_support_it(
     if status == ap.FAILED:
         assert result["c1"].codes == ("scope_overreach",)
         assert model.count("g2") == 0
+
+
+@pytest.mark.parametrize(
+    ("source", "status"),
+    [
+        ("| 様式 | 内容 |\n| --- | --- |\n| A | 申込書 |\nこの通知は4月1日から適用する。", ap.FAILED),
+        ("## 実施時期\n| 様式 | 実施時期 |\n| --- | --- |\n| 申込書の様式 |  |", ap.FAILED),
+        ("| 様式 | 実施時期 |\n| --- | --- |\n| A | 4月1日から |", ap.PASSED),
+        ("各様式の実施時期は別表のとおりとする。", ap.PASSED),
+    ],
+)
+def test_g2_checks_for_source_support_for_timing_by_form(source, status):
+    evidence = {"E4": {
+        "evidence_id": "E4", "excerpt": source, "start_line": 1, "end_line": len(source.splitlines()),
+    }}
+    timing_claim = claim("実施時期は様式ごとに定められています。", "E4", source.splitlines()[-1])
+    draft = ap.parse_answer_draft({"sections": [{"claims": [timing_claim]}]})
+    assert ap.check_g1(draft, evidence)["c1"].status == ap.PASSED
+    model = FakeModel()
+
+    result = pipeline.verify_claims("手続の詳細は？", draft, ["c1"], evidence, make_env(model, source_lines_for=None))
+
+    assert result["c1"].status == status
+    assert model.count("g2") == (1 if status == ap.PASSED else 0)
+    if status == ap.FAILED:
+        assert result["c1"].codes == ("not_in_source",)

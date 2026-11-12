@@ -213,7 +213,8 @@ def test_normal_path_adds_primary_ranges_only_for_a_confirmed_broad_question(tmp
         assert item["snippet"] == "\n".join(lines[item["start_line"] - 1 : item["end_line"]])
         assert item["source"] == "expanded"
     assert any(KEY_X in i["snippet"] for i in primary)
-    assert items[-1] == hit[0] and warnings == []
+    assert [item["start_line"] for item in primary if "から適用する" in item["snippet"]] == [10]
+    assert len([item for item in items if item["start_line"] == 10]) == 1 and warnings == []
     # 具体的な質問、チャンク検索無効、ハッシュ不一致では変えない。
     assert search._with_primary_ranges(
         "会計事務における押印の取扱いについての適用日はいつ", hit,

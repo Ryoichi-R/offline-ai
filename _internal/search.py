@@ -5731,73 +5731,132 @@ def _with_primary_ranges(
     else:
         if not chunks:
             return evidence_items, []
-        matched = _source_structure.match_documents(
-            query, _source_structure.documents_from_chunks(chunks)
-        )
+        documents = _source_structure.documents_from_chunks(chunks)
+        matched = _source_structure.match_documents(query, documents)
         path = matched["confirmed"]
+        primary_source = "confirmed"
         if not path:
-            return evidence_items, []
+            # 発出者＋主題の単独候補が採用前の根拠の先頭資料と一致する場合だけ追加する
+            # （確定はしない。他の資料の根拠も残す。guided-follow-up 7.4 R2）。
+            soft = _single_issuer_candidate(query, matched)
+            top = str(evidence_items[0].get("path") or "").replace("\\", "/") if evidence_items else ""
+            document = next((d for d in documents if d["path"] == soft), None) if soft else None
+            member_paths = {m["path"] for m in (document or {}).get("paths") or []} | ({soft} if soft else set())
+            if not soft or top not in member_paths:
+                return evidence_items, []
+            path, primary_source = soft, "single_candidate"
         candidate = _source_structure.candidate_for(matched, path)
         title = candidate["title"]
         scope = _answer_policy.classify_guided_scope(query, exclude_texts=candidate["exclude"])
         if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC:
             return evidence_items, []
-        expected_sha = next(
-            (str(c.get("file_sha256") or "") for c in chunks if str(c.get("path") or "").replace("\\", "/") == path),
-            "",
-        )
-    try:
-        data = (Path(source_root) / path).read_bytes()
-    except OSError:
-        return evidence_items, []
-    if not expected_sha or hashlib.sha256(data).hexdigest() != expected_sha:
-        return evidence_items, []
-    text = data.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    if focus_ranges:
-        selection = _focus_selection(lines, focus_ranges, max(0, char_budget))
-    else:
-        selection = _source_structure.primary_section_ranges(text, budget_chars=max(0, char_budget))
+        document = next(d for d in documents if d["path"] == path)
+        members = [
+            {"path": m["path"], "sha256": m.get("file_sha256") or ""}
+            for m in document.get("paths") or [{"path": path, "file_sha256": document.get("file_sha256")}]
+        ]
+    if forced:
+        members = list(forced.get("paths") or [{"path": path, "sha256": expected_sha}])
+    # 資料（分割資料は全部分）を検索時と同じハッシュで読む。1部分でも一致しなければ何もしない。
+    loaded = []
+    for member in members:
+        member_path = str(member["path"]).replace("\\", "/")
+        try:
+            data = (Path(source_root) / member_path).read_bytes()
+        except OSError:
+            return evidence_items, []
+        digest = hashlib.sha256(data).hexdigest()
+        if not member.get("sha256") or digest != member["sha256"]:
+            return evidence_items, []
+        part_text = data.decode("utf-8", errors="replace")
+        loaded.append((member_path, digest, part_text, part_text.splitlines()))
+    focus_by_path: dict[str, list] = {}
+    for entry in focus_ranges or []:
+        entry_path = str(entry[2]).replace("\\", "/") if len(entry) > 2 and entry[2] else loaded[0][0]
+        focus_by_path.setdefault(entry_path, []).append((entry[0], entry[1]))
     merged: list[dict] = []
-    for item in selection["ranges"]:
-        previous = merged[-1] if merged else None
-        if previous and previous["complete"] and previous["end_line"] + 1 == item["start_line"]:
-            previous.update(end_line=item["end_line"], complete=item["complete"])
-            previous["headings"].append(item["heading"])
+    unread: list[dict] = []
+    effective_dates: list[dict] = []
+    for member_path, digest, part_text, lines in loaded:
+        if focus_ranges:
+            ranges = focus_by_path.get(member_path)
+            if not ranges:
+                continue
+            share = max(0, char_budget) * len(ranges) // max(1, len(focus_ranges))
+            selection = _focus_selection(lines, ranges, share)
         else:
-            merged.append({**item, "headings": [item["heading"]]})
-    keep = merged[: max(0, item_limit - 1)] if evidence_items else merged[:item_limit]
-    unread = list(selection["unread"]) + [
-        {"start_line": m["start_line"], "end_line": m["end_line"], "heading": m["heading"]}
+            share = max(0, char_budget) // max(1, len(loaded))
+            selection = _source_structure.primary_section_ranges(part_text, budget_chars=share)
+            for item in selection["ancillary"]:
+                start, end = item["start_line"], item["end_line"]
+                body = "\n".join(lines[start - 1:end]).strip()
+                normalized = _source_structure.normalize_match_text(body)
+                if len(body) <= 240 and re.search(
+                    r"(?:元|[0-9]+)年[0-9]+月[0-9]+日(?:から|より)(?:適用|施行|実施)", normalized
+                ):
+                    effective_dates.append({
+                        **item, "headings": [item["heading"]], "path": member_path,
+                        "sha": digest, "lines": lines,
+                    })
+        for item in selection["ranges"]:
+            previous = merged[-1] if merged else None
+            if (
+                previous and previous["path"] == member_path and previous["complete"]
+                and previous["end_line"] + 1 == item["start_line"]
+            ):
+                previous.update(end_line=item["end_line"], complete=item["complete"])
+                previous["headings"].append(item["heading"])
+            else:
+                merged.append({**item, "headings": [item["heading"]], "path": member_path, "sha": digest,
+                               "lines": lines})
+        unread.extend({**item, "path": member_path} for item in selection["unread"])
+    primary_limit = max(0, item_limit - 1) if evidence_items else item_limit
+    keep = merged[:primary_limit]
+    # Keep a short, unambiguous operative date only when the main ranges
+    # leave space. Do not displace substantive clauses or the search hit.
+    if keep and len(effective_dates) == 1 and len(keep) < primary_limit:
+        date = effective_dates[0]
+        used = sum(
+            sum(len(line) + 1 for line in item["lines"][item["start_line"] - 1:item["end_line"]])
+            for item in keep
+        )
+        date_size = sum(len(line) + 1 for line in date["lines"][date["start_line"] - 1:date["end_line"]])
+        if used + date_size <= char_budget:
+            keep.append(date)
+    unread += [
+        {"start_line": m["start_line"], "end_line": m["end_line"], "heading": m["heading"], "path": m["path"]}
         for m in merged[len(keep):]
     ]
     top_score = max((float(m.get("score") or 0) for m in evidence_items), default=1.0)
     primary_items = [
         {
-            "path": path,
-            "chunk_id": f"primary:{path}:{m['start_line']}-{m['end_line']}",
+            "path": m["path"],
+            "chunk_id": f"primary:{m['path']}:{m['start_line']}-{m['end_line']}",
             "heading": " / ".join(h for h in m["headings"] if h) or m["heading"],
             "start_line": m["start_line"],
             "end_line": m["end_line"],
-            "snippet": "\n".join(lines[m["start_line"] - 1 : m["end_line"]]),
+            "snippet": "\n".join(m["lines"][m["start_line"] - 1 : m["end_line"]]),
             "score": top_score,
             "source": "expanded",
             "source_title": title,
-            "file_sha256": expected_sha,
-            "source_sha256": expected_sha,
+            "file_sha256": m["sha"],
+            "source_sha256": m["sha"],
             "primary_range": True,
+            "primary_source": "fixed" if forced else primary_source,
         }
         for m in keep
     ]
-    covered = [(m["start_line"], m["end_line"]) for m in keep]
+    covered = [(m["path"], m["start_line"], m["end_line"]) for m in keep]
     rest = [
         m
         for m in evidence_items
         if not (
-            str(m.get("path") or "").replace("\\", "/") == path
-            and isinstance(m.get("start_line"), int)
+            isinstance(m.get("start_line"), int)
             and isinstance(m.get("end_line"), int)
-            and any(a <= m["start_line"] and m["end_line"] <= b for a, b in covered)
+            and any(
+                str(m.get("path") or "").replace("\\", "/") == p_ and a <= m["start_line"] and m["end_line"] <= b_
+                for p_, a, b_ in covered
+            )
         )
     ]
     warnings = []
@@ -5807,6 +5866,50 @@ def _with_primary_ranges(
     if len(unread) > PRIMARY_UNREAD_WARNING_MAX:
         warnings.append(f"ほかに読めていない主要範囲が{len(unread) - PRIMARY_UNREAD_WARNING_MAX}件あります")
     return primary_items + rest, warnings
+
+
+def _single_issuer_candidate(query: str, matched: dict) -> str | None:
+    """発出者＋主題の単独候補（強い一致なし）で、具体的な項目を尋ねていない場合のパス。"""
+    candidates = matched.get("candidates") or []
+    if matched.get("confirmed") or len(candidates) != 1 or candidates[0]["reasons"] != ["issuer_subject"]:
+        return None
+    scope = _answer_policy.classify_guided_scope(query, exclude_texts=candidates[0]["exclude"])
+    return None if scope.scope == _answer_policy.GUIDED_SCOPE_SPECIFIC else candidates[0]["path"]
+
+
+def _demote_ancillary(query: str, items: list[dict], *, source_root: Path) -> list[dict]:
+    """付随範囲と判定した根拠を後ろへ回す。質問が付随項目を明示した場合は回さない。
+
+    判定には検索時と同じ SHA-256 の原文を使い、読めない・一致しない資料は判定しない。
+    """
+    if {"時期", "窓口", "書類"} & set(_answer_policy.classify_guided_scope(query).items):
+        return items
+    texts: dict[str, tuple[str, list[str], list] | None] = {}
+    main, ancillary = [], []
+    for item in items:
+        path = str(item.get("path") or "").replace("\\", "/")
+        start, end = item.get("start_line"), item.get("end_line")
+        if item.get("primary_range") or not isinstance(start, int) or not isinstance(end, int):
+            main.append(item)
+            continue
+        if path not in texts:
+            texts[path] = None
+            try:
+                data = (Path(source_root) / path).read_bytes()
+                expected = str(item.get("source_sha256") or item.get("file_sha256") or "")
+                if not expected or hashlib.sha256(data).hexdigest() == expected:
+                    text = data.decode("utf-8", errors="replace")
+                    texts[path] = (text, text.splitlines(), _source_structure.parse_heading_tree(text))
+            except OSError:
+                texts[path] = None
+        source = texts[path]
+        if source is not None and _source_structure.classify_range(
+            source[0], start, end, lines=source[1], nodes=source[2]
+        ):
+            ancillary.append({**item, "ancillary": True})
+        else:
+            main.append(item)
+    return main + ancillary
 
 
 def _focus_selection(lines: list[str], focus_ranges, char_budget: int) -> dict:
@@ -6170,9 +6273,12 @@ def run_retrieval_pipeline(
     # 節ごとに先頭から根拠へ加える（guided-follow-up 4.1）。検索ヒットが付随範囲に
     # 偏っても主要本文を回答へ渡す。複数資料・具体的な質問では従来どおり。
     if fixed_document:
-        fixed_path = str(fixed_document["path"]).replace("\\", "/")
+        fixed_paths = {
+            str(m["path"]).replace("\\", "/")
+            for m in fixed_document.get("paths") or [{"path": fixed_document["path"]}]
+        }
         evidence_items = [
-            m for m in evidence_items if str(m.get("path") or "").replace("\\", "/") == fixed_path
+            m for m in evidence_items if str(m.get("path") or "").replace("\\", "/") in fixed_paths
         ]
     evidence_items, primary_warnings = _with_primary_ranges(
         query,
@@ -6184,6 +6290,9 @@ def run_retrieval_pipeline(
         item_limit=final_evidence_match_limit(),
     )
     warnings.extend(primary_warnings)
+    # 付随範囲（宛先・発出者・文書番号・前付け・空欄様式・単独の適用日や照会先）の根拠は、
+    # 件数枠・文字枠の後ろへ回す（捨てない安定ソート。guided-follow-up 7.4 R1）。
+    evidence_items = _demote_ancillary(query, evidence_items, source_root=SKILL_SOURCE_DIR)
     if answer_intent is not None:
         final_trace["answer_policy"] = {
             "version": _answer_policy.POLICY_V2,

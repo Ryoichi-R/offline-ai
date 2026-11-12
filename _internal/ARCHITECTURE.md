@@ -4,6 +4,8 @@
 
 設計正本は[確認質問と段階的な深掘りのプラン](../../plans/offline-ai-guided-follow-up-plan.md)。`guided_follow_up.py`はモデルを呼ばない決定的な部分（資料の照合結果からの振り分け、原文からの概要・選択肢の抽出、追質問の対象と論点の解決、確認情報の期限・件数・直列化）を持つ。資料の照合（表題の別表記と括弧内の正式表題・冒頭の文書番号で確定、発出者＋主題・主題語で候補のみ）と主要範囲の選定は`source_structure.py`、質問範囲の判定（overview/specific/broad）は`answer_policy.classify_guided_scope`（v2の`_ASPECT_CUES`とは別表）にある。Webは`run_search`がモデル検出前に確認段階を処理し、確認結果は`clarification`イベントと`done`（`stage: "clarify"`）で返す。続きは`POST /api/search`、パネル復元は`GET /api/confirmation`。固定した資料は`fixed_document`として通常回答（`run_retrieval_pipeline`）と深掘り（`run_deep_research`）へ渡し、根拠・候補をその資料と焦点範囲に限る。深掘り枠は`JobTable.acquire_deep_slot`で実調査の直前に取る。
 
+段階3（既定で有効）: 付随範囲の共通判定は`source_structure.classify_range`（宛先等の冒頭部・YAML前付け・空欄様式・単独の適用日や照会先）。deepは付随範囲をモデル呼び出しなしで主要範囲の後に回し、根拠枠の`DEEP_ANCILLARY_EVIDENCE_SHARE`までだけ入れる。通常回答は`search._demote_ancillary`で後ろへ回す。分割ファイルは`group_split_documents`で1資料にまとめ、固定資料は`paths`（部分のパスとハッシュ）と`[開始行, 終了行, パス]`の焦点範囲を持つ。抜粋の複数区間は`snippetSegments`。
+
 段階1（既定で有効）: 資料が1つに確定し特定の項目を尋ねない質問では、通常回答・深掘りとも確定した資料の主要節を節ごとに先頭から根拠へ加える（宛先・単独の適用日・照会先は後回し、読めない主要範囲は警告）。SSE・保存の抜粋は回答・抽出内容に対応する箇所を優先し、抜粋自体の行範囲と省略を記録する。
 
 
@@ -28,7 +30,7 @@
 - 抽出JSONは必須型を検証し、破損時は共通期限内で1回だけ再試行する。抽出・最終回答には別の原文支持照合を行う。モデル照合の正しさは実資料・保留群の人手評価で測る。モデルによる自己照合を精度の保証にしない。
 - `deep_transport.py`は要求専用の標準ライブラリ子プロセスを使用する。応答ヘッダー待ち、停止したstream、候補検索・候補選別を親の単調時計とキャンセルで監視し、workerにも親期限を渡して選別ループ内で期限切れをfail fastする。中止時はその子のみをkill/communicateして回収する。共有Ollama自体は停止しない。推論が実際に終了した時間は実機試験で別に測る。
 - deep入口はモデル設定を読み取るだけで、旧モデル設定の自動移行を行わない。既存互換cacheがあるときはkeywordとembeddingのランキングを再利用し、検索中のcache再構築は行わない。cacheは現在のsnapshotと一致するentryのみ使う。
-- CLIとWebは受付時の絶対期限を共通処理へ渡す。探索は統合照合120秒・終了5秒を予約し、モデル入力全体に32,768 context・4,096生成予約・1,024安全予約を適用する。保持根拠12,000字とtoken上限を別々に守る。
+- CLIとWebは受付時の絶対期限を共通処理へ渡す。探索は統合照合120秒・終了5秒を予約し、モデル入力全体に40,960トークンのコンテキスト、JSONは8,192トークン・テキストは4,096トークンの生成予約、1,024トークンの安全予約を適用する。保持根拠12,000字とtoken上限を別々に守る。
 - 資料hashを読み取り直前と最終確定前に再検証する。失敗・未確認・上限で落ちた範囲は台帳へ記録する。未検証の解釈はfallbackへ出さず、元の抜粋を表示する。診断dictには本文・質問・回答・自由文エラーを格納しない。
 - deepの候補検索は全snapshotを順位付けした後、`deep_candidate_selection.py`で資料別8件・全体40件を選別する。workerから親へはschema version 2の採用候補・除外参照・件数だけを返し、本文・snippet・ベクトルは転送しない。大量の除外参照はpathとsource SHA-256をそれぞれテーブル化し、参照indexで重複転送を避ける。除外参照はcompactなindex形式だけをworker契約として受け付け、親側で展開する。親は同じsnapshotのchunk IDから採用候補を復元する。空pathは旧親処理との互換性のため選別時に即時失敗させず、本文なしで親へ渡して`source_missing`として台帳化する。一方、chunk ID欠落・不正な行範囲など本文復元不能な候補はworker境界でfail closedする。選別前後の件数は保存するが、網羅率・正答率とは解釈しない。
 - retrieve応答のUTF-8シリアライズ後サイズは32,000,000 bytes以下を要求する。超過は固定コード`candidate_transfer_limit`として伝達し、初回検索で根拠が無ければ`failed`、既存根拠があれば`partial`とする。通常の候補選別による除外はエラーではなく調査台帳へ記録する。終了理由の優先順位では、cancel・期限・source変更の既存優先を維持したうえで、候補転送超過を通常のevidence/document/unit/round limitより優先し、通信失敗を別の上限理由へ隠さない。不明なschema version・項目・件数不整合は一般障害としてfail closedする。入力JSONの大きさと検索中メモリは別の残存制約であり、本契約はそれらを保証しない。

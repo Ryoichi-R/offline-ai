@@ -22,6 +22,7 @@ from pathlib import Path
 
 import answer_policy as ap
 from source_structure import (
+    document_numbers,
     documents_from_chunks,
     match_documents,
     normalize_match_text,
@@ -29,6 +30,7 @@ from source_structure import (
     primary_units,
     title_exclusions,
 )
+from source_view import EvidenceRegistry
 
 GUIDED_ENV = "OFFLINE_AI_GUIDED_FOLLOW_UP"
 
@@ -187,16 +189,60 @@ def _point_for_range(lines: list[str], start: int, end: int, heading: str) -> di
     return {"kind": "excerpt", "heading": heading, "startLine": first, "endLine": last, "text": text}
 
 
+def _table_lines(lines: list[str], start: int, end: int) -> list[int]:
+    return [n for n in range(start, min(end, len(lines)) + 1) if lines[n - 1].strip().startswith("|")]
+
+
+def _appendix_point(lines: list[str], unit: dict) -> dict | None:
+    """別紙・別表の子単位: 表の見出し行と先頭2行を原文のまま示す（R3）。"""
+    rows = _table_lines(lines, unit["start_line"], unit["end_line"])
+    if not rows:
+        return _point_for_range(lines, unit["start_line"] + 1, unit["end_line"], unit["heading"])
+    shown = rows[:4]  # 見出し行・区切り行・先頭2行
+    text = "\n".join(lines[n - 1] for n in shown)
+    point = {"kind": "excerpt", "heading": unit["heading"], "startLine": shown[0], "endLine": shown[-1], "text": text}
+    if len(rows) > len(shown):
+        point["truncated"] = True
+    return point
+
+
+def _appendix_label(lines: list[str], unit: dict) -> str:
+    rows = _table_lines(lines, unit["start_line"], unit["end_line"])
+    marker = unit["heading"].rsplit("／", 1)[-1]
+    if not rows:
+        return unit["heading"]
+    columns = [cell.strip() for cell in lines[rows[0] - 1].strip().strip("|").split("|") if cell.strip()]
+    return f"{marker}: " + " / ".join(columns[:3]) if columns else unit["heading"]
+
+
 def build_overview(text: str) -> dict:
-    """短い概要（2〜4点）と論点の選択肢を原文から作る。"""
+    """短い概要（2〜4点）と論点の選択肢を原文から作る。
+
+    節の中の別紙・別表は表の見出し行と先頭行を点にし、直後の注記に除外・限定があれば
+    同じ点に添える（原則と例外を切り離さない。R3）。
+    """
     lines = text.splitlines()
     units = [unit for unit in primary_units(text) if not unit["ancillary"]]
     points: list[dict] = []
-    for unit in units:
+    for index, unit in enumerate(units):
+        if unit.get("kind") == "note":
+            # 直前の別紙の点に添える。別紙が点に無ければ独立した点にする。
+            previous = units[index - 1] if index else None
+            if previous and previous.get("kind") == "appendix" and points and points[-1].get("_unit") == id(previous):
+                note = _point_for_range(lines, unit["start_line"], unit["end_line"], unit["heading"])
+                if note is not None:
+                    points[-1].setdefault("notes", []).append(
+                        {key: note[key] for key in ("startLine", "endLine", "text") if key in note}
+                    )
+                continue
         if len(points) >= OVERVIEW_MAX_POINTS:
             break
-        point = _point_for_range(lines, _body_start(unit, lines), unit["end_line"], unit["heading"])
+        if unit.get("kind") == "appendix":
+            point = _appendix_point(lines, unit)
+        else:
+            point = _point_for_range(lines, _body_start(unit, lines), unit["end_line"], unit["heading"])
         if point is not None:
+            point["_unit"] = id(unit)
             points.append(point)
     if len(points) < 2 and units:
         # 節が少ない資料では、同じ範囲の後続の段落から補う。
@@ -208,9 +254,16 @@ def build_overview(text: str) -> dict:
                 break
             points.append(point)
             cursor = point["endLine"] + 1
-    sections = [unit for unit in units if unit["heading"]]
+    for point in points:
+        point.pop("_unit", None)
+    sections = [unit for unit in units if unit["heading"] and unit.get("kind") != "note"]
     options = [
-        {"kind": "section", "label": unit["heading"], "startLine": unit["start_line"], "endLine": unit["end_line"]}
+        {
+            "kind": "section",
+            "label": _appendix_label(lines, unit) if unit.get("kind") == "appendix" else unit["heading"],
+            "startLine": unit["start_line"],
+            "endLine": unit["end_line"],
+        }
         for unit in sections[:TOPIC_OPTION_MAX]
     ]
     options.append({"kind": "overview", "label": "全体をまとめて"})
@@ -227,6 +280,8 @@ def _document_card(document: dict) -> dict:
         card["date"] = date.group(0)
     if kind:
         card["kind"] = kind.group(0)
+    if document.get("paths"):
+        card["parts"] = len(document["paths"])
     return card
 
 
@@ -256,30 +311,117 @@ def _documents_by_path(chunks: list[dict]) -> dict[str, dict]:
 
 
 def _fixed_document(source_root: Path, document: dict) -> dict | None:
-    read = read_document(source_root, document["path"], str(document.get("file_sha256") or ""))
-    if read is None:
-        return None
-    text, digest = read
+    """資料（分割資料は全部分）を検索時と同じハッシュで読み、固定用の情報を作る。"""
+    members = document.get("paths") or [{"path": document["path"], "file_sha256": document.get("file_sha256")}]
+    parts = []
+    for member in members:
+        read = read_document(source_root, member["path"], str(member.get("file_sha256") or ""))
+        if read is None:
+            return None
+        parts.append({"path": member["path"], "sha256": read[1], "text": read[0]})
     titles = list(document.get("titles") or [document["title"]])
     return {
-        "path": document["path"],
+        "path": parts[0]["path"],
         "title": document["title"],
         "titles": titles,
-        "sha256": digest,
+        "sha256": parts[0]["sha256"],
+        "paths": [{"path": part["path"], "sha256": part["sha256"]} for part in parts],
         "sourceRoot": str(Path(source_root).resolve()),
-        "text": text,
+        "text": parts[0]["text"],
+        "parts": parts,
     }
+
+
+def document_parts(document: dict) -> list[dict]:
+    """固定資料の部分（``path``・``text``）。分割していない資料は1部分。"""
+    return document.get("parts") or [{"path": document["path"], "text": document["text"]}]
+
+
+RELATED_DOCUMENT_MAX = 2
+
+
+def find_related(document: dict, chunks: list[dict]) -> list[dict]:
+    """固定資料の冒頭の文書番号を本文で引用している、同じフォルダ（親フォルダ）の資料（R6）。
+
+    接頭部のない番号（「第２号」だけ）は他の資料と取り違えやすいため使わない。
+    戻り値は選択肢用の ``{"title", "kind", "paths": [{"path", "sha256"}]}``（最大2件）。
+    """
+    numbers = {n for n in document_numbers(document.get("head_text") or "") if n[0]}
+    if not numbers:
+        return []
+    own = {m["path"] for m in document.get("paths") or [{"path": document["path"]}]}
+    folder = document["path"].rsplit("/", 1)[0] if "/" in document["path"] else ""
+    parent = folder.rsplit("/", 1)[0] if "/" in folder else ""
+    citing: list[str] = []
+    for chunk in chunks:
+        path = str(chunk.get("path") or "").replace("\\", "/")
+        if path in own or path in citing:
+            continue
+        chunk_folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        if chunk_folder not in {folder, parent} and not chunk_folder.startswith(folder + "/"):
+            continue
+        if numbers & document_numbers(str(chunk.get("text") or "")):
+            citing.append(path)
+    documents = {doc["path"]: doc for doc in documents_from_chunks(chunks)}
+    by_member = {m["path"]: doc for doc in documents.values() for m in doc.get("paths") or []}
+    related, seen = [], set()
+    for path in citing:
+        doc = documents.get(path) or by_member.get(path)
+        if doc is None or doc["path"] in seen:
+            continue
+        seen.add(doc["path"])
+        card = _document_card(doc)
+        related.append({
+            "title": card["title"],
+            "kind": card.get("kind", ""),
+            "paths": [
+                {"path": m["path"], "sha256": m.get("file_sha256") or ""}
+                for m in doc.get("paths") or [{"path": doc["path"], "file_sha256": doc.get("file_sha256")}]
+            ],
+        })
+        if len(related) >= RELATED_DOCUMENT_MAX:
+            break
+    return related
+
+
+def build_document_overview(document: dict, related: list[dict] | None = None) -> dict:
+    """資料（分割資料は部分ごと）の概要と選択肢。点・選択肢には部分のパスを付ける。
+
+    ``related`` は関連資料（番号を引用する事務連絡等）。本文との区別が分かるラベルで選択肢に加える。
+    """
+    parts = document_parts(document)
+    points, options, more = [], [], []
+    for index, part in enumerate(parts, start=1):
+        overview = build_overview(part["text"])
+        prefix = f"［{index}/{len(parts)}］" if len(parts) > 1 else ""
+        for point in overview["points"]:
+            points.append({**point, "path": part["path"], "heading": prefix + point.get("heading", "")})
+        for option in overview["options"]:
+            if option["kind"] == "section":
+                options.append({**option, "path": part["path"], "label": prefix + option["label"]})
+        more.extend(prefix + label for label in overview["moreSections"])
+    if len(parts) > 1:
+        more = [o["label"] for o in options[TOPIC_OPTION_MAX:]] + more
+        options = options[:TOPIC_OPTION_MAX]
+        points = points[:OVERVIEW_MAX_POINTS]
+    for item in (related or [])[:RELATED_DOCUMENT_MAX]:
+        kind = f"{item['kind']}・" if item.get("kind") else ""
+        options.append({"kind": "related", "label": f"関連資料（{kind}{item['title']}）", "paths": item["paths"],
+                        "title": item["title"]})
+    options.append({"kind": "overview", "label": "全体をまとめて"})
+    return {"points": points, "options": options, "moreSections": more}
 
 
 def _exclusions(document: dict) -> tuple[str, ...]:
     return title_exclusions(document.get("titles") or [document.get("title") or ""])
 
 
-def route_for_document(query: str, document: dict) -> Decision:
+def route_for_document(query: str, document: dict, related: list[dict] | None = None) -> Decision:
     """資料が確定した後、元の質問の範囲で回答・案内を決める。"""
     scope = ap.classify_guided_scope(query, exclude_texts=_exclusions(document))
     if scope.scope == ap.GUIDED_SCOPE_BROAD:
-        return Decision("topics", document=document, overview=build_overview(document["text"]), scope=scope.scope)
+        return Decision("topics", document=document, overview=build_document_overview(document, related),
+                        scope=scope.scope)
     return Decision("answer_fixed", document=document, scope=scope.scope)
 
 
@@ -295,9 +437,12 @@ def decide(query: str, chunks: list[dict], source_root: Path, *, initial: bool =
         if initial and scope.scope != ap.GUIDED_SCOPE_BROAD:
             # 具体的な質問・全体概要の明示は従来の回答経路で直接回答する。
             return Decision("direct", scope=scope.scope)
-        return route_for_document(query, fixed)
+        source = documents[matched["confirmed"]]
+        return route_for_document(query, fixed, find_related({**fixed, "head_text": source.get("head_text")}, chunks))
     candidates = matched["candidates"]
-    scope = ap.classify_guided_scope(query)
+    # 資料が確定しなくても、候補の表題に含まれる語（「範囲」等）は尋ねている項目に数えない。
+    exclusions = tuple(dict.fromkeys(t for item in candidates[:DOCUMENT_CANDIDATE_MAX] for t in item["exclude"]))
+    scope = ap.classify_guided_scope(query, exclude_texts=exclusions)
     if initial and scope.scope != ap.GUIDED_SCOPE_BROAD:
         # 資料が確定しない具体的な質問は、従来の資料横断の回答経路で直接回答する
         # （不要な確認を増やさない）。
@@ -346,10 +491,11 @@ class FollowUpPlan:
 
     query: str
     topic: Topic
-    focus_ranges: list[tuple[int, int]] = field(default_factory=list)
+    focus_ranges: list[tuple[int, int, str]] = field(default_factory=list)  # (開始行, 終了行, パス)
     aspects: tuple[str, ...] = ()
     overview: bool = False
     ask: dict | None = None
+    related: dict | None = None  # 関連資料の選択（固定資料に加えて検索・根拠の対象にする）
 
 
 def _terms(text: str, exclude: tuple[str, ...]) -> list[str]:
@@ -391,16 +537,25 @@ def _leaf_ranges(text: str) -> list[tuple[int, int, str]]:
     return ranges
 
 
-def _ranges_containing(text: str, words: tuple[str, ...], within: tuple[int, int] | None) -> list[tuple[int, int, str]]:
-    lines = text.splitlines()
+def _ranges_containing(parts: list[dict], words: tuple[str, ...], within: dict | None) -> list[tuple[int, int, str, str]]:
+    """語をすべて含む節（葉）の ``(開始行, 終了行, 見出し, パス)``。``within`` は選んだ節。"""
     result = []
-    for start, end, heading in _leaf_ranges(text):
-        if within and not (within[0] <= start and end <= within[1]):
+    for part in parts:
+        if within and within.get("path", part["path"]) != part["path"]:
             continue
-        body = unicodedata.normalize("NFKC", "\n".join(lines[start - 1 : end]))
-        if all(word in body for word in words):
-            result.append((start, end, heading))
+        lines = part["text"].splitlines()
+        for start, end, heading in _leaf_ranges(part["text"]):
+            if within and not (within["startLine"] <= start and end <= within["endLine"]):
+                continue
+            body = unicodedata.normalize("NFKC", "\n".join(lines[start - 1 : end]))
+            if all(word in body for word in words):
+                result.append((start, end, heading, part["path"]))
     return result
+
+
+def _range_text(parts: list[dict], start: int, end: int, path: str) -> str:
+    part = next((item for item in parts if item["path"] == path), parts[0])
+    return "\n".join(part["text"].splitlines()[start - 1 : end])
 
 
 def resolve_follow_up(
@@ -423,7 +578,7 @@ def resolve_follow_up(
     - 対象が資料内の複数の箇所に残る場合は、同じ資料内の候補を示して聞き返す。
     """
     title = document["title"]
-    doc_text = document["text"]
+    parts = document_parts(document)
     current = Topic(topic.section, tuple(t for t in topic.targets if t not in drop_targets), topic.aspects)
     if action == ACTION_FOLLOW_UP:
         number = _NUMBER_ONLY_RE.match(text or "")
@@ -435,18 +590,26 @@ def resolve_follow_up(
         option = options[choice]
         if option["kind"] == "overview":
             return FollowUpPlan(f"「{title}」の全体をまとめて説明してください。", current, overview=True)
-        section = {"label": option["label"], "startLine": option["startLine"], "endLine": option["endLine"]}
+        if option["kind"] == "related":
+            return FollowUpPlan(
+                f"「{title}」に関連する「{option['title']}」について、資料ごとに説明してください。",
+                current,
+                overview=True,
+                related={"title": option["title"], "paths": list(option["paths"])},
+            )
+        path = option.get("path") or parts[0]["path"]
+        section = {"label": option["label"], "startLine": option["startLine"], "endLine": option["endLine"], "path": path}
         return FollowUpPlan(
             f"「{title}」の「{option['label']}」について説明してください。",
             Topic(section, (), ()),
-            focus_ranges=[(option["startLine"], option["endLine"])],
+            focus_ranges=[(option["startLine"], option["endLine"], path)],
         )
     if action != ACTION_FOLLOW_UP:
         raise ConfirmationError("confirmation_invalid", "現在の状態に合わない操作です")
 
     labels, cues = _aspect_cues(text)
     cue_set = set(cues)
-    body = unicodedata.normalize("NFKC", doc_text)
+    body = unicodedata.normalize("NFKC", "\n".join(part["text"] for part in parts))
     candidates = [
         term
         for term in _terms(text, _exclusions(document))
@@ -475,15 +638,31 @@ def resolve_follow_up(
                 "options": [],
             },
         )
-    within = (current.section["startLine"], current.section["endLine"]) if current.section else None
-    focus: list[tuple[int, int, str]] = []
+    within = current.section
+    focus: list[tuple[int, int, str, str]] = []
+    cue_groups = [words for label, words in ap.GUIDED_ITEM_CUES if any(w in cues for w in words)]
+
+    def best_by_cues(ranges):
+        """尋ねた項目の種類を最も多く含む範囲だけを残す（同数なら全部）。"""
+        if not cue_groups or not ranges:
+            return ranges, 0
+        scored = [
+            (sum(any(w in _range_text(parts, r[0], r[1], r[3]) for w in group) for group in cue_groups), r)
+            for r in ranges
+        ]
+        top = max(score for score, _ in scored)
+        return [r for score, r in scored if score == top and score > 0], top
+
     if targets:
-        focus = _ranges_containing(doc_text, targets, within)
-        if cues:
-            narrowed = [r for r in focus if any(c in "\n".join(doc_text.splitlines()[r[0] - 1 : r[1]]) for c in cues)]
-            focus = narrowed or focus
-        if not focus and within:
-            focus = _ranges_containing(doc_text, targets, None)
+        focus, local_score = best_by_cues(_ranges_containing(parts, targets, within))
+        if within and cue_groups and local_score < len(cue_groups):
+            # 選んだ節に尋ねた項目（例外・期限等）が揃わない場合は、同じ資料の他の箇所も探す
+            # （「別紙の様式のうち除かれるもの」は別紙の注記にある等）。
+            others, other_score = best_by_cues(_ranges_containing(parts, targets, None))
+            if other_score > local_score:
+                focus = others
+        if not focus:
+            focus = _ranges_containing(parts, targets, within) or _ranges_containing(parts, targets, None)
         if len(focus) > 1:
             return FollowUpPlan(
                 text,
@@ -492,13 +671,14 @@ def resolve_follow_up(
                 ask={
                     "message": "「" + "」「".join(targets) + "」は資料内の複数の箇所にあります。どの箇所について知りたいですか。",
                     "options": [
-                        {"kind": "section", "label": heading or f"行 {start}-{end}", "startLine": start, "endLine": end}
-                        for start, end, heading in focus[:TOPIC_OPTION_MAX]
+                        {"kind": "section", "label": heading or f"行 {start}-{end}", "startLine": start, "endLine": end,
+                         "path": path}
+                        for start, end, heading, path in focus[:TOPIC_OPTION_MAX]
                     ],
                 },
             )
     elif within:
-        focus = [(within[0], within[1], current.section["label"])]
+        focus = [(within["startLine"], within["endLine"], within["label"], within.get("path") or parts[0]["path"])]
     context = []
     if current.section:
         context.append(f"「{current.section['label']}」")
@@ -508,7 +688,7 @@ def resolve_follow_up(
     return FollowUpPlan(
         f"{prefix}について: {text}",
         new_topic,
-        focus_ranges=[(start, end) for start, end, _ in focus],
+        focus_ranges=[(start, end, path) for start, end, _, path in focus],
         aspects=labels,
     )
 
@@ -537,7 +717,7 @@ class ConfirmationRecord:
     more_sections: list[str] = field(default_factory=list)
     busy_request: str = ""
 
-    def public(self) -> dict:
+    def public(self, evidence_registry: EvidenceRegistry | None = None) -> dict:
         """画面へ返す確認情報（候補・選択肢・固定中の資料と論点）。"""
         data = {
             "confirmationId": self.confirmation_id,
@@ -553,11 +733,39 @@ class ConfirmationRecord:
             data["document"] = {
                 key: self.document[key] for key in ("path", "title") if self.document and key in self.document
             }
-            data["points"] = [dict(point) for point in self.points]
+            if self.document and len(self.document.get("paths") or []) > 1:
+                data["document"]["parts"] = len(self.document["paths"])
+            data["points"] = self._public_points(evidence_registry)
             data["options"] = [dict(option) for option in self.options]
             data["moreSections"] = list(self.more_sections)
             data["topic"] = self.topic.to_dict()
         return data
+
+    def _public_points(self, evidence_registry: EvidenceRegistry | None) -> list[dict]:
+        points = [dict(point) for point in self.points]
+        if evidence_registry is None or self.document is None:
+            return points
+        hashes = {
+            member["path"]: member["sha256"]
+            for member in self.document.get("paths") or [
+                {"path": self.document["path"], "sha256": self.document.get("sha256")}
+            ]
+        }
+        for point in points:
+            if "notes" in point:
+                point["notes"] = [dict(note) for note in point["notes"]]
+            path = point.get("path")
+            for span in [point, *point.get("notes", [])]:
+                evidence_id = evidence_registry.register(
+                    session_id=self.session_id,
+                    relative_path=path,
+                    start_line=span.get("startLine"),
+                    end_line=span.get("endLine"),
+                    source_sha256=hashes.get(path),
+                )
+                if evidence_id:
+                    span["evidenceId"] = evidence_id
+        return points
 
 
 class ConfirmationStore:
@@ -570,11 +778,13 @@ class ConfirmationStore:
         max_age_seconds: float = CONFIRMATION_MAX_AGE_SECONDS,
         limit: int = CONFIRMATION_LIMIT,
         clock=time.monotonic,
+        evidence_registry: EvidenceRegistry | None = None,
     ):
         self.idle_seconds = idle_seconds
         self.max_age_seconds = max_age_seconds
         self.limit = max(1, int(limit))
         self._clock = clock
+        self._evidence_registry = evidence_registry
         self._records: dict[str, ConfirmationRecord] = {}
         self._lock = threading.Lock()
 
@@ -627,7 +837,7 @@ class ConfirmationStore:
     def view(self, confirmation_id: object, session_id: str) -> dict:
         """パネル復元用の読み取り。期限を延長しない。"""
         with self._lock:
-            return self._get_locked(confirmation_id, session_id).public()
+            return self._get_locked(confirmation_id, session_id).public(self._evidence_registry)
 
     def begin(
         self, confirmation_id: object, session_id: str, *, action: str, options_version: object, request_id: str
@@ -649,7 +859,7 @@ class ConfirmationStore:
 
     def finish(self, confirmation_id: str, request_id: str, *, decision: Decision | None = None,
                topic: Topic | None = None, options: list[dict] | None = None,
-               completed: bool) -> dict | None:
+               add_paths: list[dict] | None = None, completed: bool) -> dict | None:
         """操作の終了。正常完了だけ期限と論点を更新する。失効・破棄済みなら復活させない。"""
         with self._lock:
             record = self._records.get(confirmation_id)
@@ -666,13 +876,20 @@ class ConfirmationStore:
                 _apply_decision(record, decision)
             if topic is not None:
                 record.topic = Topic(topic.section, tuple(topic.targets), tuple(topic.aspects))
+            if add_paths and record.document is not None:
+                # 関連資料を以後の検索・根拠の対象に加える（固定の解除で消える）。
+                current = list(record.document.get("paths") or [
+                    {"path": record.document["path"], "sha256": record.document.get("sha256")}
+                ])
+                known = {m["path"] for m in current}
+                record.document["paths"] = current + [dict(m) for m in add_paths if m["path"] not in known]
             if options is not None:
                 # 聞き返しの候補を新しい選択肢一覧にする（番号入力・古い番号の照合に使う）。
                 record.options = [dict(option) for option in options]
                 record.options_version += 1
             record.updated_at = now
             record.last_completed_at = now
-            return record.public()
+            return record.public(self._evidence_registry)
 
     def discard(self, confirmation_id: str) -> None:
         with self._lock:
@@ -716,7 +933,7 @@ def _apply_decision(record: ConfirmationRecord, decision: Decision) -> None:
         record.state = STATE_DOCUMENT_FIXED
         record.document = {
             key: decision.document.get(key)
-            for key in ("path", "title", "titles", "sha256", "sourceRoot", "indexMarker")
+            for key in ("path", "title", "titles", "sha256", "paths", "sourceRoot", "indexMarker")
         }
         record.candidates = []
         if changed:

@@ -145,6 +145,40 @@ def run(tmp_path, monkeypatch, *, text=SOURCE_TEXT, policy="v2", timeout=300, qu
 # --- 方針の固定 ---------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("retry_succeeds", [True, False])
+def test_high_reasoning_draft_output_limit_uses_one_source_only_retry(tmp_path, monkeypatch, retry_succeeds):
+    backend = Backend(monkeypatch)
+    prompts = []
+
+    def model(name, system, user, **kwargs):
+        if system in {apipe.DRAFT_SYSTEM, apipe.DRAFT_RETRY_SYSTEM}:
+            prompts.append((system, user, kwargs))
+            if system == apipe.DRAFT_SYSTEM or not retry_succeeds:
+                raise deep.DeepWorkerError(code=deep.MODEL_OUTPUT_INCOMPLETE_CODE)
+            return complete_draft_for(user)
+        assert "num_predict" not in kwargs
+        if system == apipe.CLAIM_VERIFY_SYSTEM and kwargs["timeout"] <= ap.CHECK_CALL_CAP_SECONDS["deep"]:
+            raise TimeoutError("first meaning check requires more than the usual 60 seconds")
+        return backend.model(name, system, user, **kwargs)
+
+    monkeypatch.setattr(deep, "_call_ollama_json", model)
+    (tmp_path / "sample.md").write_text(SOURCE_TEXT, encoding="utf-8")
+    result = deep.run_deep_research(
+        QUERY, model="gpt-oss:120b", reasoning="high", source_root=tmp_path,
+        timeout_seconds=1800, answer_policy="v2",
+    )
+
+    assert [system for system, _, _ in prompts] == [apipe.DRAFT_SYSTEM, apipe.DRAFT_RETRY_SYSTEM]
+    first, retry = prompts
+    assert "抽出メモ" in first[1] and "抽出メモ" not in retry[1]
+    assert "原文:" in retry[1] and "引用・一覧の選択表" in retry[1]
+    assert "num_predict" not in first[2]
+    assert retry[2]["num_predict"] == deep.DEEP_FINAL_RETRY_NUM_PREDICT
+    assert retry[2]["reasoning"] == "high"
+    assert (backend.g2_calls > 0) is retry_succeeds
+    assert (result.answer_state == deep.ANSWER_STATE_GENERATED) is retry_succeeds
+
+
 def test_default_is_legacy_and_the_request_fixes_its_policy(tmp_path, monkeypatch):
     monkeypatch.delenv(ap.POLICY_ENV, raising=False)
     result, backend = run(tmp_path, monkeypatch, policy=None)

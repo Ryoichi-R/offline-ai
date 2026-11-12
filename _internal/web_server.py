@@ -353,7 +353,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self.index_coordinator = IndexCoordinator()
         self.evidence_registry = evidence_registry or create_evidence_registry()
         # 確認案内（既定は無効）の確認情報。サーバーのメモリ内だけに置く。
-        self.confirmation_store = ConfirmationStore()
+        self.confirmation_store = ConfirmationStore(evidence_registry=self.evidence_registry)
         # web.bat（非表示起動）だけが設定する。None ならページを閉じても停止しない。
         self.page_presence = page_presence
         self.chat_model = chat_model
@@ -424,7 +424,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
 class OfflineAIHandler(BaseHTTPRequestHandler):
     """offline-ai Web UI HTTP ハンドラ。"""
 
-    server_version = "OfflineAI/0.2.0"
+    server_version = "OfflineAI/0.2.6"
 
     def log_message(self, format, *args):
         """デフォルトのログ出力を抑制（構造化ログに統一）。"""

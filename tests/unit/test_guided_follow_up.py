@@ -138,7 +138,7 @@ def test_targets_carry_over_to_aspect_only_follow_up():
     assert third.ask is None
     assert third.topic.targets == ("請求書",)
     # 請求書の期限がある「提出書類」の節に絞る（領収書の保存期限の節ではない）。
-    assert third.focus_ranges == [(7, 10)]
+    assert third.focus_ranges == [(7, 10, "notice.md")]
     assert "請求書" in third.query and "期限は？" in third.query
 
 
@@ -162,7 +162,7 @@ def test_selecting_a_section_clears_targets_and_numbers_map_to_options():
     topic = gf.Topic(None, ("請求書",))
     chosen = gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_SELECT_TOPIC, choice=2)
     assert chosen.topic.section["label"] == "3 領収書の保存" and chosen.topic.targets == ()
-    assert chosen.focus_ranges == [(11, 12)]
+    assert chosen.focus_ranges == [(11, 12, "notice.md")]
     by_number = gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_FOLLOW_UP, text="3")
     assert by_number.topic.section == chosen.topic.section
     overview = gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_SELECT_TOPIC, choice=len(options) - 1)

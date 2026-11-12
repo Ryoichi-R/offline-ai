@@ -2,10 +2,34 @@
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 import deep_transport as transport
+
+
+def test_worker_keeps_the_output_limit_reason_without_partial_answer():
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"message":{"content":"unfinished"},"done":true,"done_reason":"length"}\n')
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with pytest.raises(transport.DeepWorkerError) as caught:
+                transport.run_worker({
+                    "operation": "chat", "host": f"http://127.0.0.1:{server.server_port}",
+                    "body": {}, "timeout": 3,
+                }, timeout=3)
+            assert caught.value.code == transport.MODEL_OUTPUT_INCOMPLETE_CODE
+            assert "unfinished" not in str(caught.value)
+        finally:
+            server.shutdown()
+            thread.join(timeout=3)
 
 
 def test_slow_reader_receives_payload_larger_than_pipe_buffer(monkeypatch):

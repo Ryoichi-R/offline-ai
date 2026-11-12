@@ -127,6 +127,33 @@ def test_specific_question_goes_straight_to_the_existing_path(guided_server):
     assert calls == [{"query": query, "fixed": None, "mode": "answer"}]
 
 
+def test_guided_overview_links_to_the_original_lines_and_restores_access(guided_server):
+    server, _, root = guided_server
+    initial = _start(server)
+    status, _, payload = _request(server, "GET", f"/api/confirmation?id={initial['confirmationId']}")
+    assert status == 200
+    restored = json.loads(payload)["confirmation"]
+    for panel in (initial, restored):
+        point = panel["points"][0]
+        status, _, body = _request(server, "GET", f"/api/evidence/view?evidence_id={point['evidenceId']}")
+        assert status == 200
+        evidence = json.loads(body)
+        assert (evidence["highlightStartLine"], evidence["highlightEndLine"]) == (
+            point["startLine"], point["endLine"]
+        )
+        assert any(line["highlighted"] and line["text"] == NOTICE_LINES[5] for line in evidence["lines"])
+        status, _, _ = _request(
+            server, "GET", f"/api/evidence/view?evidence_id={point['evidenceId']}", session="other"
+        )
+        assert status == 403
+
+    (root / "notice.md").write_text(NOTICE + "追記\n", encoding="utf-8")
+    status, _, body = _request(
+        server, "GET", f"/api/evidence/view?evidence_id={restored['points'][0]['evidenceId']}"
+    )
+    assert status == 409 and json.loads(body)["error"]["code"] == "source_changed"
+
+
 def test_topic_free_input_and_short_follow_up_keep_the_same_document(guided_server):
     server, calls, _ = guided_server
     clarification = _start(server)
@@ -137,17 +164,19 @@ def test_topic_free_input_and_short_follow_up_keep_the_same_document(guided_serv
     assert status == 200
     assert _types(events) == ["result_meta", "chunk", "confirmation_state", "done"], events
     assert calls[-1]["fixed"]["path"] == "notice.md"
-    assert calls[-1]["fixed"]["focus_ranges"] == [[7, 10]]
+    assert calls[-1]["fixed"]["focus_ranges"] == [[7, 10, "notice.md"]]
+    assert calls[-1]["fixed"]["focus_only"] is True
     state = next(e for e in events if e["type"] == "confirmation_state")
     assert state["topic"]["section"]["label"] == "2 提出書類"
 
     status, events, _ = _continue(server, clarification, "g4", action="follow_up", text="請求書だけ")
+    assert "focus_only" not in calls[-1]["fixed"]
     state = next(e for e in events if e["type"] == "confirmation_state")
     assert state["topic"]["targets"] == ["請求書"]
     status, events, _ = _continue(server, clarification, "g5", action="follow_up", text="期限は？")
     state = next(e for e in events if e["type"] == "confirmation_state")
     assert state["topic"]["targets"] == ["請求書"]
-    assert calls[-1]["fixed"]["focus_ranges"] == [[7, 10]]
+    assert calls[-1]["fixed"]["focus_ranges"] == [[7, 10, "notice.md"]]
     assert all(call["fixed"]["path"] == "notice.md" for call in calls)
 
     # 同じ入力で再購読しても処理を重複実行しない。

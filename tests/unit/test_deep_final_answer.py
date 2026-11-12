@@ -144,6 +144,46 @@ def test_no_rewrite_when_too_little_time_remains(tmp_path, monkeypatch):
     assert result.diagnostics["final_answer"]["result"] == "rejected_citations"
 
 
+def test_large_high_reasoning_retries_truncated_final_within_existing_two_attempts(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    (tmp_path / "source.md").write_text("対象である。", encoding="utf-8")
+    calls = []
+
+    def text(model, system, prompt, **kwargs):
+        calls.append((system, prompt, kwargs))
+        if len(calls) == 1:
+            raise deep.DeepWorkerError(code=deep.MODEL_OUTPUT_INCOMPLETE_CODE)
+        return "対象である。[E1]\n出典のない補足。"
+
+    monkeypatch.setattr(deep, "_call_ollama_text", text)
+    result = deep.run_deep_research(
+        "対象", model="gpt-oss:120b", reasoning="high", source_root=tmp_path, timeout_seconds=1800,
+    )
+    assert result.diagnostics["timeout_seconds"] == 1800
+    assert result.diagnostics["reserved_seconds"]["integration"] > deep.DEEP_INTEGRATION_RESERVE_SECONDS
+    assert result.diagnostics["final_answer"]["generation_failure"] == deep.MODEL_OUTPUT_INCOMPLETE_CODE
+    assert result.diagnostics["final_answer"]["result"] == "accepted"
+    assert result.diagnostics["final_answer"]["uncited_lines_removed"] == 1
+    assert result.answer == "対象である。[E1]"
+    assert len(calls) == 2 and calls[1][2]["num_predict"] == deep.DEEP_FINAL_RETRY_NUM_PREDICT
+    assert all(options["reasoning"] == "high" for _, _, options in calls)
+    system, prompt, _ = calls[1]
+    assert system == deep.DEEP_FINAL_RETRY_SYSTEM
+    assert "日本語" in system and "質問の主題への結論" in system
+    assert "句点の直後" in system and "[E2] の形式" in system
+    assert "[E1]" in prompt and "対象である。" in prompt
+    assert "調査終了理由" not in prompt and "適用範囲:" not in prompt
+
+
+@pytest.mark.parametrize("answer", ["根拠がありません。", "対象である。[E99]\n根拠がありません。"])
+def test_retry_cannot_create_a_citation_or_hide_an_unknown_id(answer):
+    evidence = [{"evidence_id": "E1", "excerpt": "対象である。"}]
+    record = {"attempts": []}
+    prepared, issues = deep._check_final_candidate(answer, evidence, record)
+    assert deep._drop_uncited_retry_lines(prepared, issues, evidence, record) == (prepared, issues)
+    assert "uncited_lines_removed" not in record
+
+
 def test_rewrite_timeout_keeps_the_citation_failure_instead_of_not_generated(tmp_path, monkeypatch):
     backend(monkeypatch)
     calls = []
@@ -456,6 +496,18 @@ def _line_verdicts(monkeypatch, unsupported_lines, *, background=(), verdict=Non
 
     monkeypatch.setattr(deep, "_call_ollama_json", model)
     return seen
+
+
+def test_form_table_does_not_support_a_schedule_even_if_the_model_would_accept_it(tmp_path, monkeypatch):
+    backend(monkeypatch)
+    _text_calls(monkeypatch, "窓口に提出する。[E1]\n実施時期は別紙の様式ごとに定められている。[E1]")
+    checked = _line_verdicts(monkeypatch, ())
+    result = research(tmp_path, "窓口に提出する。\n| 様式 | 内容 |\n| --- | --- |\n| A | 申込書 |")
+
+    assert result.answer_state == deep.ANSWER_STATE_GENERATED
+    assert result.answer == "窓口に提出する。[E1]"
+    assert result.diagnostics["final_answer"]["line_checks"]["dropped"] == 1
+    assert all("実施時期" not in line for line in checked)
 
 
 def test_unsupported_line_is_replaced_by_the_source_line_it_restates(tmp_path, monkeypatch):

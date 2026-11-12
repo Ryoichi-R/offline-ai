@@ -73,6 +73,73 @@ def _bigrams(text: str) -> set[str]:
     return {normalized[i : i + 2] for i in range(len(normalized) - 1)}
 
 
+EXCERPT_MAX_SEGMENTS = 3
+EXCERPT_SEGMENT_SEPARATOR = "\n…\n"
+EXCERPT_SEED_MIN_COVERAGE = 0.2
+
+
+def _focus_segments(lines: list[str], focus, limit: int) -> list[tuple[int, int]]:
+    """回答の各主張に最も対応する行を種にして、枠内で最大3区間を選ぶ（R4）。
+
+    主張ごとに、主張の2文字単位を最も多く含む行を種にする（同率なら先頭側）。
+    種が2つ未満なら空を返し、呼び出し側は従来の連続1区間を使う。区間は枠の残りで
+    前後の行へ広げ、隣接・重複した区間はまとめる。原文の文言は変えない。
+    """
+    line_grams = [_bigrams(line) for line in lines]
+    seeds: list[int] = []
+    for value in focus:
+        grams = _bigrams(value)
+        if not grams:
+            continue
+        best = max(range(len(lines)), key=lambda i: (len(line_grams[i] & grams), -i))
+        if len(line_grams[best] & grams) / len(grams) >= EXCERPT_SEED_MIN_COVERAGE and best not in seeds:
+            seeds.append(best)
+    if len(seeds) < 2:
+        return []
+    separator = len(EXCERPT_SEGMENT_SEPARATOR)
+    segments: list[list[int]] = []
+    used = 0
+    for seed in seeds:
+        if len(segments) >= EXCERPT_MAX_SEGMENTS:
+            break
+        if any(a - 1 <= seed <= b + 1 for a, b in segments):
+            continue
+        cost = len(lines[seed]) + (separator if segments else 0)
+        if used + cost > limit:
+            continue
+        segments.append([seed, seed])
+        used += cost
+    if len(segments) < 2:
+        return []
+
+    def taken(index: int) -> bool:
+        return any(a <= index <= b for a, b in segments)
+
+    grew = True
+    while grew:
+        grew = False
+        for segment in sorted(segments):
+            for index, edge in ((segment[1] + 1, 1), (segment[0] - 1, 0)):
+                if 0 <= index < len(lines) and not taken(index) and used + len(lines[index]) + 1 <= limit:
+                    segment[edge] = index
+                    used += len(lines[index]) + 1
+                    grew = True
+    merged: list[list[int]] = []
+    for first, end in sorted(segments):
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([first, end])
+    result = []
+    for first, end in merged:
+        while first < end and not lines[first].strip():
+            first += 1
+        while end > first and not lines[end].strip():
+            end -= 1
+        result.append((first, end))
+    return result
+
+
 def select_excerpt(
     text: str,
     start_line: int | None,
@@ -102,6 +169,28 @@ def select_excerpt(
             "endLine": start_line + len(lines) - 1 if aligned and lines else None,
             "truncated": False,
         }
+    segments = _focus_segments(lines, focus, limit)
+    if segments:
+        texts = []
+        for first, end in segments:
+            texts.append("\n".join(lines[first : end + 1]) if first != end or len(lines[first]) <= limit
+                         else lines[first][:limit])
+        result = {
+            "snippet": EXCERPT_SEGMENT_SEPARATOR.join(texts),
+            "startLine": start_line + segments[0][0] if aligned else None,
+            "endLine": start_line + segments[-1][1] if aligned else None,
+            "truncated": True,
+        }
+        if len(segments) > 1:
+            result["segments"] = [
+                {
+                    "startLine": start_line + first if aligned else None,
+                    "endLine": start_line + end if aligned else None,
+                    "text": text,
+                }
+                for (first, end), text in zip(segments, texts)
+            ]
+        return result
     focus_grams: set[str] = set()
     for value in focus:
         focus_grams |= _bigrams(value)
@@ -167,6 +256,9 @@ def _apply_excerpt(item: dict, selected: dict) -> None:
         item["snippetStartLine"] = selected["startLine"]
         item["snippetEndLine"] = selected["endLine"]
     item["snippetTruncated"] = bool(selected["truncated"])
+    if selected.get("segments"):
+        # 区間ごとの行範囲。snippet は区間を「…」でつないだ文字列（互換）。
+        item["snippetSegments"] = [dict(segment) for segment in selected["segments"]]
 
 
 def create_evidence_registry(source_root: Path | None = None) -> EvidenceRegistry:
@@ -1532,16 +1624,34 @@ def _guided_source_ok(document: dict) -> bool:
         return False
     if document.get("indexMarker") != _index_marker():
         return False
-    return read_document(active, document["path"], document.get("sha256", "")) is not None
+    return all(read_document(active, part["path"], part["sha256"]) is not None for part in _document_paths(document))
+
+
+def _document_paths(document: dict) -> list[dict]:
+    """固定資料の部分のパスとハッシュ（分割していない資料は1件）。"""
+    return list(document.get("paths") or [{"path": document["path"], "sha256": document.get("sha256", "")}])
 
 
 def _with_document_text(document: dict) -> dict | None:
+    """固定資料の全部分を、確定時と同じハッシュで読み直す。"""
     from guided_follow_up import read_document
 
-    read = read_document(Path(SKILL_SOURCE_DIR), document["path"], document.get("sha256", ""))
-    if read is None:
-        return None
-    return {**document, "text": read[0]}
+    parts = []
+    for member in _document_paths(document):
+        read = read_document(Path(SKILL_SOURCE_DIR), member["path"], member["sha256"])
+        if read is None:
+            return None
+        parts.append({"path": member["path"], "sha256": read[1], "text": read[0]})
+    return {**document, "text": parts[0]["text"], "parts": parts}
+
+
+def _fixed_for_answer(document: dict, **extra) -> dict:
+    """回答処理（通常回答・深掘り）へ渡す固定資料。本文は渡さない。"""
+    return {
+        "path": document["path"], "title": document["title"], "sha256": document["sha256"],
+        "paths": [{"path": m["path"], "sha256": m["sha256"]} for m in _document_paths(document)],
+        **extra,
+    }
 
 
 def _emit_clarification(event_queue, request_id: str, public: dict, kind: str, ask: dict | None = None) -> None:
@@ -1632,7 +1742,7 @@ def _guided_step(query, event_queue, request_id, *, session_id, store, guided_re
         if decision.document is not None:
             decision.document["indexMarker"] = _index_marker()
         record = store.create(session_id, query, decision)
-        _emit_clarification(event_queue, request_id, record.public(), decision.kind)
+        _emit_clarification(event_queue, request_id, store.view(record.confirmation_id, session_id), decision.kind)
         return None
 
     cid = guided_request["confirmationId"]
@@ -1665,7 +1775,9 @@ def _guided_step(query, event_queue, request_id, *, session_id, store, guided_re
             fixed = gf._fixed_document(Path(SKILL_SOURCE_DIR), current)
             if fixed is None:
                 return fail("source_changed", "候補の資料を読み出せません。もう一度質問してください。", discard=True)
-            decision = gf.route_for_document(snapshot.initial_query, fixed)
+            decision = gf.route_for_document(
+                snapshot.initial_query, fixed, gf.find_related({**fixed, "head_text": current.get("head_text")}, chunks)
+            )
         else:
             combined = f"{snapshot.initial_query} {guided_request['text']}"
             decision = gf.decide(combined, chunks, Path(SKILL_SOURCE_DIR), initial=False)
@@ -1684,10 +1796,7 @@ def _guided_step(query, event_queue, request_id, *, session_id, store, guided_re
             return None
         # 具体的な質問・全体概要の指定は固定資料で回答する。
         document = decision.document
-        fixed_document = {
-            "path": document["path"], "title": document["title"], "sha256": document["sha256"],
-            "primary": decision.scope == GUIDED_SCOPE_OVERVIEW,
-        }
+        fixed_document = _fixed_for_answer(document, primary=decision.scope == GUIDED_SCOPE_OVERVIEW)
         return (
             snapshot.initial_query,
             fixed_document,
@@ -1715,9 +1824,22 @@ def _guided_step(query, event_queue, request_id, *, session_id, store, guided_re
             return None
         _emit_clarification(event_queue, request_id, public, "ask", ask=plan.ask)
         return None
-    fixed_document = {
-        "path": document["path"], "title": document["title"], "sha256": document["sha256"],
-        "focus_ranges": [list(r) for r in plan.focus_ranges],
-        "primary": plan.overview,
-    }
+    if plan.related is not None:
+        # 関連資料は選んだ時点のハッシュで読めることを確かめ、固定資料と合わせて対象にする。
+        from guided_follow_up import read_document
+
+        if any(read_document(Path(SKILL_SOURCE_DIR), m["path"], m["sha256"]) is None for m in plan.related["paths"]):
+            return fail("source_changed", "関連資料が変更されました。もう一度質問してください。")
+        combined = {**document, "paths": _document_paths(document) + [
+            m for m in plan.related["paths"] if m["path"] not in {d["path"] for d in _document_paths(document)}
+        ]}
+        fixed_document = _fixed_for_answer(combined, primary=True)
+        return plan.query, fixed_document, lambda ok: finish(
+            topic=plan.topic, add_paths=plan.related["paths"], completed=ok,
+        )
+    fixed_document = _fixed_for_answer(
+        document, focus_ranges=[list(r) for r in plan.focus_ranges], primary=plan.overview,
+    )
+    if action == gf.ACTION_SELECT_TOPIC and plan.focus_ranges:
+        fixed_document["focus_only"] = True
     return plan.query, fixed_document, lambda ok: finish(topic=plan.topic, completed=ok)

@@ -33,7 +33,7 @@ import coverage_evaluator  # noqa: E402
 import eval_harness  # noqa: E402
 import macos_runtime  # noqa: E402
 import search  # noqa: E402
-from deep_research import run_deep_research  # noqa: E402
+from deep_research import DEEP_NUM_CTX, run_deep_research  # noqa: E402
 from model_config import (  # noqa: E402
     MAC_MODEL_DIGESTS,
     canonical_model_reference,
@@ -314,7 +314,7 @@ def build_plan(
             "normalPipelineSecondsPerQuestion": 300,
             "normalAnswerGenerationSecondsPerQuestion": 300,
             "normalContextTokens": search.NUM_CTX,
-            "deepContextTokens": 32768,
+            "deepContextTokens": DEEP_NUM_CTX,
             "deepJsonNumPredict": 8192,
             "deepTextNumPredict": 4096,
             "deepTimeoutSeconds": 1800,

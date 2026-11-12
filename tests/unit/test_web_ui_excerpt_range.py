@@ -42,3 +42,10 @@ out({{labels: items.map((item) => ui._excerptRangeLabel(item)), markdown: saved[
 def test_evidence_list_shows_the_excerpt_label():
     html = INDEX_HTML.read_text(encoding="utf-8")
     assert "const excerptLabel = this._excerptRangeLabel(item);" in html
+
+
+def test_segment_ranges_are_listed_in_the_label():
+    item = {"snippetTruncated": True, "snippetStartLine": 30, "snippetEndLine": 58,
+            "snippetSegments": [{"startLine": 30, "endLine": 38, "text": "a"}, {"startLine": 53, "endLine": 58, "text": "b"}]}
+    result = run_node(f"out(ui._excerptRangeLabel({json.dumps(item)}));")
+    assert result == "抜粋 行 30-38、53-58（根拠範囲の一部。区間の間と前後を省略）"

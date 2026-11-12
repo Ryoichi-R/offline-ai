@@ -267,6 +267,12 @@ HEADER_PARAGRAPH_MAX_LINE_CHARS = 40
 _QUALIFYING_BODY_RE = re.compile(
     r"経過措置|ただし|但し|例外|除く|除き|条件|要件|限り|適用しない|適用除外|場合"
 )
+# 照会先の案内（「疑義がある場合には…照会されたい」）は「場合」を含んでも付随範囲とする。
+_CONTACT_RE = re.compile(r"照会(?:されたい|ください|願います|先)|問い?合わ?せ(?:先|ください|願います)|連絡先")
+_STRONG_QUALIFIER_RE = re.compile(r"経過措置|ただし|但し|例外|除く|除き|適用しない|適用除外|この限りでない")
+# 節の本文中の別紙・別表の開始行と、「※」で始まる注記（guided-follow-up 7.4 R3）。
+_APPENDIX_MARKER_RE = re.compile(r"[（(]?(?:別紙|別表|別添)[0-9０-９一二三四五六七八九十]*[）)]?")
+_PLACEHOLDER_CELL_RE = re.compile(r"[○●□◯〇・\s　（）()\-－―]*")
 
 
 def _paragraph_ranges(lines: list[str], start: int, end: int) -> list[tuple[int, int]]:
@@ -289,11 +295,50 @@ def _body_text(lines: list[str], start: int, end: int) -> str:
     return "\n".join(lines[start - 1 : min(end, len(lines))])
 
 
+def _is_blank_form(body: str) -> bool:
+    """空欄の様式・チェックリスト（記入欄の多い表と「項目名：」の行）か。"""
+    rows, other = [], []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("|"):
+            if re.fullmatch(r"\|[\s|:\-]+\|?", stripped):
+                continue
+            rows.append([cell.strip() for cell in stripped.strip("|").split("|")])
+        else:
+            other.append(_LINE_MARKUP_RE.sub("", stripped))
+    if len(rows) < 2:
+        return False
+    cells = [cell for row in rows[1:] for cell in row]
+    if not cells:
+        return False
+    blank = sum(1 for cell in cells if _PLACEHOLDER_CELL_RE.fullmatch(cell) or "○○" in cell or "●●" in cell)
+    if blank / len(cells) < 0.3:
+        return False
+    # 確認項目を文で書いたチェックリスト（「…されているか。」）は実務の本文であり、空欄様式ではない。
+    filled = [cell for cell in cells if not _PLACEHOLDER_CELL_RE.fullmatch(cell)]
+    if filled and sum(1 for cell in filled if re.search(r"[。？?]\s*$|か\s*$", cell)) / len(filled) >= 0.3:
+        return False
+    return all(
+        line.endswith(("：", ":")) or line.startswith(("※", "（注", "注")) or ("。" not in line and len(line) <= 20)
+        for line in other
+    )
+
+
 def _is_ancillary(heading: str, body: str, *, header: bool = False) -> bool:
     content = [_LINE_MARKUP_RE.sub("", line) for line in body.splitlines() if line.strip()]
     content = [line for line in content if line]
     if not heading and content and all(re.fullmatch(r"(?:記|以上)", line) for line in content):
         return True  # 「記」「以上」だけの段落
+    if _is_blank_form(body) and not _STRONG_QUALIFIER_RE.search(body):
+        return True
+    if not heading and _CONTACT_RE.search(body) and not _STRONG_QUALIFIER_RE.search(body):
+        return True
+    if header and not heading and content and all(
+        "。" not in line and len(line) <= HEADER_PARAGRAPH_MAX_LINE_CHARS for line in content
+    ):
+        return True  # 見出しより前の宛先・発出者・文書番号・機密区分の並び
     if _QUALIFYING_BODY_RE.search(body):
         return False
     if heading:
@@ -328,6 +373,7 @@ def primary_units(text: str) -> list[dict]:
                     "end_line": last,
                     "ancillary": _is_ancillary("", body, header=header),
                     "read_ranges": [(first, last, "")],
+                    "kind": "paragraph",
                 }
             )
 
@@ -355,6 +401,11 @@ def primary_units(text: str) -> list[dict]:
             subtree.append(child)
             pending.extend(reversed(child.children_indices))
         body = _body_text(lines, node.body_start_line, node.section_end_line)
+        if not node.children_indices:
+            parts = _split_section(lines, node)
+            if len(parts) > 1:
+                units.extend(parts)
+                continue
         read_ranges = []
         for item in subtree:
             intro_end = (
@@ -371,9 +422,132 @@ def primary_units(text: str) -> list[dict]:
                 "end_line": node.section_end_line,
                 "ancillary": _is_ancillary(node.heading_text, body),
                 "read_ranges": read_ranges,
+                "kind": "section",
             }
         )
     return units
+
+
+def _split_section(lines: list[str], node: HeadingNode) -> list[dict]:
+    """子見出しのない節を、本文・別紙（別表）・注記の子単位に分ける（R3）。
+
+    子単位は親の見出しを引き継ぎ、ラベルを「３ 実施時期／別紙」のように付ける。
+    付随範囲の判定は子単位ごとに行う（単独の適用日は付随、別紙と除外の注記は主要）。
+    """
+    start, end = node.heading_line, node.section_end_line
+    boundaries: list[tuple[int, str, str]] = []  # (開始行, 種類, ラベル)
+    for line_no in range(node.body_start_line, end + 1):
+        stripped = _LINE_MARKUP_RE.sub("", lines[line_no - 1])
+        if _APPENDIX_MARKER_RE.fullmatch(stripped):
+            boundaries.append((line_no, "appendix", stripped.strip("（）()")))
+        elif stripped.startswith(("※", "＊注", "注）", "（注）")):
+            previous = lines[line_no - 2].strip() if line_no > 1 else ""
+            if not previous or not previous.startswith(("※",)):
+                boundaries.append((line_no, "note", "注記"))
+    if not boundaries:
+        return []
+    parts: list[dict] = []
+    segments = [(start, "body", node.heading_text)] + boundaries
+    for index, (first, kind, label) in enumerate(segments):
+        last = segments[index + 1][0] - 1 if index + 1 < len(segments) else end
+        if kind == "body":
+            body = _body_text(lines, node.body_start_line, last)
+            if not body.strip():
+                continue
+            parts.append(_part(node.heading_text, node.heading_text, first, last, "body",
+                               _is_ancillary(node.heading_text, body)))
+            continue
+        # 別紙・注記は段落ごとに付随範囲かを判定する（照会先の案内などを切り離す）。
+        paragraphs = _paragraph_ranges(lines, first, last)
+        if kind == "appendix":
+            body = _body_text(lines, first, last)
+            parts.append(_part(node.heading_text, f"{node.heading_text}／{label}", first, last, "appendix",
+                               _is_ancillary("", body)))
+            continue
+        for p_first, p_last in paragraphs:
+            body = _body_text(lines, p_first, p_last)
+            parts.append(_part(node.heading_text, f"{node.heading_text}／{label}", p_first, p_last, "note",
+                               _is_ancillary("", body)))
+    return parts
+
+
+def _part(heading: str, label: str, start: int, end: int, kind: str, ancillary: bool) -> dict:
+    return {
+        "heading": label,
+        "parent_heading": heading,
+        "start_line": start,
+        "end_line": end,
+        "ancillary": ancillary,
+        "read_ranges": [(start, end, label)],
+        "kind": kind,
+    }
+
+
+def classify_range(text: str, start: int, end: int, *, lines: list[str] | None = None,
+                   nodes: list[HeadingNode] | None = None) -> bool:
+    """行範囲が付随範囲（宛先・発出者・文書番号・YAML前付け・空欄様式・単独の適用日や照会先）か。
+
+    深掘りの読取と、通常回答・深掘りの根拠枠で共通に使う（guided-follow-up 7.4 R1）。
+    経過措置・ただし書・除外を含む範囲は主要範囲として扱う。
+    """
+    lines = lines if lines is not None else text.splitlines()
+    nodes = nodes if nodes is not None else parse_heading_tree(text)
+    if not lines or start < 1 or end < start:
+        return False
+    end = min(end, len(lines))
+    if lines[0].strip() == "---":
+        closing = next((i for i in range(2, min(len(lines), 200) + 1) if lines[i - 1].strip() == "---"), 0)
+        if closing and (end <= closing or not any(line.strip() for line in lines[closing:end])):
+            return True  # YAML前付け
+    first_heading = nodes[0].heading_line if nodes else len(lines) + 1
+    node = next((item for item in nodes if item.heading_line == start), None)
+    heading = node.heading_text if node else ""
+    body_start = start + 1 if node else start
+    body = _body_text(lines, body_start, end)
+    if heading:
+        return _is_ancillary(heading, body)
+    paragraphs = _paragraph_ranges(lines, body_start, end)
+    if not paragraphs:
+        return False
+    header = end < first_heading
+    return all(_is_ancillary("", _body_text(lines, a, b), header=header) for a, b in paragraphs) or (
+        _is_blank_form(body) and not _STRONG_QUALIFIER_RE.search(body)
+    )
+
+
+_OPERATIVE_DATE_RE = re.compile(
+    r"(?:(?:本|この)(?:通知|規程|要綱|要領|通達|事務連絡)は[、,]?)?"
+    r"(?:(?:令和|平成|昭和)?(?:元|[0-9]+)年)[0-9]+月[0-9]+日(?:から|より)"
+    r"(?:適用|施行|実施)する。"
+)
+
+
+def operative_date_clause(text: str) -> bool:
+    return bool(_OPERATIVE_DATE_RE.fullmatch(re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))))
+
+
+def unique_operative_date_range(text: str) -> tuple[int, str] | None:
+    """短い付随節に単独で明示された施行・適用日だけを選ぶ。"""
+    lines = text.splitlines()
+    dates = []
+    for unit in primary_units(text):
+        if not unit["ancillary"]:
+            continue
+        body = [(n, lines[n - 1].strip()) for n in range(unit["start_line"], unit["end_line"] + 1)
+                if lines[n - 1].strip() and not lines[n - 1].lstrip().startswith("#")]
+        if len(body) == 1 and operative_date_clause(body[0][1]):
+            dates.append((body[0][0], unit["heading"]))
+    return dates[0] if len(dates) == 1 else None
+
+
+def verification_follow_through(text: str) -> str:
+    """真正性の確認と、その後に求められる処理が一文にある原文。"""
+    matches = [
+        sentence.strip() for line in text.splitlines() if not line.lstrip().startswith(("#", "|", ">", "```"))
+        for sentence in re.findall(r"[^。！？\n]+。", line)
+        if re.search(r"真正性.{0,300}確認した(?:上|うえ)で[、,]?\s*迅速かつ適切に", sentence)
+    ]
+    return matches[0] if len(matches) == 1 else ""
 
 
 def primary_section_ranges(text: str, *, budget_chars: int) -> dict:
@@ -462,6 +636,10 @@ _GENERIC_QUERY_TERMS = frozenset(
 )
 TITLE_CORE_MIN_CHARS = 4
 TITLE_WEAK_COVERAGE = 0.5
+# 表題の中核から除くと内容が残らない定型語（「一部改正」だけの表題中核では確定しない）。
+_GENERIC_TITLE_RE = re.compile(
+    r"一部を?改正(?:する)?|改正|施行|について|に関する|に係る|における|の件|及び|並びに|等|の|を|に"
+)
 HEADER_MAX_LINES = 30
 
 
@@ -628,7 +806,13 @@ def match_documents(query: str, documents: list[dict]) -> dict:
         strength = 0
         coverages = [(v, _bigram_coverage(v, normalized_query)) for v in variants]
         coverage = max((c for _, c in coverages), default=0.0)
-        if any(len(v) >= TITLE_CORE_MIN_CHARS and v in normalized_query for v in variants):
+        matched = [
+            v for v in variants
+            if len(v) >= TITLE_CORE_MIN_CHARS and v in normalized_query
+            and len(_GENERIC_TITLE_RE.sub("", v)) >= TITLE_CORE_MIN_CHARS
+        ]
+        matched_core = max(matched, key=len) if matched else ""
+        if matched:
             strength, reasons = 2, ["title"]
         if query_numbers and _numbers_match(query_numbers, document_numbers(str(document.get("head_text") or ""))):
             strength = 2
@@ -654,6 +838,7 @@ def match_documents(query: str, documents: list[dict]) -> dict:
                     "coverage": round(coverage, 4),
                     "subject_hits": len(subject_hits),
                     "reasons": reasons,
+                    "matched_core": matched_core,
                     "exclude": list(title_exclusions(titles)),
                 }
             )
@@ -662,6 +847,17 @@ def match_documents(query: str, documents: list[dict]) -> dict:
     )
     strong = [item for item in candidates if item["strength"] == 2]
     confirmed = strong[0]["path"] if len(strong) == 1 else None
+    if confirmed is None and len(strong) > 1:
+        # 表題の一致が入れ子になっている場合（「毒物及び劇物取締法施行令」と「毒物及び劇物取締法」等）は、
+        # 質問に現れた最も長い表題の資料に確定する。長さが並ぶ・入れ子でない場合は確定しない。
+        ranked = sorted(strong, key=lambda item: -len(item["matched_core"]))
+        top, others = ranked[0], ranked[1:]
+        if top["matched_core"] and all(
+            len(other["matched_core"]) < len(top["matched_core"]) and other["matched_core"] in top["matched_core"]
+            and other["reasons"] == ["title"]
+            for other in others
+        ):
+            confirmed = top["path"]
     return {"confirmed": confirmed, "candidates": candidates}
 
 
@@ -728,4 +924,60 @@ def documents_from_chunks(chunks: list[dict]) -> list[dict]:
                 "file_sha256": str(items[0].get("file_sha256") or ""),
             }
         )
-    return documents
+    return group_split_documents(documents)
+
+
+_PART_NUMBER_RE = re.compile(r"([0-9]+)[A-Za-z0-9_\-]*$")
+
+
+def _split_group_key(path: str) -> tuple[str, str] | None:
+    """分割ファイル（-resegmented-NN、_partN 等）なら ``(フォルダ, 接尾部を除いた名前)``。"""
+    folder, _, name = path.replace("\\", "/").rpartition("/")
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    base = _FILE_SUFFIX_RE.sub("", stem)
+    if base == stem or not base:
+        return None
+    return folder, base
+
+
+def _part_order(path: str) -> tuple[int, str]:
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    suffix = _FILE_SUFFIX_RE.search(stem)
+    number = _PART_NUMBER_RE.search(suffix.group(0)) if suffix else None
+    return (int(number.group(1)) if number else 0, path)
+
+
+def group_split_documents(documents: list[dict]) -> list[dict]:
+    """同じフォルダで接尾部を除いた名前が同じ分割ファイルを、1つの資料にまとめる（R5）。
+
+    まとめた資料は先頭の部分を ``path`` とし、``paths`` に部分のパスと SHA-256 を原文順で持つ。
+    表題・冒頭部は先頭の部分から採る。部分が1つだけなら変えない。
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    order: list[object] = []
+    for document in documents:
+        key = _split_group_key(document["path"])
+        if key is None:
+            order.append(document)
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(document)
+    result = []
+    for item in order:
+        if isinstance(item, dict):
+            result.append(item)
+            continue
+        members = sorted(groups[item], key=lambda d: _part_order(d["path"]))
+        if len(members) == 1:
+            result.append(members[0])
+            continue
+        first = dict(members[0])
+        titles = list(first.get("titles") or [first.get("title") or ""]) + [item[1]]
+        first["titles"] = [t for t in dict.fromkeys(titles) if t]
+        first["paths"] = [
+            {"path": member["path"], "file_sha256": str(member.get("file_sha256") or "")} for member in members
+        ]
+        result.append(first)
+    return result

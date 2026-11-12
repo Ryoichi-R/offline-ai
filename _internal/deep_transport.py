@@ -10,10 +10,15 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.error import HTTPError
 
 WORKER_OUTPUT_MAX_BYTES = 32_000_000
 CANDIDATE_TRANSFER_LIMIT_CODE = "candidate_transfer_limit"
-WORKER_ERROR_CODES = frozenset({CANDIDATE_TRANSFER_LIMIT_CODE, "worker_error"})
+MODEL_OUTPUT_INCOMPLETE_CODE = "model_output_incomplete"
+WORKER_ERROR_CODES = frozenset({
+    CANDIDATE_TRANSFER_LIMIT_CODE, MODEL_OUTPUT_INCOMPLETE_CODE,
+    "model_http_error", "model_stream_error", "model_stream_incomplete", "timeout", "worker_error",
+})
 # Operations whose oversize output is a candidate-transfer limit, not a generic failure.
 RETRIEVE_OPERATIONS = frozenset({"retrieve", "retrieve_many"})
 
@@ -318,7 +323,7 @@ def _execute(payload):
                 sys.stderr.buffer.write(b".")
                 sys.stderr.buffer.flush()
             if event.get("error"):
-                raise ValueError("model error")
+                raise DeepWorkerError(code="model_stream_error")
             content = event.get("message", {}).get("content", "")
             size += len(content)
             if size > 65536:
@@ -326,11 +331,11 @@ def _execute(payload):
             parts.append(content)
             if event.get("done") is True:
                 if event.get("done_reason") == "length":
-                    raise ValueError("model output incomplete")
+                    raise DeepWorkerError(code=MODEL_OUTPUT_INCOMPLETE_CODE)
                 finished = True
                 break
     if not finished:
-        raise ValueError("incomplete stream")
+        raise DeepWorkerError(code="model_stream_incomplete")
     return "".join(parts).strip()
 
 
@@ -343,5 +348,11 @@ if __name__ == "__main__":
         sys.stdout.buffer.write(encoded)
     except CandidateTransferLimitError:
         sys.stdout.buffer.write(_error_payload(CANDIDATE_TRANSFER_LIMIT_CODE))
+    except DeepWorkerError as exc:
+        sys.stdout.buffer.write(_error_payload(exc.code))
+    except TimeoutError:
+        sys.stdout.buffer.write(_error_payload("timeout"))
+    except HTTPError:
+        sys.stdout.buffer.write(_error_payload("model_http_error"))
     except Exception:
         sys.stdout.buffer.write(_error_payload("worker_error"))

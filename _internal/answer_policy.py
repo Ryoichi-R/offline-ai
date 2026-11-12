@@ -736,6 +736,47 @@ def claim_numbers_missing(claim_text: str, source_text: str) -> list[str]:
     return sorted({n for n in _DIGITS_RE.findall(claim) if n not in source})
 
 
+_PER_FORM_RE = re.compile(r"(?:各|個々の|それぞれの)様式|様式(?:ごと|毎|別|によって|により)")
+_NAMED_FORM_RE = re.compile(r"(?:別紙)?様式\s*(?:第\s*)?(?:[0-9０-９一二三四五六七八九十]+|[A-ZＡ-Ｚ])")
+_TIMING_LABEL_RE = re.compile(r"(?:実施|適用|施行|提出|受付|開始)(?:時期|期日|日|期限|期間)|期限|日程")
+_TIMING_VALUE_RE = re.compile(
+    r"[0-9０-９]+(?:年|月|日|週間)|(?:日|月)(?:から|まで|以内)|"
+    r"(?:提出|受付|決定|交付|公示|通知|発出|申請|契約|実施|施行)の?(?:前|後)|"
+    r"(?:当日|翌日|随時|即日|速やかに|遅滞なく|年度末|月末)"
+)
+
+
+def form_specific_timing_missing(claim: str, sources: Iterable[str]) -> bool:
+    """様式の一覧や文書全体の適用日だけでは、様式別の日程を裏付けない。"""
+    if not (_PER_FORM_RE.search(claim) and _TIMING_LABEL_RE.search(claim)):
+        return False
+    for source in sources:
+        table_columns = None
+        for line in re.split(r"[。！？\n]", source):
+            row = line.strip()
+            if row.startswith("|") and row.endswith("|"):
+                cells = [cell.strip() for cell in row[1:-1].split("|")]
+                if table_columns is not None and len(cells) == table_columns[0]:
+                    _, form, timing = table_columns
+                    if cells[form] and _TIMING_VALUE_RE.search(cells[timing]):
+                        return False
+                if "様式" in cells:
+                    for timing, cell in enumerate(cells):
+                        if _TIMING_LABEL_RE.fullmatch(cell):
+                            table_columns = (len(cells), cells.index("様式"), timing)
+                continue
+            table_columns = None
+            if row.startswith("#"):
+                continue
+            if (_PER_FORM_RE.search(row) or _NAMED_FORM_RE.search(row)) and _TIMING_VALUE_RE.search(row):
+                return False
+            if _PER_FORM_RE.search(row) and _TIMING_LABEL_RE.search(row) and re.search(
+                r"定め|異な|別に|のとおり|による|に示", row
+            ):
+                return False
+    return True
+
+
 # 「予算決算及び会計令」のような、及び・並びにで結ばれた法令・規程の名称（原文側）。
 _COMPOUND_NAME_RE = re.compile(r"([一-龥々]{2,})(?:及び|並びに)([一-龥々]{1,}(?:法|令|規則|規程|規定|要綱|要領))")
 
@@ -2178,6 +2219,7 @@ def assess_answer_text(answer: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 案内の振り分け: 質問範囲の判定（plans/offline-ai-guided-follow-up-plan.md 4.2）
 # ---------------------------------------------------------------------------
 # 回答の詳しさ（granularity）とは別の判定。v2の `_ASPECT_CUES` と必須観点を
@@ -2195,7 +2237,7 @@ _GUIDED_OVERVIEW_RE = re.compile(
 GUIDED_ITEM_CUES = (
     ("時期", ("適用日", "適用期日", "施行日", "施行期日", "いつ", "期限", "期間", "締切", "締め切り", "時期", "日付", "何日")),
     ("対象", ("対象", "誰", "だれ", "範囲", "該当")),
-    ("例外", ("例外", "除外", "ただし", "但し", "除く")),
+    ("例外", ("例外", "除外", "ただし", "但し", "除く", "除か", "除き", "除いて", "対象外")),
     ("条件", ("条件", "要件", "基準", "場合")),
     ("手続", ("手続", "手順", "方法", "やり方", "流れ")),
     ("書類", ("提出", "書類", "添付", "様式", "申請", "届出")),
