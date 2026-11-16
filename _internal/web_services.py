@@ -1072,6 +1072,8 @@ ERROR_CODES = {
     "invalid_evidence_id": 400,
     "unauthorized": 403,
     "request_conflict": 409,
+    "conversation_not_found": 404,
+    "conversation_full": 409,
     "source_changed": 409,
     "index_source_changed": 409,
     "index_source_unreadable": 409,

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import threading
 import time
 
@@ -139,6 +140,8 @@ def _assert_path_boundary(
             try:
                 os.lstat(current)
             except FileNotFoundError as exc:
+                if missing_code == "source_missing":
+                    raise EvidenceViewError("source_missing", "資料が見つかりません", 404) from exc
                 if missing_code == "source_changed":
                     raise EvidenceViewError(
                         "source_changed",
@@ -209,6 +212,71 @@ def _truncate_utf8(value: str, max_bytes: int) -> str:
     if len(raw) <= max_bytes:
         return value
     return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def read_source_snapshot(source_root: Path, relative_path: str, expected_sha256: str | None = None,
+                         *, missing_code: str = "source_missing") -> tuple[str, list[str], str]:
+    """Read a bounded local source and verify the opened file before returning any text."""
+    normalized = _normalize_relative_path(relative_path)
+    path = _assert_path_boundary(
+        source_root,
+        normalized,
+        missing_code=missing_code,
+    )
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
+
+    try:
+        initial_handle_stat = os.fstat(fd)
+        if not stat.S_ISREG(initial_handle_stat.st_mode):
+            raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500)
+        if initial_handle_stat.st_size > MAX_SOURCE_FILE_BYTES:
+            raise EvidenceViewError("evidence_too_large", "資料が閲覧上限を超えています", 413)
+        final_path = _final_path_from_handle(fd)
+        if os.name == "nt":
+            if final_path is None:
+                raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500)
+            try:
+                root = source_root.resolve(strict=True)
+            except OSError as exc:
+                raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
+            if not _is_within(final_path, root):
+                raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500)
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            data = handle.read(MAX_SOURCE_FILE_BYTES + 1)
+            after_handle_stat = os.fstat(handle.fileno())
+        if len(data) > MAX_SOURCE_FILE_BYTES:
+            raise EvidenceViewError("evidence_too_large", "資料が閲覧上限を超えています", 413)
+        if _identity(initial_handle_stat) != _identity(after_handle_stat):
+            raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
+        try:
+            current_path_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409) from exc
+        if _identity(initial_handle_stat) != _identity(current_path_stat):
+            raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_sha256 is not None and not secrets.compare_digest(digest, expected_sha256):
+            raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
+    except EvidenceViewError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    text = data.decode("utf-8", errors="replace")
+    return digest, text.splitlines(), text
 
 
 class EvidenceRegistry:
@@ -296,62 +364,9 @@ class EvidenceRegistry:
         return self._read_reference(reference)
 
     def _read_reference(self, reference: EvidenceReference) -> dict:
-        path = _assert_path_boundary(
-            self.source_root,
-            reference.relative_path,
-            missing_code="source_changed",
+        _, lines, _ = read_source_snapshot(
+            self.source_root, reference.relative_path, reference.source_sha256, missing_code="source_changed",
         )
-        try:
-            flags = os.O_RDONLY
-            if hasattr(os, "O_BINARY"):
-                flags |= os.O_BINARY
-            fd = os.open(path, flags)
-        except OSError as exc:
-            raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
-
-        try:
-            initial_handle_stat = os.fstat(fd)
-            if initial_handle_stat.st_size > MAX_SOURCE_FILE_BYTES:
-                raise EvidenceViewError("evidence_too_large", "資料が閲覧上限を超えています", 413)
-            final_path = _final_path_from_handle(fd)
-            if os.name == "nt":
-                if final_path is None:
-                    raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500)
-                try:
-                    root = self.source_root.resolve(strict=True)
-                except OSError as exc:
-                    raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
-                if not _is_within(final_path, root):
-                    raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500)
-            with os.fdopen(fd, "rb", closefd=True) as handle:
-                data = handle.read(MAX_SOURCE_FILE_BYTES + 1)
-                after_handle_stat = os.fstat(handle.fileno())
-            fd = -1
-            if len(data) > MAX_SOURCE_FILE_BYTES:
-                raise EvidenceViewError("evidence_too_large", "資料が閲覧上限を超えています", 413)
-            if _identity(initial_handle_stat) != _identity(after_handle_stat):
-                raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
-            try:
-                current_path_stat = os.stat(path, follow_symlinks=False)
-            except OSError as exc:
-                raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409) from exc
-            if _identity(initial_handle_stat) != _identity(current_path_stat):
-                raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
-            digest = hashlib.sha256(data).hexdigest()
-            if not secrets.compare_digest(digest, reference.source_sha256):
-                raise EvidenceViewError("source_changed", "検索後に資料が変更されたため再検索してください", 409)
-        except EvidenceViewError:
-            raise
-        except (OSError, ValueError) as exc:
-            raise EvidenceViewError("evidence_unavailable", "資料を読み出せません", 500) from exc
-        finally:
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-        lines = data.decode("utf-8", errors="replace").splitlines()
         if lines:
             highlight_start = min(reference.start_line, len(lines))
             highlight_end = min(max(reference.end_line, highlight_start), len(lines))

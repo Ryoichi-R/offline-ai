@@ -97,6 +97,14 @@ except ValueError as exc:
         raise SystemExit(2) from None
     raise
 
+import assistant
+from assistant_sessions import (
+    ID as CONVERSATION_ID, MAX_SAVED_BYTES, REQUEST_ID, ConversationError,
+    Conversations, failure_result, import_saved, render_saved,
+)
+from assistant_tools import SOURCE_ID, verify_source
+from web_services import _index_marker
+
 from source_folder import (
     SourceFolderError, describe_source_folder, pick_source_folder, save_source_root,
 )
@@ -354,6 +362,8 @@ class LimitedThreadingServer(ThreadingHTTPServer):
         self.evidence_registry = evidence_registry or create_evidence_registry()
         # 確認案内（既定は無効）の確認情報。サーバーのメモリ内だけに置く。
         self.confirmation_store = ConfirmationStore(evidence_registry=self.evidence_registry)
+        self.conversations = Conversations()
+        self.assistant_source_epoch = secrets.token_urlsafe(16)
         # web.bat（非表示起動）だけが設定する。None ならページを閉じても停止しない。
         self.page_presence = page_presence
         self.chat_model = chat_model
@@ -424,7 +434,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
 class OfflineAIHandler(BaseHTTPRequestHandler):
     """offline-ai Web UI HTTP ハンドラ。"""
 
-    server_version = "OfflineAI/0.2.6"
+    server_version = "OfflineAI/0.3.11"
 
     def log_message(self, format, *args):
         """デフォルトのログ出力を抑制（構造化ログに統一）。"""
@@ -644,7 +654,7 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
 
     def _stream_events(self, event_queue: queue.Queue,
                        cancel_token: CancellationToken,
-                       cancel_on_disconnect: bool = True):
+                       cancel_on_disconnect: bool = True, terminal_grace: int = 0):
         """queue からイベントを読み出して SSE 送信する。
 
         cancel_on_disconnect=False の場合、クライアント切断時にジョブを
@@ -656,7 +666,7 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
                 try:
                     event = event_queue.get(timeout=1)
                 except queue.Empty:
-                    if cancel_token.remaining() <= 0:
+                    if time.monotonic() >= cancel_token.deadline + terminal_grace:
                         self._send_sse_event({
                             "type": "error", "code": "timeout",
                             "message": "処理がタイムアウトしました"
@@ -828,6 +838,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_search()
         elif path == "/api/evidence/view":
             self._handle_evidence_view(parsed)
+        elif path.startswith("/api/conversations/"):
+            self._handle_conversation_read(path)
         elif path == "/api/confirmation":
             self._handle_confirmation_view(parsed)
         else:
@@ -856,6 +868,8 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
             self._handle_search_cancel()
         elif path == "/api/search":
             self._handle_search_continue()
+        elif path in {"/api/conversations", "/api/conversations/import"}:
+            self._handle_conversation_write(path)
         elif path == "/api/page/heartbeat":
             self._handle_page_presence(closing=False)
         elif path == "/api/page/close":
@@ -891,7 +905,9 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
                 payload = self._read_json_body(max_bytes=16384)
                 if set(payload) != {"path"}:
                     raise SourceFolderError("フォルダーのパスを指定してください。")
-                save_source_root(self.server.source_settings_root, payload["path"])
+                saved_root = save_source_root(self.server.source_settings_root, payload["path"])
+                if saved_root != self.server.source_root.resolve():
+                    self.server.assistant_source_epoch = secrets.token_urlsafe(16)
             self._send_json(describe_source_folder(
                 self.server.source_settings_root, self.server.source_root
             ))
@@ -1252,6 +1268,173 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _assistant_generation(self):
+        return assistant.source_generation(
+            self.server.source_root, [self.server.assistant_source_epoch, _index_marker()]
+        )
+
+    def _handle_conversation_write(self, path):
+        session = self._get_auth_session_id()
+        if not session:
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        try:
+            if path.endswith("/import"):
+                payload = self._read_json_body(max_bytes=MAX_SAVED_BYTES * 2)
+                if set(payload) != {"markdown"}:
+                    raise ValueError("保存したMarkdownを指定してください。")
+                result = import_saved(payload["markdown"], self.server.source_root,
+                                      self.server.evidence_registry, session)
+                self._send_json({"result": result})
+                return
+            if self._read_json_body(max_bytes=128):
+                raise ValueError("会話の開始要求が不正です。")
+            id_ = self.server.conversations.new(session, self._assistant_generation())
+            self._send_json({"conversationId": id_, "nextTurn": 1}, status=201)
+        except ConversationError as exc:
+            self._send_error_json(exc.code, str(exc))
+        except (ValueError, UnicodeError, RecursionError):
+            self._send_error_json("invalid_query", "会話の開始または保存回答の読み込みに失敗しました。")
+
+    def _handle_conversation_read(self, path):
+        session = self._get_auth_session_id()
+        if not session:
+            self._send_error_json("unauthorized", "認証が必要です")
+            return
+        parts = path.split("/")[3:]
+        id_ = parts[0]
+        if not CONVERSATION_ID.fullmatch(id_):
+            self._send_error_json("conversation_not_found", "会話が見つかりません。")
+            return
+        store = self.server.conversations
+        args = id_, session, self._assistant_generation()
+        try:
+            if len(parts) == 1:
+                self._send_json(store.view(*args))
+            elif len(parts) == 3 and parts[1] == "sources" and SOURCE_ID.fullmatch(parts[2]):
+                source = store.source(*args, parts[2])
+                self._send_json(verify_source(self.server.source_root, source,
+                                              registry=self.server.evidence_registry, session_id=session))
+            elif (len(parts) == 4 and parts[1] == "turns" and parts[3] == "markdown"
+                  and re.fullmatch(r"[1-9][0-9]{0,5}", parts[2])):
+                self._send_json({"markdown": render_saved(store.result(*args, int(parts[2])))})
+            else:
+                self._send_error_json("conversation_not_found", "会話または回答が見つかりません。")
+        except ConversationError as exc:
+            self._send_error_json(exc.code, str(exc))
+
+    def _handle_assistant_search(self, session, payload):
+        id_ = payload.get("conversationId")
+        request_id = payload.get("requestId")
+        turn = payload.get("turn")
+        resume = payload.get("resume_only", False)
+        if (not isinstance(id_, str) or not CONVERSATION_ID.fullmatch(id_)
+                or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id)
+                or type(turn) is not int or not 1 <= turn <= 1_000_000
+                or type(resume) is not bool):
+            self._send_error_json("invalid_query", "会話またはターンの指定が不正です。")
+            return
+        store = self.server.conversations
+        jobs = self.server.job_table
+        generation = self._assistant_generation()
+        try:
+            if resume:
+                if set(payload) != {"mode", "conversationId", "requestId", "turn", "resume_only"}:
+                    raise ValueError()
+                store.authorize_resume(id_, session, generation, request_id, turn)
+                entry = jobs.get(request_id)
+                if entry is None or (entry.fingerprint or ())[:5] != (session, id_, turn, generation, "assistant"):
+                    raise JobNotFoundError()
+            else:
+                if set(payload) - {"mode", "conversationId", "requestId", "turn", "resume_only",
+                                   "text", "reasoning", "timeout_seconds"}:
+                    raise ValueError()
+                text, reasoning = payload.get("text"), payload.get("reasoning", "off")
+                if (not isinstance(text, str) or not 1 <= len(text.strip()) <= MAX_QUERY_LENGTH
+                        or reasoning not in ("off", "low", "medium", "high")):
+                    raise ValueError()
+                try:
+                    seconds = assistant.validate_timeout(payload.get("timeout_seconds", assistant.DEFAULT_SECONDS))
+                except ValueError as exc:
+                    self._send_error_json("invalid_timeout", str(exc))
+                    return
+                query = text.strip()
+                model = self.server.chat_model or detect_model()
+                fingerprint = (session, id_, turn, generation, "assistant", model, query, reasoning, seconds)
+                request_hash = hashlib.sha256(assistant.encode(fingerprint).encode()).hexdigest()
+                token = CancellationToken(seconds)
+
+                def submit(resume_only):
+                    entry, created = jobs.submit(request_id, token, fingerprint=fingerprint, mode="assistant",
+                                                 resume_only=resume_only)
+                    if not resume_only and not created:
+                        raise RequestConflictError()
+                    return entry
+
+                entry, snapshot = store.start(id_, session, generation, request_id, turn, request_hash, submit)
+                if snapshot is not None:
+                    self._spawn_assistant_worker(entry, id_, request_id, turn, generation, query,
+                                                 model, reasoning, snapshot)
+        except ConversationError as exc:
+            self._send_error_json(exc.code, str(exc))
+            return
+        except JobNotFoundError:
+            self._send_error_json("job_not_found", "処理の保持期限が過ぎました。会話を再取得してください。")
+            return
+        except RequestConflictError:
+            self._send_error_json("request_conflict", "この処理IDは既に使用されています。")
+            return
+        except ValueError:
+            self._send_error_json("invalid_query", "アシスタントの要求が不正です。")
+            return
+        except RuntimeError:
+            self._send_error_json("server_busy", "サーバーが処理中です。")
+            return
+        subscriber = entry.add_subscriber()
+        try:
+            self._begin_sse(close_on_terminal=True)
+            self._stream_events(subscriber, entry.cancel_token, cancel_on_disconnect=False, terminal_grace=5)
+        finally:
+            entry.remove_subscriber(subscriber)
+
+    def _spawn_assistant_worker(self, entry, id_, request_id, turn, generation, query, model, reasoning, snapshot):
+        token = entry.cancel_token
+        self.server.register_token(token)
+
+        def emit(kind, value):
+            entry.broadcast({"type": kind, **value})
+
+        def work():
+            result = failure_result(turn, query)
+            try:
+                turns, prior, key = snapshot
+                result = assistant.live_turn(
+                    self.server.source_root, generation, turn, query, model, reasoning,
+                    token.remaining(), turns, prior, key,
+                    lambda: token.is_cancelled or generation != self._assistant_generation(), emit,
+                )
+            except Exception:
+                # No question, output, excerpts, or exception text in logs.
+                log_structured(request_id, phase="assistant_worker_failed")
+            finally:
+                try:
+                    stored = self.server.conversations.finish(id_, request_id, result)
+                finally:
+                    self.server.job_table.finish(request_id)
+                    self.server.unregister_token(token)
+                if stored is not None:
+                    emit("assistant_result", {"result": stored})
+                emit("done", {"requestId": request_id})
+
+        thread = threading.Thread(target=work, daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            self.server.conversations.finish(id_, request_id, failure_result(turn, query))
+            emit("error", {"code": "internal_error", "message": "処理を起動できません。"})
+            self.server.job_table.finish(request_id)
+            self.server.unregister_token(token)
+
     # --- 確認案内の続き（POST /api/search）と確認パネルの復元 ---
 
     def _handle_confirmation_view(self, parsed):
@@ -1279,15 +1462,21 @@ class OfflineAIHandler(BaseHTTPRequestHandler):
         if not session_id:
             self._send_error_json("unauthorized", "認証が必要です")
             return
-        if not guided_enabled():
-            self.send_error(404)
-            return
         try:
             payload = self._read_json_body(max_bytes=MAX_REQUEST_LINE)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            if not guided_enabled():
+                self.send_error(404)
+                return
             self._send_error_json("invalid_query", f"送信内容が不正です（{MAX_REQUEST_LINE}バイト以内）")
             return
         mode = payload.get("mode", "answer")
+        if mode == "assistant":
+            self._handle_assistant_search(session_id, payload)
+            return
+        if not guided_enabled():
+            self.send_error(404)
+            return
         if mode not in {"answer", "deep"}:
             self._send_error_json("invalid_mode", "検索モードが不正です")
             return

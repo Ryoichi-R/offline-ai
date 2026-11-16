@@ -14,7 +14,7 @@ def test_source_policy_excludes_secret_and_hidden_paths():
     assert not search.is_allowed_source_path("secrets.json")
     assert not search.is_allowed_source_path("secrets.yaml")
     assert not search.is_allowed_source_path(".env")
-    assert not search.is_allowed_source_path(".env.local")
+    assert not search.is_allowed_source_path(".env.test.json")
     assert not search.is_allowed_source_path(".hidden/doc.md")
     assert not search.is_allowed_source_path("keys/private.pem")
     assert search.is_allowed_source_path("rules/leave.md")

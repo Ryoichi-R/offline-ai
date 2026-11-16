@@ -289,6 +289,14 @@ body {
 .source-folder-controls input { flex: 1 1 280px; min-width: 0; padding: 9px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }
 .source-folder-current { margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
 .source-folder-note { margin: 8px 0 0; font-size: 13px; }
+.assistant-turn { border-top: 1px solid #ccd3db; padding: 16px 0; overflow-wrap: anywhere; }
+.assistant-turn h3 { margin: 0 0 12px; }
+.assistant-turn details { margin: 8px 0; }
+.assistant-turn details details { margin-left: 16px; }
+.assistant-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-meta, .assistant-hash { font-size: 0.9em; }
+.assistant-progress { white-space: pre-wrap; margin: 8px 0; }
+.assistant-outside { padding-left: 12px; border-left: 3px solid #9baabb; }
 </style>
 </head>
 <body>
@@ -334,6 +342,7 @@ body {
             <div class="search-controls">
             <select class="mode-select" id="searchModeSelect" aria-label="検索モード">
                 <option value="answer" selected>回答を作る</option>
+                <option value="assistant">アシスタント</option>
                 <option value="search">資料を探す</option>
                 <option value="deep">深掘り調査（最大30分）</option>
             </select>
@@ -352,6 +361,24 @@ body {
             </div>
             <p class="mode-hint" id="searchModeHint">回答を生成し、根拠を表示します。</p>
         </div>
+        <section id="assistantPanel" hidden aria-label="資料参照アシスタント">
+            <div class="result-actions">
+                <button class="btn btn-secondary" id="assistantNew" type="button">新しい会話</button>
+                <button class="btn btn-danger" id="assistantCancel" type="button" hidden>中止</button>
+                <button class="btn btn-secondary" id="assistantReconnect" type="button" hidden>再接続</button>
+                <button class="btn btn-secondary" id="assistantImport" type="button">保存した回答を開く</button>
+                <input id="assistantFile" type="file" accept=".md,text/markdown" hidden>
+            </div>
+            <p id="assistantStatus" role="status" class="status-msg"></p>
+            <div id="assistantProgress" class="assistant-progress" aria-live="polite"></div>
+            <details id="assistantThinking" class="thinking-panel" hidden>
+                <summary>思考</summary>
+                <pre id="assistantThinkingText" class="assistant-excerpt"></pre>
+            </details>
+            <div id="assistantTurns"></div>
+            <div id="assistantImported"></div>
+        </section>
+        <div id="legacyResults">
         <div id="searchStatus" class="status-msg" hidden></div>
         <div id="resultMetaSummary" class="result-meta-summary" hidden></div>
         <div id="searchBudget" class="budget-msg" hidden></div>
@@ -393,6 +420,7 @@ body {
             <span class="save-hint" id="saveMarkdownHint">質問・回答・根拠の抜粋が含まれます。</span>
         </div>
         <div class="result-area" id="searchResult"></div>
+        </div>
     </div>
 </div>
 
@@ -1155,6 +1183,8 @@ const ui = {
             saveMarkdownHint: document.getElementById("saveMarkdownHint"),
             searchResult: document.getElementById("searchResult"),
             pageCloseHint: document.getElementById("pageCloseHint"),
+            assistantPanel: document.getElementById("assistantPanel"),
+            legacyResults: document.getElementById("legacyResults"),
             guidedPanel: document.getElementById("guidedPanel"),
             guidedTitle: document.getElementById("guidedTitle"),
             guidedMessage: document.getElementById("guidedMessage"),
@@ -1168,12 +1198,14 @@ const ui = {
         };
 
         this.bindEvents();
+        assistantUI.bind();
         this.loadSourceFolder();
         this.updateSearchModeUI();
         pagePresence.start();
         this.pollHealth();
         this.restoreGuidedPanel();
         this.resumeActiveSearch();
+        assistantUI.restore();
     },
 
     // ページリロード直後、前回のsessionStorageに進行中の検索が残っていれば
@@ -1264,7 +1296,12 @@ const ui = {
         this.els.searchBtn.addEventListener("click", () => this.startSearch());
         this.els.cancelSearchBtn.addEventListener("click", () => this.cancelSearch());
         this.els.reconnectSearchBtn.addEventListener("click", () => this.resumeActiveSearch());
-        this.els.searchModeSelect.addEventListener("change", () => this.updateSearchModeUI());
+        this.els.searchModeSelect.addEventListener("change", () => {
+            try {
+                sessionStorage.setItem("offlineAiAssistantMode", this.els.searchModeSelect.value === "assistant" ? "1" : "0");
+            } catch {}
+            this.updateSearchModeUI();
+        });
         this.els.evidenceViewerCloseBtn.addEventListener("click", () => this.closeEvidenceViewer());
         this.els.saveMarkdownBtn.addEventListener("click", () => this.saveMarkdown());
         this.els.guidedSendBtn.addEventListener("click", () => this.sendGuidedText());
@@ -1288,7 +1325,7 @@ const ui = {
         const update = async () => {
             // 検索SSE購読中はポーリングを止め、Ollama呼び出しの競合を避ける
             // （検索完了後に onEnd から1回だけ再取得する）。
-            if (state.searching) {
+            if (state.searching || state.assistantBusy) {
                 this.scheduleHealthPoll();
                 return;
             }
@@ -1301,7 +1338,12 @@ const ui = {
             if (!state.timeoutSynced && Number.isFinite(h.searchTimeoutMin) && Number.isFinite(h.searchTimeoutMax)) {
                 this.els.searchTimeoutInput.min = String(h.searchTimeoutMin);
                 this.els.searchTimeoutInput.max = String(h.searchTimeoutMax);
-                if (!state.searching) this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
+                if (this.els.searchModeSelect.value !== "assistant" && !state.searching) {
+                    this.els.searchTimeoutInput.value = String(h.searchTimeoutDefault || h.searchTimeoutMin);
+                } else if (this.els.searchModeSelect.value === "assistant") {
+                    this.els.searchTimeoutInput.min = "300";
+                    this.els.searchTimeoutInput.max = "1800";
+                }
                 state.timeoutSynced = true;
             }
             if (Number.isFinite(h.deepSearchTimeoutMin) && Number.isFinite(h.deepSearchTimeoutMax)) {
@@ -1435,6 +1477,19 @@ const ui = {
 
     updateSearchModeUI() {
         const selected = this.els.searchModeSelect.value;
+        if (this.els.assistantPanel && this.els.legacyResults) {
+            this.els.assistantPanel.hidden = selected !== "assistant";
+            this.els.legacyResults.hidden = selected === "assistant";
+        }
+        if (selected === "assistant") {
+            assistantUI.controls();
+            this.els.searchTimeoutInput.min = "300";
+            this.els.searchTimeoutInput.max = "1800";
+            this.els.searchTimeoutInput.value = "600";
+            this.els.reasoningSelect.disabled = false;
+            this.els.searchModeHint.textContent = "資料を検索・読取し、同じ会話で質問を続けられます。";
+            return;
+        }
         const mode = ["answer", "search", "deep"].includes(selected) ? selected : "answer";
         const searchOnly = mode === "search";
         const deep = mode === "deep";
@@ -1460,6 +1515,10 @@ const ui = {
     },
 
     startSearch(resume = null) {
+        if (!resume && this.els.searchModeSelect.value === "assistant") {
+            assistantUI.send();
+            return;
+        }
         if (state.cancelPending || (state.searching && (!resume || !state.searchDisconnected))) return;
         // Invalidate old callbacks before aborting an earlier subscription.
         if (state.searchAbort) state.searchAbort.abort();
@@ -2264,6 +2323,442 @@ const ui = {
         }
     },
 
+};
+
+// Only the opaque conversation ID and mode preference survive a reload.
+const assistantUI = {
+    id: "",
+    turn: 1,
+    active: null,
+    busy: false,
+    turns: new Map(),
+
+    element(id) { return document.getElementById(id); },
+
+    async json(path, data) {
+        const options = data === undefined ? {} : {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data),
+        };
+        const response = await fetch(path, options);
+        const body = await response.json();
+        if (!response.ok) {
+            throw Object.assign(new Error(body.error?.message || "会話の通信に失敗しました。"),
+                { code: body.error?.code });
+        }
+        return body;
+    },
+
+    path() { return `/api/conversations/${encodeURIComponent(this.id)}`; },
+
+    status(message) { this.element("assistantStatus").textContent = message; },
+
+    setID(id) {
+        this.id = id;
+        try {
+            if (id) sessionStorage.setItem("offlineAiAssistantConversation", id);
+            else sessionStorage.removeItem("offlineAiAssistantConversation");
+        } catch {}
+    },
+
+    controls() {
+        const disabled = this.busy || Boolean(this.active);
+        state.assistantBusy = this.busy;
+        ui.els.searchModeSelect.disabled = disabled;
+        ui.els.searchBtn.disabled = disabled;
+        this.element("assistantNew").disabled = disabled;
+        this.element("assistantCancel").hidden = !this.active;
+        this.element("assistantReconnect").hidden = this.busy || !this.active;
+    },
+
+    async restore() {
+        let preferred = false;
+        try {
+            this.id = sessionStorage.getItem("offlineAiAssistantConversation") || "";
+            preferred = sessionStorage.getItem("offlineAiAssistantMode") === "1";
+        } catch {}
+        if (!preferred || state.searching) return;
+        ui.els.searchModeSelect.value = "assistant";
+        ui.updateSearchModeUI();
+        if (!this.id) return;
+        this.busy = true;
+        this.controls();
+        try {
+            await this.refresh();
+            if (this.active) await this.subscribe({ ...this.active, resume_only: true });
+        } catch (error) {
+            this.status(error.message);
+        } finally {
+            this.busy = false;
+            this.controls();
+        }
+    },
+
+    async newConversation() {
+        const next = await this.json("/api/conversations", {});
+        this.setID(next.conversationId);
+        this.turn = next.nextTurn;
+        this.active = null;
+        this.turns.clear();
+        this.element("assistantTurns").replaceChildren();
+        this.element("assistantImported").replaceChildren();
+        this.clearProgress();
+        this.status("");
+    },
+
+    async reset() {
+        if (this.busy || this.active) return;
+        this.busy = true;
+        this.controls();
+        try {
+            await this.newConversation();
+            ui.els.searchInput.focus();
+        } catch (error) {
+            this.status(error.message);
+        } finally {
+            this.busy = false;
+            this.controls();
+        }
+    },
+
+    async refresh() {
+        try {
+            const current = await this.json(this.path());
+            this.active = current.active;
+            this.turn = current.nextTurn;
+            for (const result of current.turns) this.showTurn(result);
+            return current;
+        } catch (error) {
+            if (error.code === "conversation_not_found") {
+                this.setID("");
+                this.active = null;
+                this.turns.clear();
+                this.element("assistantTurns").replaceChildren();
+            }
+            throw error;
+        }
+    },
+
+    clearProgress() {
+        this.element("assistantProgress").textContent = "";
+        this.element("assistantThinkingText").textContent = "";
+        this.element("assistantThinking").hidden = true;
+    },
+
+    async send() {
+        if (this.busy || this.active || state.searching) return;
+        const query = ui.els.searchInput.value.trim();
+        if (!query) return;
+        const timeout = Number(ui.els.searchTimeoutInput.value);
+        if (!Number.isInteger(timeout) || timeout < 300 || timeout > 1800) {
+            this.status("実行上限は300〜1,800秒です。");
+            return;
+        }
+        this.busy = true;
+        this.controls();
+        this.status("開始しています…");
+        try {
+            if (!this.id) await this.newConversation();
+            const requestId = crypto.randomUUID ? crypto.randomUUID()
+                : `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            await this.subscribe({ requestId, turn: this.turn, text: query,
+                reasoning: ui.els.reasoningSelect.value || "off", timeout_seconds: timeout });
+        } catch (error) {
+            this.status(error.message);
+        } finally {
+            this.busy = false;
+            this.controls();
+        }
+    },
+
+    async reconnect() {
+        if (this.busy || !this.id) return;
+        this.busy = true;
+        this.controls();
+        try {
+            await this.refresh();
+            if (this.active) await this.subscribe({ ...this.active, resume_only: true });
+            else this.status("");
+        } catch (error) {
+            this.status(error.message);
+        } finally {
+            this.busy = false;
+            this.controls();
+        }
+    },
+
+    async subscribe(payload) {
+        this.clearProgress();
+        const params = { mode: "assistant", conversationId: this.id, ...payload };
+        let response;
+        try {
+            response = await fetch("/api/search", {
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params),
+            });
+            if (!response.ok) {
+                const error = (await response.json()).error || {};
+                if (["job_not_found", "request_conflict"].includes(error.code)) await this.refresh();
+                if (error.code === "conversation_not_found") this.setID("");
+                if (error.code === "job_not_found" && !this.active) return;
+                throw Object.assign(new Error(error.message || "処理を開始できません。"), { responseError: true });
+            }
+            this.active = { requestId: payload.requestId, turn: payload.turn };
+            this.controls();
+            if (payload.text && ui.els.searchInput.value.trim() === payload.text) ui.els.searchInput.value = "";
+            this.status("処理中…");
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let finished = false;
+            let streamError = "";
+            for (;;) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                buffer += decoder.decode(chunk.value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    if (!line.startsWith("data: ")) continue;
+                    const event = JSON.parse(line.slice(6));
+                    if (event.type === "done") finished = true;
+                    else if (event.type === "error") streamError = event.message || "処理が中断しました。";
+                    else this.event(event);
+                }
+            }
+            await this.refresh();
+            this.clearProgress();
+            if (finished || !this.active) this.status(streamError);
+            else this.status(streamError || "接続が切れました。再接続できます。");
+        } catch (error) {
+            if (!error.responseError) {
+                try { await this.refresh(); } catch {}
+                if (this.active) {
+                    this.status("接続が切れました。再接続できます。");
+                    return;
+                }
+                if (this.turns.has(payload.turn)) {
+                    this.status("");
+                    this.clearProgress();
+                    return;
+                }
+            }
+            throw error;
+        }
+    },
+
+    event(event) {
+        if (event.type === "assistant_result") {
+            this.clearProgress();
+            this.showTurn(event.result);
+        }
+        if (event.type === "assistant_progress") this.element("assistantProgress").textContent = event.text;
+        if (event.type === "assistant_thinking") {
+            const text = this.element("assistantThinkingText");
+            this.element("assistantThinking").hidden = false;
+            text.textContent = (text.textContent + event.text).slice(-65536);
+        }
+        if (event.type === "assistant_tool") {
+            if (event.error) this.status(`${event.tool} ${event.detail || event.error}`);
+            else if (event.tool === "search_sources") this.status(`検索 ${event.query}（${event.results}件）`);
+            if (event.tool === "read_source") this.status(`原文を読取 ${event.path}`);
+        }
+    },
+
+    async cancel() {
+        if (!this.active) return;
+        const button = this.element("assistantCancel");
+        button.disabled = true;
+        try {
+            await this.json("/api/search/cancel", { request_id: this.active.requestId });
+            this.status("中止を受け付けました。");
+        } catch (error) {
+            this.status(error.message);
+        } finally {
+            button.disabled = false;
+        }
+    },
+
+    node(tag, text, className) {
+        const node = document.createElement(tag);
+        if (text) node.textContent = text;
+        if (className) node.className = className;
+        return node;
+    },
+
+    details(label) {
+        const panel = this.node("details");
+        panel.append(this.node("summary", label));
+        return panel;
+    },
+
+    showTurn(result) {
+        const record = this.render(result, false);
+        const existing = this.turns.get(result.turn);
+        if (existing) existing.replaceWith(record);
+        else this.element("assistantTurns").append(record);
+        this.turns.set(result.turn, record);
+    },
+
+    render(result, imported) {
+        const article = this.node("article", "", "assistant-turn");
+        const body = this.node("div", "", "result-area");
+        const answerLines = result.answer.split("\n");
+        const outsideLines = new Set(result.annotations.filter(note => note.code === "outside_sources").map(note => note.line));
+        if (outsideLines.size && outsideLines.size < answerLines.length) {
+            let lines = [];
+            let outside = false;
+            const flush = () => {
+                if (!lines.length) return;
+                const part = this.node("div", "", outside ? "assistant-outside" : "");
+                part.innerHTML = md.render(lines.join("\n"));
+                body.append(part);
+                lines = [];
+            };
+            for (const [index, line] of answerLines.entries()) {
+                const isOutside = outsideLines.has(index + 1) || (outside && !line.trim());
+                if (outside !== isOutside) flush();
+                outside = isOutside;
+                lines.push(line);
+            }
+            flush();
+        } else {
+            body.innerHTML = md.render(result.answer);
+            if (outsideLines.size) body.classList.add("assistant-outside");
+        }
+        const statuses = { completed: "完了", timeout: "時間切れ", cancelled: "中止",
+            model_error: "モデル応答エラー", output_limit: "生成上限", context_limit: "入力上限" };
+        article.append(this.node("h3", result.question), body,
+            this.node("p", `終了状態 ${statuses[result.status] || result.status}`, "assistant-meta"));
+        if (result.history_omitted) article.append(this.node("p", `モデルへの送信時に古いターン ${result.history_omitted} 件を省略しました。`));
+        const sources = this.details(`出典 ${result.sources.length}件`);
+        if (result.sources.length) {
+            for (const source of result.sources) sources.append(this.renderSource(source, result.turn, imported));
+            article.append(sources);
+        }
+        const notes = this.details("照合注記");
+        notes.append(this.node("p", "同じ表記があっても意味、条件、適用対象の正しさは保証されません。"));
+        const labels = {
+            outside_sources: "資料外の補足", citation_not_explicit: "出典の明示なし",
+            number_unattributable: "照合対象を特定できない", number_spelling_absent: "出典範囲に同表記なし",
+            unknown_citation: "出典不明", prior_sources_only: "今回の資料取得なし・過去の出典を参照",
+            no_source_reference: "資料を参照していない回答",
+        };
+        const list = this.node("ul");
+        for (const note of result.annotations) {
+            const text = [labels[note.code], note.line ? `回答の${note.line}行目` : "",
+                note.source_id, note.value].filter(Boolean).join(" / ");
+            list.append(this.node("li", text));
+            if (!note.line) article.append(this.node("p", text, "assistant-meta"));
+        }
+        notes.append(list);
+        article.append(notes);
+        if (result.trace.length) {
+            const trace = this.details("検索・読取の経過");
+            for (const event of result.trace) {
+                if (event.chat_call) {
+                    const args = JSON.stringify(event.arguments);
+                    const omitted = event.arguments_omitted ? "（一部引数省略）" : "";
+                    const outcome = event.error ? [event.error, event.detail].filter(Boolean).join(" / ")
+                        : event.tool === "search_sources" ? `${event.retrieval}、${event.results}件`
+                        : event.tool === "list_sources" ? `${event.results}件`
+                        : event.source_id || "完了";
+                    trace.append(this.node("p", `#${event.chat_call} ${event.tool} ${args}${omitted} → ${outcome}`));
+                } else {
+                    trace.append(this.node("p", event.tool === "search_sources"
+                        ? `検索 ${event.query}（${event.retrieval}、${event.results}件）`
+                        : `読取 ${event.path} [${event.source_id}]`));
+                }
+            }
+            article.append(trace);
+        }
+        if (!imported) {
+            const button = this.node("button", "Markdownで保存", "btn btn-secondary");
+            button.type = "button";
+            button.addEventListener("click", () => this.save(result.turn));
+            article.append(button);
+        }
+        return article;
+    },
+
+    renderSource(source, turn, imported) {
+        const details = this.details(`${source.citation} ${source.title}`);
+        const stateLabel = this.node("p");
+        const format = current => {
+            const verification = { matched: "取得時と同じ原文範囲", changed: "資料変更で失効",
+                missing: "資料が見つからない", unavailable: "原文を開けない",
+                excerpt_mismatch: "保存した抜粋と原文が一致しない", not_rechecked: "取得後の再照合未実施" };
+            stateLabel.textContent = [current.state === "read" ? "原文読取済み" : "検索抜粋のみ",
+                current.turn === turn ? "今回取得" : "過去ターンで取得", verification[current.verification]].join(" / ");
+        };
+        format(source);
+        details.append(stateLabel, this.node("p", source.path), this.node("p", `SHA-256 ${source.sha256}`, "assistant-hash"));
+        for (const [index, span] of source.spans.entries()) {
+            details.append(this.node("p", `${span.start_line}–${span.end_line}行（開始文字 ${span.start_char}、終了文字 ${span.end_char}）`),
+                this.node("pre", span.text, "assistant-excerpt"));
+            const view = this.node("pre", "", "assistant-excerpt");
+            view.hidden = true;
+            const button = this.node("button", "現行原文の前後を表示", "btn btn-secondary");
+            button.type = "button";
+            button.addEventListener("click", async () => {
+                view.hidden = false;
+                view.textContent = "照合中…";
+                try {
+                    const current = imported ? source : await this.json(`${this.path()}/sources/${source.id}`);
+                    format(current);
+                    const id = current.evidence?.find(record => record.span === index)?.id;
+                    if (!id) {
+                        view.textContent = stateLabel.textContent;
+                        return;
+                    }
+                    const excerpt = await api.viewEvidence(id);
+                    view.textContent = excerpt.lines.map(row => `${row.lineNumber}  ${row.text}`).join("\n");
+                } catch (error) {
+                    view.textContent = error.message;
+                }
+            });
+            details.append(button, view);
+        }
+        return details;
+    },
+
+    async save(turn) {
+        try {
+            const { markdown } = await this.json(`${this.path()}/turns/${turn}/markdown`);
+            const link = this.node("a");
+            const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
+            link.href = url;
+            link.download = `offline-ai-assistant-${turn}.md`;
+            document.body.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 0);
+        } catch (error) {
+            this.status(error.message);
+        }
+    },
+
+    async load(file) {
+        if (!file) return;
+        try {
+            if (file.size > 5 * 1024 * 1024) throw new Error("保存回答は5 MiB以内にしてください。");
+            const { result } = await this.json("/api/conversations/import", { markdown: await file.text() });
+            this.element("assistantImported").replaceChildren(
+                this.node("h3", "読み込んだ回答"), this.render(result, true));
+        } catch (error) {
+            this.status(error.message);
+        }
+    },
+
+    bind() {
+        this.element("assistantNew").addEventListener("click", () => this.reset());
+        this.element("assistantCancel").addEventListener("click", () => this.cancel());
+        this.element("assistantReconnect").addEventListener("click", () => this.reconnect());
+        const file = this.element("assistantFile");
+        this.element("assistantImport").addEventListener("click", () => file.click());
+        file.addEventListener("change", () => {
+            this.load(file.files[0]);
+            file.value = "";
+        });
+    },
 };
 
 // --- init ---

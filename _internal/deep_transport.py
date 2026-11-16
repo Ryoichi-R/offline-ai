@@ -52,7 +52,7 @@ def _encode_success(payload: dict, value: object, *, max_bytes: int = WORKER_OUT
     return encoded
 
 
-def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None):
+def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None, on_update=None):
     """Cancel even while connecting or waiting for HTTP headers; reap before return."""
     if cancel_check:
         cancel_check()
@@ -62,6 +62,8 @@ def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None):
     worker_payload = dict(payload)
     if touch is not None:
         worker_payload['_worker_progress'] = True
+    if on_update is not None:
+        worker_payload["_assistant_updates"] = True
     worker_payload["_worker_deadline_monotonic"] = deadline
     encoded = json.dumps(worker_payload, ensure_ascii=False).encode("utf-8")
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -69,12 +71,12 @@ def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None):
         [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--worker"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE if touch is not None else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if touch is not None or on_update is not None else subprocess.DEVNULL,
         creationflags=flags,
     )
     finished = threading.Event()
     progress = threading.Event()
-    progress_stream = process.stderr if touch is not None else None
+    progress_stream = process.stderr if touch is not None or on_update is not None else None
     # communicate owns stdin/stdout; the progress reader alone owns stderr.
     if progress_stream is not None:
         process.stderr = None
@@ -82,8 +84,13 @@ def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None):
 
     def receive_progress():
         try:
-            while progress_stream.read(1):
-                progress.set()
+            if on_update is None:
+                while progress_stream.read(1):
+                    progress.set()
+            else:
+                for raw in progress_stream:
+                    kind, value = json.loads(raw)
+                    on_update(kind, value)
         finally:
             progress_stream.close()
 
@@ -118,6 +125,8 @@ def run_worker(payload: dict, *, timeout: float, cancel_check=None, touch=None):
                 raise TimeoutError("deep worker deadline")
             if finished.wait(timeout=min(0.05, remaining)):
                 break
+        if on_update is not None:
+            progress_thread.join()
         if "error" in response:
             raise DeepWorkerError() from response["error"]
         output = response["output"]
@@ -287,6 +296,19 @@ def _execute(payload):
             "schema_version": CANDIDATE_MANY_RESPONSE_SCHEMA_VERSION,
             "responses": [strip_excluded_scores(rank(query)) for query in queries],
         }
+    if payload["operation"] in {"assistant_chat", "assistant_retrieve"}:
+        from assistant import ModelStreamError, run_worker_operation
+
+        def notify(kind, value):
+            if payload.get("_assistant_updates"):
+                line = json.dumps([kind, value], ensure_ascii=False).encode("utf-8")
+                sys.stderr.buffer.write(line + b"\n")
+                sys.stderr.buffer.flush()
+
+        try:
+            return run_worker_operation(payload, notify)
+        except ModelStreamError as exc:
+            raise DeepWorkerError(code="model_stream_incomplete") from exc
     if payload["operation"] != "chat":
         raise ValueError("unsupported operation")
     import urllib.error

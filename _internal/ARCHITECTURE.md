@@ -1,8 +1,18 @@
 # offline-ai 内部アーキテクチャ
 
+## 資料参照アシスタント（0.3.0）
+
+設計正本は[資料参照アシスタント計画](../../workspace-control/plans/offline-ai-source-assistant-plan.md)。
+`assistant.py` は Ollama の完全なストリーム応答を受け取って道具要求を順に実行する。応答が途中で切れた場合は要求を実行しない。調査と最終生成の期限を分け、8道具・10チャット・コンテキスト32,768（生成予約4,096）に制限する。共有Ollamaへの接続はリクエストが所有するPython子プロセスを終了することで中止する。思考デルタは実行中の画面と短期ジョブの再購読バッファに限る。
+
+`assistant_tools.py` は既存の検索専用経路と見出しツリーを使う。読取・検索で実際に返した原文範囲、ハッシュ、取得ターンを出典番号へ固定する。行番号は1始まり、文字位置は0始まりで終了を含まない。検索時に索引が利用できない場合はキーワード検索を使う。出典番号は `[S3]` と `【S3】` を受け付ける。ハッシュ・実返却範囲・文字列表記を確認し、回答本文はそのまま表示する。
+
+`assistant_sessions.py` は認証セッションと資料世代に結び付けたメモリ上の会話を管理する。完了したターンはジョブの60秒の保持期限から独立して保存し、認証済みの `GET /api/conversations/{id}` で復元できる。実行中の再購読は `POST /api/search` の `resume_only` を使う。Markdown保存は確定したターンから生成し、読込時は版付き出典データの範囲・SHA-256・抜粋を再照合する。会話の既定切替は実機受入後に行う。
+
+
 ## 確認案内と追質問（2026-11-08、`OFFLINE_AI_GUIDED_FOLLOW_UP=1`、既定は無効）
 
-設計正本は[確認質問と段階的な深掘りのプラン](../../plans/offline-ai-guided-follow-up-plan.md)。`guided_follow_up.py`はモデルを呼ばない決定的な部分（資料の照合結果からの振り分け、原文からの概要・選択肢の抽出、追質問の対象と論点の解決、確認情報の期限・件数・直列化）を持つ。資料の照合（表題の別表記と括弧内の正式表題・冒頭の文書番号で確定、発出者＋主題・主題語で候補のみ）と主要範囲の選定は`source_structure.py`、質問範囲の判定（overview/specific/broad）は`answer_policy.classify_guided_scope`（v2の`_ASPECT_CUES`とは別表）にある。Webは`run_search`がモデル検出前に確認段階を処理し、確認結果は`clarification`イベントと`done`（`stage: "clarify"`）で返す。続きは`POST /api/search`、パネル復元は`GET /api/confirmation`。固定した資料は`fixed_document`として通常回答（`run_retrieval_pipeline`）と深掘り（`run_deep_research`）へ渡し、根拠・候補をその資料と焦点範囲に限る。深掘り枠は`JobTable.acquire_deep_slot`で実調査の直前に取る。
+設計正本は[確認質問と段階的な深掘りのプラン](../../workspace-control/plans/old/20261112_offline-ai-guided-follow-up-plan.md)。`guided_follow_up.py`はモデルを呼ばない決定的な部分（資料の照合結果からの振り分け、原文からの概要・選択肢の抽出、追質問の対象と論点の解決、確認情報の期限・件数・直列化）を持つ。資料の照合（表題の別表記と括弧内の正式表題・冒頭の文書番号で確定、発出者＋主題・主題語で候補のみ）と主要範囲の選定は`source_structure.py`、質問範囲の判定（overview/specific/broad）は`answer_policy.classify_guided_scope`（v2の`_ASPECT_CUES`とは別表）にある。Webは`run_search`がモデル検出前に確認段階を処理し、確認結果は`clarification`イベントと`done`（`stage: "clarify"`）で返す。続きは`POST /api/search`、パネル復元は`GET /api/confirmation`。固定した資料は`fixed_document`として通常回答（`run_retrieval_pipeline`）と深掘り（`run_deep_research`）へ渡し、根拠・候補をその資料と焦点範囲に限る。深掘り枠は`JobTable.acquire_deep_slot`で実調査の直前に取る。
 
 段階3（既定で有効）: 付随範囲の共通判定は`source_structure.classify_range`（宛先等の冒頭部・YAML前付け・空欄様式・単独の適用日や照会先）。deepは付随範囲をモデル呼び出しなしで主要範囲の後に回し、根拠枠の`DEEP_ANCILLARY_EVIDENCE_SHARE`までだけ入れる。通常回答は`search._demote_ancillary`で後ろへ回す。分割ファイルは`group_split_documents`で1資料にまとめ、固定資料は`paths`（部分のパスとハッシュ）と`[開始行, 終了行, パス]`の焦点範囲を持つ。抜粋の複数区間は`snippetSegments`。
 
@@ -11,7 +21,7 @@
 
 ## 回答方針v2（2026-10-01、移行中。既定はlegacy）
 
-質問への適合・根拠選択・文章品質を改める回答方針。`OFFLINE_AI_ANSWER_POLICY_VERSION=v2`（未指定・`legacy`は従来経路）で有効になり、方針は**要求ごとに一度だけ解決**して検索・選別・回答の全経路を固定する。v2の失敗時にlegacyへ無通知でfallbackしない。legacyは品質既知不合格であり、合格な代替として扱わない。設計正本は[回答品質の再設計プラン](../../plans/offline-ai-answer-quality-redesign-plan.md)。
+質問への適合・根拠選択・文章品質を改める回答方針。`OFFLINE_AI_ANSWER_POLICY_VERSION=v2`（未指定・`legacy`は従来経路）で有効になり、方針は**要求ごとに一度だけ解決**して検索・選別・回答の全経路を固定する。v2の失敗時にlegacyへ無通知でfallbackしない。legacyは品質既知不合格であり、合格な代替として扱わない。設計正本は[回答品質の再設計プラン](../../workspace-control/plans/old/20261003_offline-ai-answer-quality-redesign-plan.md)。
 
 - **部品の分担**: `answer_policy.py`はLLMを呼ばない決定的な部分（質問意図、根拠の役割判定、AnswerDraftの検証、G1/G3/G4の構造検査、表示・fallback、時間配分・呼出台帳）。`answer_pipeline.py`は呼出関数を注入されるLLM段階（意図計画、草稿生成、G2意味照合、G3/G4評価、再生成・再探索）。通常回答（`search.run_answer_v2`）とdeep（`deep_research`）は輸送経路だけが違い、意図・根拠役割・品質定義は共通。
 - **質問意図**: `AnswerIntent`が対象・求める情報・粒度（overview/practical/detail）・必須観点を持つ。既定はoverviewで、実務・詳細は質問文に明示された語（または質問文から逐語で示せる根拠句）があるときだけ上げる。通常は検索計画の同じ1回のLLM要求へ`answer_intent`を含め、deepは入口で最大1回だけ意図計画を呼ぶ。`OFFLINE_AI_AGENTIC_LITE=false`・計画失敗・時間不足では明示要求だけの保守的な意図へ戻る。

@@ -6720,9 +6720,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=("answer", "search", "deep"),
+        choices=("answer", "search", "deep", "assistant"),
         default="answer",
-        help="answer=回答、search=資料一覧、deep=節単位の深掘り調査",
+        help="answer=回答、search=資料一覧、deep=深掘り、assistant=資料参照アシスタント",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -6732,9 +6732,17 @@ def main():
         default=None,
         help="検索全体の時間上限（deepは300〜1800秒、それ以外は300〜600秒）",
     )
+    parser.add_argument(
+        "--interactive", action="store_true", help="assistantモードで質問を続ける"
+    )
     args = parser.parse_args()
+    if args.interactive and args.mode != "assistant":
+        parser.error("--interactive requires --mode assistant")
 
-    query = resolve_query(query_file=args.query_file, query_positional=args.query)
+    query = (
+        "" if args.interactive and not args.query_file and not args.query
+        else resolve_query(query_file=args.query_file, query_positional=args.query)
+    )
     selection = resolve_model_selection(args.model, MODEL_CONFIG)
     selected_model = selection.model
     if sys.platform != "darwin" and selection.source == "model-file":
@@ -6742,7 +6750,7 @@ def main():
         selected_model = detect_model()
     reasoning = _resolve_reasoning(args.reasoning)
     try:
-        policy = _answer_policy.resolve_policy_version()
+        policy = None if args.mode == "assistant" else _answer_policy.resolve_policy_version()
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         raise SystemExit(2) from None
@@ -6760,6 +6768,20 @@ def main():
         except (OSError, TimeoutError, urllib.error.URLError, ModelConfigurationError, json.JSONDecodeError) as exc:
             print(f"[ERROR] 選択モデルをdigestまで検証できません: {type(exc).__name__}", file=sys.stderr)
             raise SystemExit(2) from None
+
+    if args.mode == "assistant":
+        from assistant import DEFAULT_SECONDS, interactive_cli, validate_timeout
+
+        try:
+            seconds = validate_timeout(
+                DEFAULT_SECONDS if args.timeout_seconds is None else args.timeout_seconds
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        raise SystemExit(interactive_cli(
+            query, root=SKILL_SOURCE_DIR, model=selected_model, reasoning=reasoning,
+            timeout=seconds, interactive=args.interactive, show_thinking=args.show_thinking,
+        ))
 
     if args.mode == "deep":
         from deep_research import (
