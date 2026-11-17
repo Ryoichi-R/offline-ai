@@ -310,7 +310,13 @@ def test_page_presence_api_contract(http_server, monkeypatch):
 
     assert call("POST", "/api/page/heartbeat", heartbeat, auth=False)[0] == 403
     assert call("POST", "/api/page/heartbeat", heartbeat, origin="http://evil.example")[0] == 403
-    for body in ('{"page_id": "bad id"}', "{}", "[]", "{broken", '{"page_id": "page-aaaaaaaa", "visible": "yes"}'):
+    for body in (
+        '{"page_id": "bad id"}',
+        "{}",
+        "[]",
+        "{broken",
+        '{"page_id": "page-aaaaaaaa", "visible": "yes"}',
+    ):
         status, payload = call("POST", "/api/page/heartbeat", body)
         assert status == 400 and payload["error"]["code"] == "invalid_query"
 

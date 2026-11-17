@@ -18,7 +18,12 @@ import search
 from deep_fakes import patch_retrieval
 
 
-VERDICT = {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+VERDICT = {
+    "supported": True,
+    "contradictions": [],
+    "missing_conditions": [],
+    "unsupported_claims": [],
+}
 
 
 def _model(name, system, user, **kwargs):
@@ -26,7 +31,13 @@ def _model(name, system, user, **kwargs):
         return dict(VERDICT)
     if system == deep_research.DEEP_GAPS_SYSTEM:
         return {"queries": [], "unresolved": []}
-    return {"subject": "対象", "scope": "範囲", "conditions": ["対象である"], "exceptions": [], "references": []}
+    return {
+        "subject": "対象",
+        "scope": "範囲",
+        "conditions": ["対象である"],
+        "exceptions": [],
+        "references": [],
+    }
 
 
 def _synthetic_chunks(tmp_path):
@@ -65,20 +76,32 @@ def test_real_worker_retrieve_many_matches_single_retrieve_per_query(tmp_path):
     for batched, single in zip(many, singles):
         assert batched["selected"] == single["selected"]
         assert batched["counts"] == single["counts"]
-        assert [e["chunk_id"] for e in batched["excluded"]] == [e["chunk_id"] for e in single["excluded"]]
+        assert [e["chunk_id"] for e in batched["excluded"]] == [
+            e["chunk_id"] for e in single["excluded"]
+        ]
 
 
 def test_batched_excluded_references_carry_no_scores_but_stay_valid():
     ranked = [
-        {"path": "a.md", "chunk_id": f"a.md#{i}", "start_line": i + 1, "end_line": i + 1,
-         "source_sha256": "a" * 64, "rrf_score": 1 / (i + 1), "keyword_score": 0.5}
+        {
+            "path": "a.md",
+            "chunk_id": f"a.md#{i}",
+            "start_line": i + 1,
+            "end_line": i + 1,
+            "source_sha256": "a" * 64,
+            "rrf_score": 1 / (i + 1),
+            "keyword_score": 0.5,
+        }
         for i in range(12)
     ]
     response = selection.select_candidates(ranked, max_per_file=8)
     stripped = selection.strip_excluded_scores(response)
 
     assert len(stripped["excluded"]) == 4
-    assert all(not set(ref) & {"score", "keyword_score", "embedding_score", "rrf_score"} for ref in stripped["excluded"])
+    assert all(
+        not set(ref) & {"score", "keyword_score", "embedding_score", "rrf_score"}
+        for ref in stripped["excluded"]
+    )
     assert stripped["selected"] == response["selected"]
     assert selection.validate_response(stripped) is stripped
     assert len(json.dumps(stripped)) < len(json.dumps(response))
@@ -95,7 +118,9 @@ def test_real_worker_retrieve_many_rejects_invalid_queries(queries):
 
 def test_retrieve_many_oversize_output_is_a_candidate_transfer_limit():
     with pytest.raises(deep_transport.CandidateTransferLimitError):
-        deep_transport._encode_success({"operation": "retrieve_many"}, {"value": "x" * 100}, max_bytes=64)
+        deep_transport._encode_success(
+            {"operation": "retrieve_many"}, {"value": "x" * 100}, max_bytes=64
+        )
 
 
 @pytest.mark.parametrize(
@@ -174,14 +199,18 @@ def test_round_does_not_hide_other_worker_failures_behind_the_fallback(monkeypat
 def test_run_deep_research_with_the_real_batched_worker(tmp_path, monkeypatch):
     root, _ = _synthetic_chunks(tmp_path)
     monkeypatch.setattr(deep_research, "_call_ollama_json", _model)
-    monkeypatch.setattr(deep_research, "_call_ollama_text", lambda *a, **k: "委員会の審査案件は次のとおり。[E1]")
+    monkeypatch.setattr(
+        deep_research, "_call_ollama_text", lambda *a, **k: "委員会の審査案件は次のとおり。[E1]"
+    )
 
     result = deep_research.run_deep_research(
         "公共調達委員会の審査案件", model="fake", source_root=root, timeout_seconds=300
     )
 
     assert result.evidence
-    assert len(result.diagnostics["retrieval_counts"]) == len(deep_research._initial_viewpoints("公共調達委員会の審査案件"))
+    assert len(result.diagnostics["retrieval_counts"]) == len(
+        deep_research._initial_viewpoints("公共調達委員会の審査案件")
+    )
 
 
 # --- reading order: documents by summed relevance ---------------------------------
@@ -196,9 +225,17 @@ def test_documents_are_ordered_by_summed_relevance_not_first_appearance():
     second = [_ref("core.md", 20), _ref("core.md", 10), _ref("noise-2.md", 1)]
     heading = {"path": "core.md", "start_line": 30, "end_line": 31}
 
-    ordered = list(deep_research._order_by_document_relevance([first, second], {"core.md": [heading]}))
+    ordered = list(
+        deep_research._order_by_document_relevance([first, second], {"core.md": [heading]})
+    )
 
-    assert [key[0] for key in ordered] == ["core.md", "core.md", "core.md", "noise-1.md", "noise-2.md"]
+    assert [key[0] for key in ordered] == [
+        "core.md",
+        "core.md",
+        "core.md",
+        "noise-1.md",
+        "noise-2.md",
+    ]
     # Inside a document: summed candidate score (line 20: 1/63+1/61 > line 10: 1/62+1/63);
     # heading-derived candidates follow the ranked ones.
     assert ordered[:3] == [("core.md", 20, 20), ("core.md", 10, 10), ("core.md", 30, 31)]
@@ -213,11 +250,15 @@ def test_equal_scores_keep_first_seen_order():
     assert [key[0] for key in ordered] == ["b.md", "a.md"]
 
 
-def test_core_document_is_read_even_if_five_other_documents_rank_first_in_one_viewpoint(tmp_path, monkeypatch):
+def test_core_document_is_read_even_if_five_other_documents_rank_first_in_one_viewpoint(
+    tmp_path, monkeypatch
+):
     root = tmp_path / "skill-source"
     root.mkdir()
     for index in range(1, 6):
-        (root / f"noise-{index}.md").write_text(f"# 無関係{index}\n公共調達の一般論。\n", encoding="utf-8")
+        (root / f"noise-{index}.md").write_text(
+            f"# 無関係{index}\n公共調達の一般論。\n", encoding="utf-8"
+        )
     (root / "core.md").write_text(
         "# 設置要綱\n## 審査案件\n対象である。\n## 除外\n対象としない。\n## 審査時期\n事前に審査する。\n",
         encoding="utf-8",
@@ -225,7 +266,9 @@ def test_core_document_is_read_even_if_five_other_documents_rank_first_in_one_vi
     chunks = search.build_source_chunks(root)
     by_path = {}
     for chunk in chunks:
-        by_path.setdefault(chunk["path"], []).append({**chunk, "source_sha256": chunk["file_sha256"]})
+        by_path.setdefault(chunk["path"], []).append(
+            {**chunk, "source_sha256": chunk["file_sha256"]}
+        )
     noise = [by_path[f"noise-{i}.md"][0] for i in range(1, 6)]
     core = [c for c in by_path["core.md"] if c.get("heading") in {"審査案件", "除外", "審査時期"}]
     assert len(core) == 3
@@ -241,7 +284,9 @@ def test_core_document_is_read_even_if_five_other_documents_rank_first_in_one_vi
     monkeypatch.setattr(deep_research, "_call_ollama_json", _model)
     monkeypatch.setattr(deep_research, "_call_ollama_text", lambda *a, **k: "対象である。[E1]")
 
-    result = deep_research.run_deep_research("審査案件", model="fake", source_root=root, timeout_seconds=300)
+    result = deep_research.run_deep_research(
+        "審査案件", model="fake", source_root=root, timeout_seconds=300
+    )
 
     read_paths = {e["path"] for e in result.evidence}
     assert "core.md" in read_paths

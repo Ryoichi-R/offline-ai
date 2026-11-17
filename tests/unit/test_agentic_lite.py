@@ -199,7 +199,10 @@ def test_confidence_content_support_rule_applies_with_must_find_terms():
 
 
 def test_query_content_terms_skip_interrogatives_and_generic_question_words():
-    assert search._query_content_terms("宿泊費の上限を超えるときに必要な手続きは何ですか") == ["宿泊費", "上限"]
+    assert search._query_content_terms("宿泊費の上限を超えるときに必要な手続きは何ですか") == [
+        "宿泊費",
+        "上限",
+    ]
     assert search._query_content_terms("復元作業の担当人数は何名ですか") == ["復元作業", "担当人数"]
 
 
@@ -229,8 +232,15 @@ def test_query_content_support_ignores_expanded_items_and_unscored_matches():
         }
     ]
     assert search._lacks_query_content_support(query, matches) is True
-    assert search._lacks_query_content_support(query, _confidence_matches("keyword+embedding")) is False
-    assert search._query_content_terms("ノートPCの貸与期間を教えてください") == ["ノート", "pc", "貸与期間"]
+    assert (
+        search._lacks_query_content_support(query, _confidence_matches("keyword+embedding"))
+        is False
+    )
+    assert search._query_content_terms("ノートPCの貸与期間を教えてください") == [
+        "ノート",
+        "pc",
+        "貸与期間",
+    ]
 
 
 def test_relevance_support_rejects_weak_embedding_only_near_miss():
@@ -436,5 +446,10 @@ def test_constraint_conflict_ignores_anchors_spanning_particles():
     )
     assert search._has_explicit_constraint_conflict(
         "海外出張の日当はいくらですか",
-        [{"heading": "国内出張旅費規程", "snippet": "海外出張は本規程の対象外とし、別途定める規程による。"}],
+        [
+            {
+                "heading": "国内出張旅費規程",
+                "snippet": "海外出張は本規程の対象外とし、別途定める規程による。",
+            }
+        ],
     )

@@ -1512,7 +1512,8 @@ def test_linked_exception_is_rendered_from_verified_read_paragraphs(
 
         def after_update(target, check):
             path = tmp_path / law
-            path.write_text(path.read_text() + "追記\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as source_file:
+                source_file.write("追記\n")
             return read_linked(target, check)
 
         monkeypatch.setattr(tools, "read_linked_target", after_update)
@@ -1543,7 +1544,8 @@ def test_linked_exception_is_rendered_from_verified_read_paragraphs(
             assert [(row["path"], row.get("referenced_from")) for row in results] == [(rule, None)]
         if origin_mode == "changed" and len(calls) == 2:
             path = tmp_path / rule
-            path.write_text(path.read_text() + "追記\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as source_file:
+                source_file.write("追記\n")
         return next(responses)
 
     result = assistant.run_turn(
@@ -1597,7 +1599,8 @@ def test_scoped_exception_quotes_scope_and_complete_list(tmp_path, monkeypatch, 
 
         def after_update(source, number, check):
             path = tmp_path / name
-            path.write_text(path.read_text() + "更新\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as source_file:
+                source_file.write("更新\n")
             return original(source, number, check)
 
         monkeypatch.setattr(tools, "read_preceding_scope", after_update)

@@ -260,7 +260,9 @@ def test_score_question_line_overlap_is_zero_when_range_misses():
 def test_score_question_require_expected_lines_needs_facts_in_overlapping_excerpt():
     """行範囲が重なっていても、必要事項が最終抜粋から消えていればFAILにする。"""
     question = _question(require_expected_lines=True, required_facts=("3,000円",))
-    truncated = _outcome([{"path": "a/b.md", "start_line": 12, "end_line": 13, "snippet": "日当は"}])
+    truncated = _outcome(
+        [{"path": "a/b.md", "start_line": 12, "end_line": 13, "snippet": "日当は"}]
+    )
     retained = _outcome(
         [{"path": "a/b.md", "start_line": 12, "end_line": 18, "snippet": "日当は3,000円"}]
     )
@@ -830,8 +832,20 @@ def test_parse_spec_validates_expected_expansion_and_holdout():
 def test_score_question_reports_candidate_recall_and_irrelevant_expansion():
     trace = [{"candidates": [{"path": "a/b.md", "start_line": 1, "end_line": 2}]}]
     matches = [
-        {"path": "a/b.md", "start_line": 12, "end_line": 18, "snippet": "本文", "source": "expanded"},
-        {"path": "a/b.md", "start_line": 40, "end_line": 45, "snippet": "別節", "source": "expanded"},
+        {
+            "path": "a/b.md",
+            "start_line": 12,
+            "end_line": 18,
+            "snippet": "本文",
+            "source": "expanded",
+        },
+        {
+            "path": "a/b.md",
+            "start_line": 40,
+            "end_line": 45,
+            "snippet": "別節",
+            "source": "expanded",
+        },
         {"path": "c.md", "start_line": 1, "end_line": 2, "snippet": "別資料", "source": "expanded"},
     ]
     score = harness.score_question(_question(), _outcome(matches, trace=trace))
@@ -1006,7 +1020,9 @@ def test_answer_layer_probe_normalizes_forbidden_facts():
 
 def test_answer_quality_probe_is_not_measured_without_model_or_facts():
     outcome = _outcome([])
-    no_model = harness.measure_answer_quality_probe(_answerable_question(), outcome, chat_model=None)
+    no_model = harness.measure_answer_quality_probe(
+        _answerable_question(), outcome, chat_model=None
+    )
     no_facts = harness.measure_answer_quality_probe(
         _answerable_question(required_facts=()), outcome, chat_model="chat"
     )
@@ -1091,7 +1107,9 @@ def test_shipped_spec_keyword_route_meets_expansion_scenarios(monkeypatch):
         for q in targets
     ]
     assert all(s.passed for s in scores), [s.question_id for s in scores if not s.passed]
-    assert all(s.evidence_status != "sufficient" for s in scores if s.question_id in {"Q14", "Q15", "Q16"})
+    assert all(
+        s.evidence_status != "sufficient" for s in scores if s.question_id in {"Q14", "Q15", "Q16"}
+    )
 
 
 def test_run_eval_markdown_includes_quality_and_comparison_sections():

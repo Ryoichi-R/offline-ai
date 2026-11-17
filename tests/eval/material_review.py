@@ -85,9 +85,7 @@ def _quality_section(quality: dict) -> list[str]:
 
 
 def _json_bytes(value: object) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode()
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
 
 
 def _literal(text: str) -> str:
@@ -119,11 +117,7 @@ def _verify_evidence(root: Path, entry: dict) -> None:
         raise ValueError("source changed")
     lines = data.decode("utf-8", errors="replace").splitlines()
     first, last = entry.get("start_line"), entry.get("end_line")
-    if (
-        type(first) is not int
-        or type(last) is not int
-        or not 1 <= first <= last <= len(lines)
-    ):
+    if type(first) is not int or type(last) is not int or not 1 <= first <= last <= len(lines):
         raise ValueError("invalid evidence range")
     text = "\n".join(lines[first - 1 : last])
     start, end = entry.get("char_start"), entry.get("char_end")
@@ -193,7 +187,11 @@ def export_review_bundle(
         "## 未確認事項\n",
         _literal("\n".join(result.get("unconfirmed", [])) or "なし"),
         f"未知の引用ID: {len(unknown_citations)}件\n",
-        *(_quality_section(result["answer_quality"]) if isinstance(result.get("answer_quality"), dict) and result["answer_quality"] else []),
+        *(
+            _quality_section(result["answer_quality"])
+            if isinstance(result.get("answer_quality"), dict) and result["answer_quality"]
+            else []
+        ),
         "## 引用原文（保存時に照合済み）\n",
     ]
     for entry in evidence:

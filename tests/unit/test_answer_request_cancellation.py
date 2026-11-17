@@ -69,9 +69,13 @@ def test_json_call_stops_and_reaps_its_worker_without_waiting_for_model_output(
     def call():
         try:
             search.chat_json_stream(
-                "gpt-oss:120b", "Return JSON.", "A synthetic question.",
+                "gpt-oss:120b",
+                "Return JSON.",
+                "A synthetic question.",
                 timeout=0.8 if stop_kind == "deadline" else 30,
-                reasoning="off", cancel_check=check, touch=touch,
+                reasoning="off",
+                cancel_check=check,
+                touch=touch,
             )
         except Exception as exc:
             errors.append(exc)
@@ -87,8 +91,10 @@ def test_json_call_stops_and_reaps_its_worker_without_waiting_for_model_output(
         assert not worker.is_alive()
         assert time.monotonic() - started < 2
         assert len(errors) == 1
-        expected = Cancelled if stop_kind == "cancel" else (
-            web_services.CancelledError if stop_kind == "stall" else TimeoutError
+        expected = (
+            Cancelled
+            if stop_kind == "cancel"
+            else (web_services.CancelledError if stop_kind == "stall" else TimeoutError)
         )
         assert isinstance(errors[0], expected)
         if stop_kind == "stall":
@@ -119,32 +125,45 @@ def test_json_call_checks_cancellation_before_starting_a_process(monkeypatch):
 
 def test_legacy_keyword_extraction_propagates_cancellation_and_preserves_reasoning(monkeypatch):
     entered = []
+
     def run(payload, **kwargs):
         entered.append(payload)
         raise Cancelled()
+
     monkeypatch.setattr(deep_transport, "run_worker", run)
+
     def check():
         if entered:
             raise Cancelled()
+
     monkeypatch.setattr(search, "_agentic_lite_enabled", lambda: False)
     with pytest.raises(Cancelled):
-        search.create_search_plan("共用機材の貸付条件", "gpt-oss:120b", reasoning="off", cancel_check=check)
-    assert entered[0]["body"]["think"] == search.resolve_model_reasoning("gpt-oss:120b", "off")["think"]
+        search.create_search_plan(
+            "共用機材の貸付条件", "gpt-oss:120b", reasoning="off", cancel_check=check
+        )
+    assert (
+        entered[0]["body"]["think"]
+        == search.resolve_model_reasoning("gpt-oss:120b", "off")["think"]
+    )
     assert entered[0]["body"]["stream"] is False
     assert entered[0]["timeout"] > 0
 
 
 def test_cancellable_search_plan_keeps_the_original_model_request_options(monkeypatch):
-    observed=[]
-    def run(payload,**kwargs):
+    observed = []
+
+    def run(payload, **kwargs):
         observed.append(payload)
         return '{"keywords":["研修"],"search_queries":["研修申請"],"must_find_terms":[]}'
-    monkeypatch.setattr(deep_transport,"run_worker",run)
-    monkeypatch.setattr(search,"_agentic_lite_enabled",lambda:True)
-    result=search.create_search_plan("研修申請", "gpt-oss:120b", reasoning="off", timeout=12, cancel_check=lambda:None)
-    body=observed[0]["body"]
+
+    monkeypatch.setattr(deep_transport, "run_worker", run)
+    monkeypatch.setattr(search, "_agentic_lite_enabled", lambda: True)
+    result = search.create_search_plan(
+        "研修申請", "gpt-oss:120b", reasoning="off", timeout=12, cancel_check=lambda: None
+    )
+    body = observed[0]["body"]
     assert body["stream"] is False
-    assert body["options"]==search.build_chat_options(temperature=0)
-    assert body["think"]==search.resolve_model_reasoning("gpt-oss:120b","off")["think"]
-    assert observed[0]["timeout"]==12
-    assert result["keywords"]==["研修"]
+    assert body["options"] == search.build_chat_options(temperature=0)
+    assert body["think"] == search.resolve_model_reasoning("gpt-oss:120b", "off")["think"]
+    assert observed[0]["timeout"] == 12
+    assert result["keywords"] == ["研修"]

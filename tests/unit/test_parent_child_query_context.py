@@ -86,9 +86,7 @@ def _context(queries_vectors, embed_model="m"):
 
 
 def test_max_similarity_picks_best_among_queries():
-    index = search._EmbedIndex(
-        chunk_ids=["c1"], entries=[{}], vectors=[[1.0, 0.0]], norms=[1.0]
-    )
+    index = search._EmbedIndex(chunk_ids=["c1"], entries=[{}], vectors=[[1.0, 0.0]], norms=[1.0])
     lookup = search._build_chunk_id_lookup(index)
     ctx = _context([("q1", [0.0, 1.0]), ("q2", [1.0, 0.0])])  # q2は完全一致(cos=1.0)
 

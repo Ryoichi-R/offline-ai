@@ -150,7 +150,9 @@ class DiversionVerdict:
     mentions_abstain_phrase: bool = False
 
 
-def evaluate_diversion(answer_text: str, forbidden_facts: list[str] | tuple[str, ...]) -> DiversionVerdict:
+def evaluate_diversion(
+    answer_text: str, forbidden_facts: list[str] | tuple[str, ...]
+) -> DiversionVerdict:
     """回答全体を文単位で見て、別対象への流用・作話を判定する。"""
     sentences = _split_sentences(answer_text)
     diverted: list[str] = []
@@ -189,7 +191,9 @@ def evaluate_diversion(answer_text: str, forbidden_facts: list[str] | tuple[str,
     )
 
 
-def legacy_forbidden_fact_match(answer_text: str, forbidden_facts: list[str] | tuple[str, ...]) -> bool:
+def legacy_forbidden_fact_match(
+    answer_text: str, forbidden_facts: list[str] | tuple[str, ...]
+) -> bool:
     """変更前の判定（禁止事実の原文部分一致）。比較のために保持する。
 
     ``eval_harness.measure_answer_probe`` / ``measure_answer_quality_probe`` の

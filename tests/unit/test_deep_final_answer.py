@@ -144,7 +144,9 @@ def test_no_rewrite_when_too_little_time_remains(tmp_path, monkeypatch):
     assert result.diagnostics["final_answer"]["result"] == "rejected_citations"
 
 
-def test_large_high_reasoning_retries_truncated_final_within_existing_two_attempts(tmp_path, monkeypatch):
+def test_large_high_reasoning_retries_truncated_final_within_existing_two_attempts(
+    tmp_path, monkeypatch
+):
     backend(monkeypatch)
     (tmp_path / "source.md").write_text("対象である。", encoding="utf-8")
     calls = []
@@ -157,11 +159,21 @@ def test_large_high_reasoning_retries_truncated_final_within_existing_two_attemp
 
     monkeypatch.setattr(deep, "_call_ollama_text", text)
     result = deep.run_deep_research(
-        "対象", model="gpt-oss:120b", reasoning="high", source_root=tmp_path, timeout_seconds=1800,
+        "対象",
+        model="gpt-oss:120b",
+        reasoning="high",
+        source_root=tmp_path,
+        timeout_seconds=1800,
     )
     assert result.diagnostics["timeout_seconds"] == 1800
-    assert result.diagnostics["reserved_seconds"]["integration"] > deep.DEEP_INTEGRATION_RESERVE_SECONDS
-    assert result.diagnostics["final_answer"]["generation_failure"] == deep.MODEL_OUTPUT_INCOMPLETE_CODE
+    assert (
+        result.diagnostics["reserved_seconds"]["integration"]
+        > deep.DEEP_INTEGRATION_RESERVE_SECONDS
+    )
+    assert (
+        result.diagnostics["final_answer"]["generation_failure"]
+        == deep.MODEL_OUTPUT_INCOMPLETE_CODE
+    )
     assert result.diagnostics["final_answer"]["result"] == "accepted"
     assert result.diagnostics["final_answer"]["uncited_lines_removed"] == 1
     assert result.answer == "対象である。[E1]"
@@ -270,7 +282,9 @@ def test_faithful_answer_keeps_every_limit():
 
 
 def test_dropped_parenthetical_limit_is_reported_on_its_line():
-    answer = FAITHFUL.replace("企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争")
+    answer = FAITHFUL.replace(
+        "企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争"
+    )
     issues = deep._limitation_issues(answer, EVIDENCE)
     assert [line for line, _ in issues] == [3]
     assert "新規案件及び前回一者応募の案件" in issues[0][1][0]
@@ -298,10 +312,23 @@ def test_alias_parenthesis_and_uncited_lines_are_not_limits():
 def _article_backend(monkeypatch, tmp_path):
     backend(monkeypatch)
     (tmp_path / "source.md").write_text(ARTICLE, encoding="utf-8")
-    monkeypatch.setattr(deep, "_split_line_range", lambda lines, start, end, **kw: [
-        {"start_line": 1, "end_line": len(ARTICLE.splitlines()), "char_start": None, "char_end": None,
-         "text": ARTICLE}
-    ] if start == 1 else [])
+    monkeypatch.setattr(
+        deep,
+        "_split_line_range",
+        lambda lines, start, end, **kw: (
+            [
+                {
+                    "start_line": 1,
+                    "end_line": len(ARTICLE.splitlines()),
+                    "char_start": None,
+                    "char_end": None,
+                    "text": ARTICLE,
+                }
+            ]
+            if start == 1
+            else []
+        ),
+    )
 
 
 def _run_article(tmp_path):
@@ -310,7 +337,9 @@ def _run_article(tmp_path):
 
 def test_limit_dropped_then_restored_by_the_rewrite(tmp_path, monkeypatch):
     _article_backend(monkeypatch, tmp_path)
-    dropped = FAITHFUL.replace("企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争")
+    dropped = FAITHFUL.replace(
+        "企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争"
+    )
     calls = _text_calls(monkeypatch, dropped, FAITHFUL)
     result = _run_article(tmp_path)
 
@@ -332,8 +361,14 @@ def test_limit_still_dropped_after_rewrite_is_repaired_with_source_text(tmp_path
     result = _run_article(tmp_path)
 
     assert result.answer_state == deep.ANSWER_STATE_GENERATED
-    assert "三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]" in result.answer
-    assert "２　前項第１号又は第２号の規定に関わらず、次の各号に該当する案件は審査案件としない。[E1]" in result.answer
+    assert (
+        "三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]"
+        in result.answer
+    )
+    assert (
+        "２　前項第１号又は第２号の規定に関わらず、次の各号に該当する案件は審査案件としない。[E1]"
+        in result.answer
+    )
     final = result.diagnostics["final_answer"]
     assert final["result"] == "accepted"
     assert final["repaired_lines"] == 2
@@ -346,14 +381,20 @@ def test_limit_still_dropped_after_rewrite_is_repaired_with_source_text(tmp_path
 
 def test_unrepairable_limit_is_rejected_and_names_the_source_limit(tmp_path, monkeypatch):
     _article_backend(monkeypatch, tmp_path)
-    dropped = FAITHFUL.replace("企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争")
+    dropped = FAITHFUL.replace(
+        "企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件）", "企画競争"
+    )
     _text_calls(monkeypatch, dropped, dropped)
     monkeypatch.setattr(deep, "_repair_limitations", lambda answer, findings: (answer, []))
     result = _run_article(tmp_path)
 
     assert result.answer_state == deep.ANSWER_STATE_VERIFICATION_FAILED
     assert result.diagnostics["final_answer"]["result"] == "rejected_limitations"
-    detail = next(item for item in result.unconfirmed if "根拠の限定（括弧書き・限定の文言・適用範囲）が欠けた" in item)
+    detail = next(
+        item
+        for item in result.unconfirmed
+        if "根拠の限定（括弧書き・限定の文言・適用範囲）が欠けた" in item
+    )
     assert "欠けた原文の限定: 前号に該当するもののほか、新規案件及び前回一者応募の案件。" in detail
     assert "原文抜粋" in result.answer
 
@@ -376,9 +417,14 @@ def test_uncited_sentence_after_parentheses_is_still_caught():
 
 
 def test_verbatim_source_text_is_cited_after_every_sentence():
-    text = "２　前項の規定に関わらず、次の案件は審査しない（公募を含む。）。なお書類は別途提出する。"
+    text = (
+        "２　前項の規定に関わらず、次の案件は審査しない（公募を含む。）。なお書類は別途提出する。"
+    )
     cited = deep._cite_verbatim(text, "E3")
-    assert cited == "２　前項の規定に関わらず、次の案件は審査しない（公募を含む。）。[E3]なお書類は別途提出する。[E3]"
+    assert (
+        cited
+        == "２　前項の規定に関わらず、次の案件は審査しない（公募を含む。）。[E3]なお書類は別途提出する。[E3]"
+    )
     assert deep._validate_final_answer(cited, {"E3"})
 
 
@@ -405,16 +451,32 @@ def test_irrelevant_units_are_listed_in_diagnostics(tmp_path, monkeypatch):
     result = research(tmp_path)
 
     assert result.evidence == []
-    assert result.diagnostics["irrelevant_ranges"] == [{"path": "source.md", "start_line": 1, "end_line": 1}]
+    assert result.diagnostics["irrelevant_ranges"] == [
+        {"path": "source.md", "start_line": 1, "end_line": 1}
+    ]
 
 
 def test_public_ledger_keeps_irrelevant_entries_ahead_of_bulk_exclusions():
     import web_services
 
     ledger = [
-        {"path": f"doc-{i}.md", "reason": "candidate_limit", "status": "unconfirmed", "start_line": 1, "end_line": 2}
+        {
+            "path": f"doc-{i}.md",
+            "reason": "candidate_limit",
+            "status": "unconfirmed",
+            "start_line": 1,
+            "end_line": 2,
+        }
         for i in range(web_services.DEEP_PUBLIC_LEDGER_MAX + 50)
-    ] + [{"path": "core.md", "reason": "irrelevant", "status": "irrelevant", "start_line": 110, "end_line": 117}]
+    ] + [
+        {
+            "path": "core.md",
+            "reason": "irrelevant",
+            "status": "irrelevant",
+            "start_line": 110,
+            "end_line": 117,
+        }
+    ]
     result = deep.DeepResearchResult(status="partial", stop_reason="evidence_budget", ledger=ledger)
 
     event = web_services.build_deep_evidence_event(result)
@@ -452,7 +514,9 @@ def test_answer_keeping_the_nested_limit_passes():
 
 def test_nested_limit_line_is_repaired_with_the_whole_source_line():
     answer = "基金事業（法人等に国庫補助金等を交付して設置造成された基金により実施する事業）は諮問対象とする。[E5]"
-    repaired, notes = deep._repair_limitations(answer, deep._limitation_findings(answer, ARTICLE_ONE_EVIDENCE))
+    repaired, notes = deep._repair_limitations(
+        answer, deep._limitation_findings(answer, ARTICLE_ONE_EVIDENCE)
+    )
     assert repaired.startswith("第１条　厚生労働省における調達（")
     assert deep._validate_final_answer(repaired, {"E5"})
     assert deep._limitation_issues(repaired, ARTICLE_ONE_EVIDENCE) == []
@@ -462,7 +526,9 @@ def test_nested_limit_line_is_repaired_with_the_whole_source_line():
 def test_only_the_outermost_limiting_parenthesis_is_taken():
     text = "契約（公募を含む（別紙の様式のみ）。）"
     spans = deep._limiting_spans(text)
-    assert [(text[start : end + 1]) for start, end, _ in spans] == ["（公募を含む（別紙の様式のみ）。）"]
+    assert [(text[start : end + 1]) for start, end, _ in spans] == [
+        "（公募を含む（別紙の様式のみ）。）"
+    ]
     # An alias-only nested parenthesis is not a limit.
     assert deep._limiting_spans("随意契約（秘密随意契約（予決令））") == []
 
@@ -483,22 +549,37 @@ def _line_verdicts(monkeypatch, unsupported_lines, *, background=(), verdict=Non
                 return verdict
             return {
                 "source_sentence": "",
-                "source_kind": "background" if any(fragment in claims for fragment in background) else "answer",
+                "source_kind": "background"
+                if any(fragment in claims for fragment in background)
+                else "answer",
                 "source_actor": "委員会",
                 "claim_actor": "委員会",
                 "supported": not any(fragment in claims for fragment in unsupported_lines),
             }
         if system == deep.DEEP_VERIFY_SYSTEM:
-            return {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+            return {
+                "supported": True,
+                "contradictions": [],
+                "missing_conditions": [],
+                "unsupported_claims": [],
+            }
         if system == deep.DEEP_GAPS_SYSTEM:
             return {"queries": [], "unresolved": []}
-        return {"subject": "対象", "scope": "範囲", "conditions": ["対象である"], "exceptions": [], "references": []}
+        return {
+            "subject": "対象",
+            "scope": "範囲",
+            "conditions": ["対象である"],
+            "exceptions": [],
+            "references": [],
+        }
 
     monkeypatch.setattr(deep, "_call_ollama_json", model)
     return seen
 
 
-def test_form_table_does_not_support_a_schedule_even_if_the_model_would_accept_it(tmp_path, monkeypatch):
+def test_form_table_does_not_support_a_schedule_even_if_the_model_would_accept_it(
+    tmp_path, monkeypatch
+):
     backend(monkeypatch)
     _text_calls(monkeypatch, "窓口に提出する。[E1]\n実施時期は別紙の様式ごとに定められている。[E1]")
     checked = _line_verdicts(monkeypatch, ())
@@ -524,9 +605,18 @@ def test_unsupported_line_is_replaced_by_the_source_line_it_restates(tmp_path, m
     assert "常に審査しない" not in result.answer
     assert "二　庁舎で使用する電力の供給及びガスの供給に関する一般競争入札[E1]" in result.answer
     checks = result.diagnostics["final_answer"]["line_checks"]
-    assert checks == {"checked": 6, "unsupported": 1, "replaced": 1, "dropped": 0, "off_question": 0, "unchecked": 0}
+    assert checks == {
+        "checked": 6,
+        "unsupported": 1,
+        "replaced": 1,
+        "dropped": 0,
+        "off_question": 0,
+        "unchecked": 0,
+    }
     assert len(seen) == 6
-    assert any(item.startswith("line_unsupported") and "6行目" in item for item in result.unconfirmed)
+    assert any(
+        item.startswith("line_unsupported") and "6行目" in item for item in result.unconfirmed
+    )
     assert result.stop_reason != "line_unsupported"
 
 
@@ -582,14 +672,25 @@ def test_line_check_diagnostics_hold_numbers_only(tmp_path, monkeypatch):
     result = _run_article(tmp_path)
 
     checks = result.diagnostics["final_answer"]["line_checks"]
-    assert set(checks) == {"checked", "unsupported", "replaced", "dropped", "off_question", "unchecked"}
+    assert set(checks) == {
+        "checked",
+        "unsupported",
+        "replaced",
+        "dropped",
+        "off_question",
+        "unchecked",
+    }
     assert all(isinstance(value, int) for value in checks.values())
 
 
-def test_line_restating_background_is_dropped_even_when_a_source_line_matches(tmp_path, monkeypatch):
+def test_line_restating_background_is_dropped_even_when_a_source_line_matches(
+    tmp_path, monkeypatch
+):
     """2026-09-24 run 1: a line turned the notice's background into a condition."""
     _article_backend(monkeypatch, tmp_path)
-    background = "二　庁舎で使用する電力の供給及びガスの供給に関する一般競争入札が審査の目的である。[E1]"
+    background = (
+        "二　庁舎で使用する電力の供給及びガスの供給に関する一般競争入札が審査の目的である。[E1]"
+    )
     _text_calls(monkeypatch, FAITHFUL + "\n" + background)
     _line_verdicts(monkeypatch, [], background=["審査の目的である"])
     result = _run_article(tmp_path)
@@ -598,14 +699,21 @@ def test_line_restating_background_is_dropped_even_when_a_source_line_matches(tm
     assert "審査の目的である" not in result.answer
     checks = result.diagnostics["final_answer"]["line_checks"]
     assert (checks["off_question"], checks["dropped"], checks["replaced"]) == (1, 1, 0)
-    assert any(item.startswith("line_unsupported") and "背景" in item for item in result.unconfirmed)
+    assert any(
+        item.startswith("line_unsupported") and "背景" in item for item in result.unconfirmed
+    )
 
 
 def test_line_naming_another_actor_is_unsupported(tmp_path, monkeypatch):
     _article_backend(monkeypatch, tmp_path)
     _text_calls(monkeypatch, FAITHFUL)
-    verdict = {"source_sentence": "", "source_kind": "answer", "source_actor": "特別会計の勘定元",
-               "claim_actor": "委員会", "supported": True}
+    verdict = {
+        "source_sentence": "",
+        "source_kind": "answer",
+        "source_actor": "特別会計の勘定元",
+        "claim_actor": "委員会",
+        "supported": True,
+    }
     _line_verdicts(monkeypatch, [], verdict=verdict)
     result = _run_article(tmp_path)
 
@@ -615,15 +723,22 @@ def test_line_naming_another_actor_is_unsupported(tmp_path, monkeypatch):
 
 
 def test_line_verdict_reads_kind_actors_and_support():
-    base = {"source_sentence": "", "source_kind": "answer", "source_actor": "委員会",
-            "claim_actor": "厚生労働省の公共調達委員会", "supported": True}
+    base = {
+        "source_sentence": "",
+        "source_kind": "answer",
+        "source_actor": "委員会",
+        "claim_actor": "厚生労働省の公共調達委員会",
+        "supported": True,
+    }
     assert deep._line_verdict(base) == deep.LINE_SUPPORTED
     assert deep._line_verdict({**base, "claim_actor": ""}) == deep.LINE_SUPPORTED
     assert deep._line_verdict({**base, "source_actor": "大臣"}) == deep.LINE_UNSUPPORTED
     assert deep._line_verdict({**base, "supported": False}) == deep.LINE_UNSUPPORTED
     assert deep._line_verdict({**base, "source_kind": "background"}) == deep.LINE_OFF_QUESTION
     # No source sentence found: the kind is left empty.
-    assert deep._line_verdict({**base, "source_kind": "", "supported": False}) == deep.LINE_UNSUPPORTED
+    assert (
+        deep._line_verdict({**base, "source_kind": "", "supported": False}) == deep.LINE_UNSUPPORTED
+    )
     broken_verdicts = (
         {**base, "source_kind": "rule"},
         {**base, "source_kind": ""},
@@ -649,6 +764,7 @@ def test_malformed_line_verdict_leaves_the_line_unchecked(tmp_path, monkeypatch)
 def test_line_check_prompt_asks_for_separate_readings():
     for key in ("source_sentence", "source_kind", "source_actor", "claim_actor", "supported"):
         assert key in prompt_templates.DEEP_LINE_VERIFY_SYSTEM
+
 
 # --- limits outside parentheses; enumerations used in part ---------------------------
 
@@ -724,10 +840,16 @@ def test_item_left_out_of_a_list_the_answer_uses_is_reported_and_added():
     gaps = deep._enumeration_issues(answer, NOTICE_42_EVIDENCE)
     assert [evidence_id for evidence_id, _ in gaps] == ["E8", "E8"]
     assert [texts[0][:1] for _, texts in gaps] == ["⑵", "⑵"]
-    repaired, notes = deep._repair_enumerations(answer, deep._enumeration_findings(answer, NOTICE_42_EVIDENCE))
+    repaired, notes = deep._repair_enumerations(
+        answer, deep._enumeration_findings(answer, NOTICE_42_EVIDENCE)
+    )
     lines = repaired.splitlines()
-    assert lines[0] == KIND_ONE and lines[1].startswith("⑵ 予定価格が２５０万円をこえない随意契約で")
-    assert lines[2] == MEASURE_ONE and lines[3].startswith("⑵ 契約担当官等は、見積書の徴取を省略する")
+    assert lines[0] == KIND_ONE and lines[1].startswith(
+        "⑵ 予定価格が２５０万円をこえない随意契約で"
+    )
+    assert lines[2] == MEASURE_ONE and lines[3].startswith(
+        "⑵ 契約担当官等は、見積書の徴取を省略する"
+    )
     assert deep._enumeration_issues(repaired, NOTICE_42_EVIDENCE) == []
     assert deep._validate_final_answer(repaired, {"E8"})
     assert len(notes) == 2 and all("列挙の項目" in text for text in notes)
@@ -749,7 +871,10 @@ def test_item_left_out_is_named_in_the_rewrite_and_added_when_still_missing(tmp_
     assert len(calls) == 2
     assert "根拠E1の列挙のうち、次の項目が回答にありません" in calls[1] and "企画競争" in calls[1]
     assert result.answer_state == deep.ANSWER_STATE_GENERATED
-    assert "三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]" in result.answer
+    assert (
+        "三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]"
+        in result.answer
+    )
     final = result.diagnostics["final_answer"]
     assert final["added_items"] == 1
     assert [attempt["enumeration_gaps"] for attempt in final["attempts"]] == [1, 1]
@@ -777,13 +902,19 @@ def test_two_paraphrases_repaired_into_one_source_line_appear_once(tmp_path, mon
     result = _run_article(tmp_path)
 
     assert result.answer_state == deep.ANSWER_STATE_GENERATED
-    assert result.answer.count("三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]") == 1
+    assert (
+        result.answer.count(
+            "三　企画競争（前号に該当するもののほか、新規案件及び前回一者応募の案件。）[E1]"
+        )
+        == 1
+    )
     assert result.diagnostics["final_answer"]["duplicate_lines"] == 1
 
 
 def test_final_prompt_asks_for_limits_outside_parentheses_and_whole_lists():
     assert "括弧の外にある限定の文言" in prompt_templates.DEEP_FINAL_SYSTEM
     assert "同じ列挙の他の項目も省略せずに書いてください" in prompt_templates.DEEP_FINAL_SYSTEM
+
 
 # --- paraphrase of a long source line; answer scope -----------------------------------
 
@@ -823,9 +954,13 @@ def test_source_repair_counts_only_surviving_unique_source_lines():
     metrics.record("原文B。[E2]", added=True)
     report = metrics.summary("原文A。[E1]\n主張B。[E2]", removed=1, duplicates=1)
     assert report == {
-        "before_claim_lines": 2, "replaced_lines": 1, "added_source_lines": 2,
-        "support_removed_lines": 1, "duplicate_removed_lines": 1,
-        "final_claim_lines": 2, "final_source_derived_unique_lines": 1,
+        "before_claim_lines": 2,
+        "replaced_lines": 1,
+        "added_source_lines": 2,
+        "support_removed_lines": 1,
+        "duplicate_removed_lines": 1,
+        "final_claim_lines": 2,
+        "final_source_derived_unique_lines": 1,
         "source_dependence_ratio": 0.5,
     }
     assert "原文" not in json.dumps(report, ensure_ascii=False)

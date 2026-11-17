@@ -300,7 +300,11 @@ def build_markdown(receipt: dict) -> str:
     )
     lines.append("")
 
-    lines.extend(_answer_layer_markdown(receipt, "answer_probes", "answer 層 probe（本文非保存、通しの比較）"))
+    lines.extend(
+        _answer_layer_markdown(
+            receipt, "answer_probes", "answer 層 probe（本文非保存、通しの比較）"
+        )
+    )
     lines.extend(
         _answer_layer_markdown(
             receipt,
@@ -309,7 +313,13 @@ def build_markdown(receipt: dict) -> str:
         )
     )
     lines.extend(_answer_quality_markdown(receipt))
-    lines.extend(_answer_quality_markdown(receipt, key="answer_quality_probes_same_evidence", heading="回答品質 probe（回答可能な質問、本文非保存、E0-2 同一根拠比較。受入判定には含めない）"))
+    lines.extend(
+        _answer_quality_markdown(
+            receipt,
+            key="answer_quality_probes_same_evidence",
+            heading="回答品質 probe（回答可能な質問、本文非保存、E0-2 同一根拠比較。受入判定には含めない）",
+        )
+    )
     lines.extend(_expansion_comparison_markdown(receipt))
     if receipt.get("answer_fixtures_saved_to"):
         lines.append("## E0-5 評価用回答fixture（Git管理外の別保存）")

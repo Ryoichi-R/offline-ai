@@ -49,11 +49,7 @@ def build_plan(run_id, interfaces, models, selected_cases=None):
         or set(interfaces) - {"cli", "web"}
     ):
         raise ValueError("invalid smoke interfaces")
-    if (
-        not models
-        or len(set(models)) != len(models)
-        or set(models) - set(MAC_MODEL_DIGESTS)
-    ):
+    if not models or len(set(models)) != len(models) or set(models) - set(MAC_MODEL_DIGESTS):
         raise ValueError("invalid pinned models")
     names = [
         name
@@ -75,20 +71,14 @@ def build_plan(run_id, interfaces, models, selected_cases=None):
             or set(selected_cases) - valid
         ):
             raise ValueError("invalid case selection")
-        cases = [
-            case
-            for case in cases
-            if case["interface"] + ":" + case["mode"] in selected_cases
-        ]
+        cases = [case for case in cases if case["interface"] + ":" + case["mode"] in selected_cases]
     return {
         "schemaVersion": "1.1",
         "runId": run_id,
         "status": "PREPARED_NOT_RUN",
         "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "purpose": "synthetic-product-wiring-only-not-quality-acceptance",
-        "product": {
-            "files": {name: compare.sha256_file(ROOT / name) for name in names}
-        },
+        "product": {"files": {name: compare.sha256_file(ROOT / name) for name in names}},
         "corpusSha256": compare.sha256_file(ROOT / CORPUS),
         "querySha256": hashlib.sha256(QUERY.encode()).hexdigest(),
         "models": {model: MAC_MODEL_DIGESTS[model] for model in models},
@@ -117,9 +107,7 @@ def summarize_answer(answer):
 
 def parse_swap_bytes(text):
     match = re.search(r"used\s*=\s*([\d.]+)([KMGT])", text)
-    return (
-        int(float(match[1]) * 1024 ** ("KMGT".index(match[2]) + 1)) if match else None
-    )
+    return int(float(match[1]) * 1024 ** ("KMGT".index(match[2]) + 1)) if match else None
 
 
 def process_rss_bytes(table, root_pid):
@@ -150,25 +138,19 @@ class ResourceSampler:
 
     @staticmethod
     def _command(args):
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=2, check=False
-        )
+        result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=False)
         return result.stdout if result.returncode == 0 else ""
 
     def sample(self):
         try:
             table = self._command(["ps", "-axo", "pid=,ppid=,rss="])
             swap = (
-                self._command(["sysctl", "-n", "vm.swapusage"])
-                if sys.platform == "darwin"
-                else ""
+                self._command(["sysctl", "-n", "vm.swapusage"]) if sys.platform == "darwin" else ""
             )
             self.samples.append(
                 {
                     "productProcessTreeRssBytes": process_rss_bytes(table, self.pid),
-                    "ollamaProcessTreeRssBytes": process_rss_bytes(
-                        table, self.ollama_pid
-                    ),
+                    "ollamaProcessTreeRssBytes": process_rss_bytes(table, self.ollama_pid),
                     "systemSwapUsedBytes": parse_swap_bytes(swap),
                 }
             )
@@ -194,9 +176,7 @@ class ResourceSampler:
         ):
             values = [sample[key] for sample in self.samples if sample[key] is not None]
             result[key] = (
-                {"first": values[0], "maximum": max(values), "last": values[-1]}
-                if values
-                else None
+                {"first": values[0], "maximum": max(values), "last": values[-1]} if values else None
             )
         return result
 
@@ -224,9 +204,7 @@ def cli_case(case):
             stopReason=result.stop_reason,
         )
         captured["stageSeconds"] = result.diagnostics.get("stage_seconds", {})
-        captured["sourceRepair"] = result.diagnostics.get("final_answer", {}).get(
-            "source_repair"
-        )
+        captured["sourceRepair"] = result.diagnostics.get("final_answer", {}).get("source_repair")
         return result
 
     previous = sys.argv
@@ -276,9 +254,7 @@ def web_case(case):
     server.bind_port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    conn = http.client.HTTPConnection(
-        "127.0.0.1", server.bind_port, timeout=CASE_SECONDS + 5
-    )
+    conn = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=CASE_SECONDS + 5)
     host = f"127.0.0.1:{server.bind_port}"
     events = []
     first_content = None
@@ -326,11 +302,7 @@ def web_case(case):
                 if event.get("type") == "thinking":
                     continue
                 events.append(event)
-                if (
-                    event.get("type") == "chunk"
-                    and event.get("text")
-                    and first_content is None
-                ):
+                if event.get("type") == "chunk" and event.get("text") and first_content is None:
                     first_content = time.monotonic() - started
     finally:
         conn.close()
@@ -338,9 +310,7 @@ def web_case(case):
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
-    answer = "".join(
-        str(event.get("text", "")) for event in events if event.get("type") == "chunk"
-    )
+    answer = "".join(str(event.get("text", "")) for event in events if event.get("type") == "chunk")
     meta = next((event for event in events if event.get("type") == "result_meta"), {})
     evidence = next((event for event in events if event.get("type") == "evidence"), {})
     return {
@@ -354,9 +324,7 @@ def web_case(case):
             if event.get("type") == "error"
         ],
         "answerState": evidence.get("answerState", "generated" if answer else "empty"),
-        "firstContentSeconds": round(first_content, 3)
-        if first_content is not None
-        else None,
+        "firstContentSeconds": round(first_content, 3) if first_content is not None else None,
         "modelMatches": meta.get("chatModel") == case["model"],
         "digestMatches": meta.get("modelDigest") == MAC_MODEL_DIGESTS[case["model"]],
         "apiThinkValue": meta.get("apiThinkValue"),
@@ -390,10 +358,7 @@ def case_passed(case, result):
 
 
 def check_corpus(receipt):
-    if (
-        compare.sha256_file(ROOT / "skill-source/handbook.md")
-        != receipt["corpusSha256"]
-    ):
+    if compare.sha256_file(ROOT / "skill-source/handbook.md") != receipt["corpusSha256"]:
         raise ValueError("smoke corpus changed")
 
 
@@ -439,11 +404,7 @@ def stop_process_group(process):
 def run_case(case, receipt, isolated, ollama_pid):
     case_path = isolated / "smoke-case.json"
     compare._atomic_write(case_path, {"case": case, "receipt": receipt})
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("OFFLINE_AI_")
-    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OFFLINE_AI_")}
     env["OLLAMA_HOST"] = "http://127.0.0.1:11434"
     process = subprocess.Popen(
         [
@@ -549,24 +510,18 @@ def execute(receipt, output, runtime_config):
                 else "FAIL"
             )
         except BaseException as exc:
-            receipt["status"] = (
-                "INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "FAILED"
-            )
+            receipt["status"] = "INTERRUPTED" if isinstance(exc, KeyboardInterrupt) else "FAILED"
             receipt["failureType"] = type(exc).__name__
             raise
         finally:
             stop_process_group(launcher)
-            receipt["finishedAt"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds"
-            )
+            receipt["finishedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             compare._atomic_write(output, receipt)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    )
+    parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     parser.add_argument("--interfaces", choices=("cli", "both"), default="both")
     parser.add_argument("--model", action="append", choices=tuple(MAC_MODEL_DIGESTS))
     parser.add_argument(
@@ -600,9 +555,7 @@ def main(argv=None):
         )
         if args.execute and args.confirm_case_runs != len(receipt["cases"]):
             raise ValueError("case count confirmation is required")
-        output = (
-            ROOT / ".test-results/macos-large-model" / receipt["runId"] / "smoke.json"
-        )
+        output = ROOT / ".test-results/macos-large-model" / receipt["runId"] / "smoke.json"
         if output.exists():
             raise ValueError("run-id already exists")
         compare._atomic_write(output, receipt)
@@ -610,10 +563,7 @@ def main(argv=None):
             execute(receipt, output, args.runtime_config.resolve())
         print(
             json.dumps(
-                {
-                    key: receipt[key]
-                    for key in ("runId", "status", "maxGenerationSeconds")
-                },
+                {key: receipt[key] for key in ("runId", "status", "maxGenerationSeconds")},
                 ensure_ascii=False,
             )
         )

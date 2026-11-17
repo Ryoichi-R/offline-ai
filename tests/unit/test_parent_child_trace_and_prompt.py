@@ -149,9 +149,7 @@ def test_expansion_calls_cancel_check_before_each_parent(tmp_path):
         raise Cancelled()
 
     with pytest.raises(Cancelled):
-        search.expand_parent_candidates(
-            [parent], chunks, source_root=tmp_path, cancel_check=cancel
-        )
+        search.expand_parent_candidates([parent], chunks, source_root=tmp_path, cancel_check=cancel)
 
 
 # ---------------------------------------------------------------------------

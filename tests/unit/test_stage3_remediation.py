@@ -84,7 +84,9 @@ MEMO_LINES = (
 )
 MEMO = "\n".join(MEMO_LINES) + "\n"
 NOTICE_PATH = "notice/押印見直し/会計課長通知（会計手続における押印の見直しについて）.md"
-MEMO_PATH = "notice/押印見直し/【監査指導室長事務連絡】押印を前提としている契約関係書類の取扱いについて.md"
+MEMO_PATH = (
+    "notice/押印見直し/【監査指導室長事務連絡】押印を前提としている契約関係書類の取扱いについて.md"
+)
 
 
 def _root(tmp_path, extra=None):
@@ -113,12 +115,25 @@ def test_classify_range_marks_headers_frontmatter_blank_forms_and_contacts():
 
 def _fake_models(monkeypatch, prompts, answer="押印は原則不要。[E1]"):
     monkeypatch.setattr(
-        deep_research, "_call_ollama_json",
+        deep_research,
+        "_call_ollama_json",
         lambda *a, **k: (
-            {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+            {
+                "supported": True,
+                "contradictions": [],
+                "missing_conditions": [],
+                "unsupported_claims": [],
+            }
             if a[1] == deep_research.DEEP_VERIFY_SYSTEM
-            else {"queries": [], "unresolved": []} if a[1] == deep_research.DEEP_GAPS_SYSTEM
-            else {"subject": "押印", "scope": "会計手続", "conditions": [], "exceptions": [], "references": []}
+            else {"queries": [], "unresolved": []}
+            if a[1] == deep_research.DEEP_GAPS_SYSTEM
+            else {
+                "subject": "押印",
+                "scope": "会計手続",
+                "conditions": [],
+                "exceptions": [],
+                "references": [],
+            }
         ),
     )
 
@@ -133,12 +148,21 @@ def _candidates(root, wanted):
     chunks = search.build_source_chunks(root)
     selected = []
     for i, (path, start) in enumerate(wanted):
-        chunk = next(c for c in chunks if c["path"] == path and c["start_line"] <= start <= c["end_line"])
-        selected.append({
-            "path": path, "chunk_id": chunk["chunk_id"], "heading": chunk.get("heading", ""),
-            "start_line": chunk["start_line"], "end_line": chunk["end_line"],
-            "score": 2 - i * 0.1, "rrf_score": 0.5 - i * 0.01, "source_sha256": chunk["file_sha256"],
-        })
+        chunk = next(
+            c for c in chunks if c["path"] == path and c["start_line"] <= start <= c["end_line"]
+        )
+        selected.append(
+            {
+                "path": path,
+                "chunk_id": chunk["chunk_id"],
+                "heading": chunk.get("heading", ""),
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "score": 2 - i * 0.1,
+                "rrf_score": 0.5 - i * 0.01,
+                "source_sha256": chunk["file_sha256"],
+            }
+        )
     return selected
 
 
@@ -146,9 +170,13 @@ def test_deep_keeps_main_items_when_ancillary_ranges_rank_first(tmp_path, monkey
     """発端の欠落（読取後に根拠枠を付随範囲に取られた）が再現しない。"""
     root = _root(tmp_path)
     # 付随範囲（事務連絡の冒頭・空欄チェックリスト、通知の冒頭）が先にヒットする。
-    candidates = _candidates(root, [(MEMO_PATH, 3), (MEMO_PATH, 20), (NOTICE_PATH, 4), (NOTICE_PATH, 17), (NOTICE_PATH, 19)])
+    candidates = _candidates(
+        root,
+        [(MEMO_PATH, 3), (MEMO_PATH, 20), (NOTICE_PATH, 4), (NOTICE_PATH, 17), (NOTICE_PATH, 19)],
+    )
     patch_retrieval(
-        monkeypatch, deep_research,
+        monkeypatch,
+        deep_research,
         lambda q, ch, **k: deep_candidate_selection.select_candidates(candidates, source_chunks=ch),
     )
     # 主要範囲（約2,000字）は入るが、付随範囲を先に入れると溢れる枠にする。
@@ -156,7 +184,10 @@ def test_deep_keeps_main_items_when_ancillary_ranges_rank_first(tmp_path, monkey
     prompts = []
     _fake_models(monkeypatch, prompts)
     result = deep_research.run_deep_research(
-        "押印を求めない事に関する事務の内容詳細を教えてください", model="m", source_root=root, timeout_seconds=300,
+        "押印を求めない事に関する事務の内容詳細を教えてください",
+        model="m",
+        source_root=root,
+        timeout_seconds=300,
     )
     assert any(K1 in p and K2 in p for p in prompts)
     main = [e for e in result.evidence if not e.get("ancillary")]
@@ -167,20 +198,26 @@ def test_deep_keeps_main_items_when_ancillary_ranges_rank_first(tmp_path, monkey
     assert all(row["status"] == "deferred" for row in ancillary_rows)
     assert not any(item.startswith("ancillary") for item in result.unconfirmed)
     # 付随範囲は抽出・照合のモデル呼び出しを使わない。
-    assert all(e["verification_status"] == "raw_unverified" for e in result.evidence if e.get("ancillary"))
+    assert all(
+        e["verification_status"] == "raw_unverified" for e in result.evidence if e.get("ancillary")
+    )
 
 
 def test_deep_reads_ancillary_ranges_when_the_question_asks_for_them(tmp_path, monkeypatch):
     root = _root(tmp_path)
     candidates = _candidates(root, [(NOTICE_PATH, 21)])
     patch_retrieval(
-        monkeypatch, deep_research,
+        monkeypatch,
+        deep_research,
         lambda q, ch, **k: deep_candidate_selection.select_candidates(candidates, source_chunks=ch),
     )
     prompts = []
     _fake_models(monkeypatch, prompts, answer="令和３年１月１日から適用する。[E1]")
     result = deep_research.run_deep_research(
-        "会計課長通知の適用日はいつですか", model="m", source_root=root, timeout_seconds=300,
+        "会計課長通知の適用日はいつですか",
+        model="m",
+        source_root=root,
+        timeout_seconds=300,
     )
     assert result.diagnostics["ancillary_ranges"] == {"deferred": 0, "raw": 0}
 
@@ -193,7 +230,10 @@ def test_normal_answer_moves_ancillary_evidence_to_the_back(tmp_path):
         {"path": NOTICE_PATH, "start_line": 16, "end_line": 17, "source_sha256": sha},
     ]
     ordered = search._demote_ancillary("押印の内容", items, source_root=root)
-    assert [(i["start_line"], i.get("ancillary", False)) for i in ordered] == [(16, False), (1, True)]
+    assert [(i["start_line"], i.get("ancillary", False)) for i in ordered] == [
+        (16, False),
+        (1, True),
+    ]
     assert search._demote_ancillary("照会先はどこですか", items, source_root=root) == items
 
 
@@ -205,15 +245,23 @@ def test_single_issuer_candidate_adds_primary_ranges_only_when_it_ranks_first(tm
     chunks = search.build_source_chunks(root)
     query = "押印を求めない事に関する会計課長通知の内容詳細を教えてください"
     sha = hashlib.sha256((root / NOTICE_PATH).read_bytes()).hexdigest()
-    top = [{"path": NOTICE_PATH, "start_line": 1, "end_line": 2, "source_sha256": sha, "score": 1.0}]
-    items, _ = search._with_primary_ranges(query, top, source_root=root, chunks=chunks, char_budget=8000, item_limit=5)
+    top = [
+        {"path": NOTICE_PATH, "start_line": 1, "end_line": 2, "source_sha256": sha, "score": 1.0}
+    ]
+    items, _ = search._with_primary_ranges(
+        query, top, source_root=root, chunks=chunks, char_budget=8000, item_limit=5
+    )
     primary = [i for i in items if i.get("primary_range")]
     assert primary and {i["primary_source"] for i in primary} == {"single_candidate"}
     assert any(K1 in i["snippet"] for i in primary) and items[-1] == top[0]
     other = [{"path": MEMO_PATH, "start_line": 14, "end_line": 14, "score": 1.0}]
-    assert search._with_primary_ranges(query, other, source_root=root, chunks=chunks, char_budget=8000, item_limit=5) == (other, [])
+    assert search._with_primary_ranges(
+        query, other, source_root=root, chunks=chunks, char_budget=8000, item_limit=5
+    ) == (other, [])
     specific = "押印を求めない事に関する会計課長通知の適用日はいつですか"
-    assert search._with_primary_ranges(specific, top, source_root=root, chunks=chunks, char_budget=8000, item_limit=5) == (top, [])
+    assert search._with_primary_ranges(
+        specific, top, source_root=root, chunks=chunks, char_budget=8000, item_limit=5
+    ) == (top, [])
 
 
 def test_overview_keeps_an_operative_date_when_primary_ranges_leave_space(tmp_path):
@@ -222,7 +270,12 @@ def test_overview_keeps_an_operative_date_when_primary_ranges_leave_space(tmp_pa
     query = "会計手続における押印の見直しについての内容詳細"
     hit = {"path": NOTICE_PATH, "start_line": 1, "end_line": 2, "score": 1.0}
     full, _ = search._with_primary_ranges(
-        query, [hit], source_root=root, chunks=chunks, char_budget=8000, item_limit=5,
+        query,
+        [hit],
+        source_root=root,
+        chunks=chunks,
+        char_budget=8000,
+        item_limit=5,
     )
     full = search._demote_ancillary(query, full, source_root=root)
     kept = [item for item in full if item.get("primary_range")]
@@ -230,7 +283,12 @@ def test_overview_keeps_an_operative_date_when_primary_ranges_leave_space(tmp_pa
     assert any(NOTICE_LINES[20] in item["snippet"] for item in kept)
     assert not any("令和２年12月25日" in item["snippet"] for item in kept)
     tight, _ = search._with_primary_ranges(
-        query, [hit], source_root=root, chunks=chunks, char_budget=8000, item_limit=3,
+        query,
+        [hit],
+        source_root=root,
+        chunks=chunks,
+        char_budget=8000,
+        item_limit=3,
     )
     assert any(K1 in item.get("snippet", "") and K2 in item["snippet"] for item in tight)
     assert all(NOTICE_LINES[20] not in item.get("snippet", "") for item in tight)
@@ -240,29 +298,41 @@ def test_deep_single_candidate_reads_main_sections_when_it_ranks_first(tmp_path,
     root = _root(tmp_path)
     candidates = _candidates(root, [(NOTICE_PATH, 21)])
     patch_retrieval(
-        monkeypatch, deep_research,
+        monkeypatch,
+        deep_research,
         lambda q, ch, **k: deep_candidate_selection.select_candidates(candidates, source_chunks=ch),
     )
     prompts = []
     _fake_models(monkeypatch, prompts)
     result = deep_research.run_deep_research(
-        "押印を求めない事に関する会計課長通知の内容詳細を教えてください", model="m", source_root=root, timeout_seconds=300,
+        "押印を求めない事に関する会計課長通知の内容詳細を教えてください",
+        model="m",
+        source_root=root,
+        timeout_seconds=300,
     )
     assert result.diagnostics["primary_source"] == "single_candidate"
     assert any(K1 in p and K2 in p for p in prompts)
-    assert any(e.get("primary_operative_date") and e["excerpt"] == NOTICE_LINES[20] for e in result.evidence)
+    assert any(
+        e.get("primary_operative_date") and e["excerpt"] == NOTICE_LINES[20]
+        for e in result.evidence
+    )
 
 
 @pytest.mark.parametrize("supported", [True, False])
 @pytest.mark.parametrize("truncated", [True, False])
-def test_v2_retains_operative_date_and_required_follow_through_from_original(tmp_path, monkeypatch, supported, truncated):
+def test_v2_retains_operative_date_and_required_follow_through_from_original(
+    tmp_path, monkeypatch, supported, truncated
+):
     root = _root(tmp_path)
-    original = "書類の真正性が保たれていることを確認した上で、迅速かつ適切に手続を進めるよう努めること。"
+    original = (
+        "書類の真正性が保たれていることを確認した上で、迅速かつ適切に手続を進めるよう努めること。"
+    )
     notice = root / NOTICE_PATH
     notice.write_text(NOTICE.replace(K2, original), encoding="utf-8")
     candidates = _candidates(root, [(NOTICE_PATH, 21)])
     patch_retrieval(
-        monkeypatch, deep_research,
+        monkeypatch,
+        deep_research,
         lambda q, ch, **k: deep_candidate_selection.select_candidates(candidates, source_chunks=ch),
     )
     _fake_models(monkeypatch, [])
@@ -275,31 +345,58 @@ def test_v2_retains_operative_date_and_required_follow_through_from_original(tmp
                 raise deep_research.DeepWorkerError(code=deep_research.MODEL_OUTPUT_INCOMPLETE_CODE)
             import re
 
-            eid = next(match[1] for match in re.finditer(r"(?m)^\[(E\d+)\].*\n", user)
-                       if K1 in user[match.end():].split("\n[", 1)[0])
-            date_id = next(match[1] for match in re.finditer(r"(?m)^\[(E\d+)\].*\n", user)
-                           if NOTICE_LINES[20] in user[match.end():].split("\n[", 1)[0])
-            return {"sections": [{"heading": "押印", "claims": [
-                {"text": K1, "evidence": [{"id": eid, "quote": K1}]},
-                {"text": "この通知は令和3年1月1日から適用されます。",
-                 "evidence": [{"id": date_id, "quote": NOTICE_LINES[20]}]},
-            ]}]}
+            eid = next(
+                match[1]
+                for match in re.finditer(r"(?m)^\[(E\d+)\].*\n", user)
+                if K1 in user[match.end() :].split("\n[", 1)[0]
+            )
+            date_id = next(
+                match[1]
+                for match in re.finditer(r"(?m)^\[(E\d+)\].*\n", user)
+                if NOTICE_LINES[20] in user[match.end() :].split("\n[", 1)[0]
+            )
+            return {
+                "sections": [
+                    {
+                        "heading": "押印",
+                        "claims": [
+                            {"text": K1, "evidence": [{"id": eid, "quote": K1}]},
+                            {
+                                "text": "この通知は令和3年1月1日から適用されます。",
+                                "evidence": [{"id": date_id, "quote": NOTICE_LINES[20]}],
+                            },
+                        ],
+                    }
+                ]
+            }
         if system == pipeline.CLAIM_VERIFY_SYSTEM:
             claims = json.loads(user)["claims"]
             checked.extend(claim["claim"] for claim in claims)
-            return {"results": [
-                {"claim_id": claim["claim_id"],
-                 "verdict": "supported" if supported or claim["claim"] == K1 else "unsupported",
-                 "reason_code": "ok" if supported or claim["claim"] == K1 else "not_in_source"}
-                for claim in claims
-            ]}
+            return {
+                "results": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "verdict": "supported"
+                        if supported or claim["claim"] == K1
+                        else "unsupported",
+                        "reason_code": "ok"
+                        if supported or claim["claim"] == K1
+                        else "not_in_source",
+                    }
+                    for claim in claims
+                ]
+            }
         assert system != pipeline.DRAFT_RETRY_SYSTEM
         return fake(name, system, user, **kwargs)
 
     monkeypatch.setattr(deep_research, "_call_ollama_json", model)
     result = deep_research.run_deep_research(
-        "押印を求めない事に関する会計課長通知の内容詳細を教えてください", model="gpt-oss:120b",
-        reasoning="high", source_root=root, timeout_seconds=1800, answer_policy="v2",
+        "押印を求めない事に関する会計課長通知の内容詳細を教えてください",
+        model="gpt-oss:120b",
+        reasoning="high",
+        source_root=root,
+        timeout_seconds=1800,
+        answer_policy="v2",
     )
     assert result.answer_state == deep_research.ANSWER_STATE_GENERATED
     assert original in checked and NOTICE_LINES[20] in checked
@@ -314,11 +411,18 @@ def test_v2_retains_operative_date_and_required_follow_through_from_original(tmp
 
 def test_multiple_operative_dates_are_not_automatically_selected():
     assert ss.unique_operative_date_range(NOTICE) == (21, "３ 実施時期")
-    assert ss.unique_operative_date_range(NOTICE + "\n## 施行日\n本通知は、令和３年２月１日から施行する。\n") is None
+    assert (
+        ss.unique_operative_date_range(
+            NOTICE + "\n## 施行日\n本通知は、令和３年２月１日から施行する。\n"
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_deep_explicit_section_uses_only_selected_lines_and_still_verifies(tmp_path, monkeypatch, supported):
+def test_deep_explicit_section_uses_only_selected_lines_and_still_verifies(
+    tmp_path, monkeypatch, supported
+):
     root = _root(tmp_path)
     prompts = []
     _fake_models(monkeypatch, prompts, answer=f"{K2}[E1]")
@@ -327,7 +431,10 @@ def test_deep_explicit_section_uses_only_selected_lines_and_still_verifies(tmp_p
 
     def model(name, system, user, **kwargs):
         verdict = original(name, system, user, **kwargs)
-        if system == deep_research.DEEP_VERIFY_SYSTEM and json.loads(user)["verification_scope"] == "final_answer":
+        if (
+            system == deep_research.DEEP_VERIFY_SYSTEM
+            and json.loads(user)["verification_scope"] == "final_answer"
+        ):
             verification.append(user)
             verdict["supported"] = supported
         return verdict
@@ -339,13 +446,22 @@ def test_deep_explicit_section_uses_only_selected_lines_and_still_verifies(tmp_p
 
     patch_retrieval(monkeypatch, deep_research, unexpected)
     result = deep_research.run_deep_research(
-        "真正性の確保について説明してください", model="m", source_root=root, timeout_seconds=300,
+        "真正性の確保について説明してください",
+        model="m",
+        source_root=root,
+        timeout_seconds=300,
         fixed_document={
-            "path": NOTICE_PATH, "sha256": hashlib.sha256((root / NOTICE_PATH).read_bytes()).hexdigest(),
-            "focus_ranges": [[18, 19, NOTICE_PATH]], "focus_only": True,
+            "path": NOTICE_PATH,
+            "sha256": hashlib.sha256((root / NOTICE_PATH).read_bytes()).hexdigest(),
+            "focus_ranges": [[18, 19, NOTICE_PATH]],
+            "focus_only": True,
         },
     )
-    expected = deep_research.ANSWER_STATE_GENERATED if supported else deep_research.ANSWER_STATE_VERIFICATION_FAILED
+    expected = (
+        deep_research.ANSWER_STATE_GENERATED
+        if supported
+        else deep_research.ANSWER_STATE_VERIFICATION_FAILED
+    )
     assert result.answer_state == expected
     assert [(item["start_line"], item["end_line"]) for item in result.evidence] == [(18, 19)]
     assert K2 in prompts[0] and K1 not in prompts[0]
@@ -357,8 +473,17 @@ def test_deep_explicit_section_uses_only_selected_lines_and_still_verifies(tmp_p
 
 def test_appendix_and_exception_note_appear_in_overview_and_options():
     units = ss.primary_units(NOTICE)
-    kinds = [(u["start_line"], u["end_line"], u["kind"], u["ancillary"]) for u in units if u["start_line"] >= 20]
-    assert kinds == [(20, 22, "body", True), (23, 30, "appendix", False), (31, 31, "note", False), (33, 33, "note", True)]
+    kinds = [
+        (u["start_line"], u["end_line"], u["kind"], u["ancillary"])
+        for u in units
+        if u["start_line"] >= 20
+    ]
+    assert kinds == [
+        (20, 22, "body", True),
+        (23, 30, "appendix", False),
+        (31, 31, "note", False),
+        (33, 33, "note", True),
+    ]
     overview = gf.build_overview(NOTICE)
     appendix = next(p for p in overview["points"] if "別紙" in p["heading"])
     assert appendix["text"].startswith("| 押印欄のある様式等 | 通知等の名称 |")
@@ -375,7 +500,10 @@ def test_excerpt_shows_separate_cited_lines_with_their_own_ranges():
     unit_lines = NOTICE.splitlines()[19:33] + ["| 追加 | " + "あ" * 300 + " |"] * 2
     unit = "\n".join(unit_lines)
     lines = [""] * 19 + unit_lines  # 行番号20から始まる根拠範囲
-    answer = ["本通知は令和３年１月１日から適用する。[E5]", "本通知とは別の取組は除外され、疑義は監査指導室へ照会する。[E5]"]
+    answer = [
+        "本通知は令和３年１月１日から適用する。[E5]",
+        "本通知とは別の取組は除外され、疑義は監査指導室へ照会する。[E5]",
+    ]
     selected = web_services.select_excerpt(unit, 20, focus=answer)
     assert len(selected["snippet"]) <= web_services.EVIDENCE_EXCERPT_MAX_CHARS
     segments = selected["segments"]
@@ -404,20 +532,41 @@ def test_split_parts_become_one_candidate_and_one_fixed_document(tmp_path):
     decision = gf.decide("契約事務研修講義資料の内容詳細", chunks, root)
     assert decision.kind == "topics"
     assert {p.get("path") for p in decision.overview["points"]} == set(parts)  # 部分ごとの概要
-    assert all(o["label"].startswith("［1/2］") for o in decision.overview["options"] if o["kind"] == "section")
+    assert all(
+        o["label"].startswith("［1/2］")
+        for o in decision.overview["options"]
+        if o["kind"] == "section"
+    )
     fixed = decision.document
-    plan = gf.resolve_follow_up(fixed, gf.Topic(), decision.overview["options"], action=gf.ACTION_FOLLOW_UP,
-                                text="随意契約の要件")
-    assert plan.ask is None and plan.focus_ranges[0][2] == "tebiki/契約事務研修講義資料-resegmented-02.md"
+    plan = gf.resolve_follow_up(
+        fixed,
+        gf.Topic(),
+        decision.overview["options"],
+        action=gf.ACTION_FOLLOW_UP,
+        text="随意契約の要件",
+    )
+    assert (
+        plan.ask is None
+        and plan.focus_ranges[0][2] == "tebiki/契約事務研修講義資料-resegmented-02.md"
+    )
     sha = {m["path"]: m["sha256"] for m in fixed["paths"]}
-    forced = {"path": fixed["path"], "title": fixed["title"], "sha256": fixed["sha256"],
-              "paths": [{"path": p, "sha256": h} for p, h in sha.items()],
-              "focus_ranges": [list(r) for r in plan.focus_ranges], "primary": False}
-    items, _ = search._with_primary_ranges("q", [], source_root=root, chunks=None, char_budget=4000, item_limit=5, forced=forced)
+    forced = {
+        "path": fixed["path"],
+        "title": fixed["title"],
+        "sha256": fixed["sha256"],
+        "paths": [{"path": p, "sha256": h} for p, h in sha.items()],
+        "focus_ranges": [list(r) for r in plan.focus_ranges],
+        "primary": False,
+    }
+    items, _ = search._with_primary_ranges(
+        "q", [], source_root=root, chunks=None, char_budget=4000, item_limit=5, forced=forced
+    )
     assert [i["path"] for i in items] == ["tebiki/契約事務研修講義資料-resegmented-02.md"]
     # 1部分でも変わると固定資料として読めない。
     (root / "tebiki/契約事務研修講義資料-resegmented-02.md").write_text("変更\n", encoding="utf-8")
-    assert search._with_primary_ranges("q", [], source_root=root, chunks=None, char_budget=4000, item_limit=5, forced=forced) == ([], [])
+    assert search._with_primary_ranges(
+        "q", [], source_root=root, chunks=None, char_budget=4000, item_limit=5, forced=forced
+    ) == ([], [])
 
 
 def test_deep_restricts_to_all_parts_of_a_fixed_split_document(tmp_path):
@@ -426,10 +575,17 @@ def test_deep_restricts_to_all_parts_of_a_fixed_split_document(tmp_path):
         "tebiki/資料-resegmented-02.md": "# 資料2\n本文2。\n",
     }
     root = _root(tmp_path, parts)
-    sources, chunks = deep_research._snapshot(root.resolve(), deep_research.DeepBudget(300), lambda *a, **k: None)
-    fixed = {"path": "tebiki/資料-resegmented-01.md", "sha256": "", "paths": [
-        {"path": p, "sha256": sources[p][1]} for p in parts]}
-    restricted, kept = deep_research._restrict_to_document(sources, chunks, fixed, lambda *a, **k: None)
+    sources, chunks = deep_research._snapshot(
+        root.resolve(), deep_research.DeepBudget(300), lambda *a, **k: None
+    )
+    fixed = {
+        "path": "tebiki/資料-resegmented-01.md",
+        "sha256": "",
+        "paths": [{"path": p, "sha256": sources[p][1]} for p in parts],
+    }
+    restricted, kept = deep_research._restrict_to_document(
+        sources, chunks, fixed, lambda *a, **k: None
+    )
     assert set(restricted) == set(parts) and {c["path"] for c in kept} == set(parts)
     batch = deep_research._fixed_candidates(restricted, {**fixed, "primary": True})
     assert {c["path"] for c in batch} == set(parts)
@@ -446,15 +602,27 @@ def test_related_memo_citing_the_notice_number_is_offered_and_kept(tmp_path):
     assert len(related) == 1 and related[0]["paths"][0]["path"] == MEMO_PATH
     assert related[0]["label"].startswith("関連資料（事務連絡")
     index = decision.overview["options"].index(related[0])
-    plan = gf.resolve_follow_up(decision.document, gf.Topic(), decision.overview["options"],
-                                action=gf.ACTION_SELECT_TOPIC, choice=index)
+    plan = gf.resolve_follow_up(
+        decision.document,
+        gf.Topic(),
+        decision.overview["options"],
+        action=gf.ACTION_SELECT_TOPIC,
+        choice=index,
+    )
     assert plan.related["paths"][0]["path"] == MEMO_PATH and plan.overview is True
     store = gf.ConfirmationStore()
     decision.document["indexMarker"] = None
     record = store.create("s", "q", decision)
-    store.begin(record.confirmation_id, "s", action=gf.ACTION_SELECT_TOPIC,
-                options_version=record.options_version, request_id="r")
-    public = store.finish(record.confirmation_id, "r", add_paths=plan.related["paths"], completed=True)
+    store.begin(
+        record.confirmation_id,
+        "s",
+        action=gf.ACTION_SELECT_TOPIC,
+        options_version=record.options_version,
+        request_id="r",
+    )
+    public = store.finish(
+        record.confirmation_id, "r", add_paths=plan.related["paths"], completed=True
+    )
     assert public["document"]["parts"] == 2
 
 
@@ -462,13 +630,21 @@ def test_related_memo_citing_the_notice_number_is_offered_and_kept(tmp_path):
 
 
 def test_nested_title_matches_confirm_the_longest_and_generic_cores_do_not():
-    docs = ss.documents_from_texts({
-        "laws/毒物及び劇物取締法.md": "# 毒物及び劇物取締法\n本文\n",
-        "laws/毒物及び劇物取締法施行令.md": "# 毒物及び劇物取締法施行令\n本文\n",
-        "notice/一部改正.md": "# 一部改正について\n本文\n",
-    })
-    assert ss.match_documents("毒物及び劇物取締法施行令について詳しく", docs)["confirmed"] == "laws/毒物及び劇物取締法施行令.md"
-    assert ss.match_documents("毒物及び劇物取締法について詳しく", docs)["confirmed"] == "laws/毒物及び劇物取締法.md"
+    docs = ss.documents_from_texts(
+        {
+            "laws/毒物及び劇物取締法.md": "# 毒物及び劇物取締法\n本文\n",
+            "laws/毒物及び劇物取締法施行令.md": "# 毒物及び劇物取締法施行令\n本文\n",
+            "notice/一部改正.md": "# 一部改正について\n本文\n",
+        }
+    )
+    assert (
+        ss.match_documents("毒物及び劇物取締法施行令について詳しく", docs)["confirmed"]
+        == "laws/毒物及び劇物取締法施行令.md"
+    )
+    assert (
+        ss.match_documents("毒物及び劇物取締法について詳しく", docs)["confirmed"]
+        == "laws/毒物及び劇物取締法.md"
+    )
     assert ss.match_documents("一部改正について教えて", docs)["confirmed"] is None
 
 
@@ -476,9 +652,15 @@ def test_title_words_of_unconfirmed_candidates_are_not_asked_items(tmp_path):
     root = tmp_path / "skill-source"
     (root / "a").mkdir(parents=True)
     (root / "b").mkdir(parents=True)
-    (root / "a/銃砲の範囲を定める命令.md").write_text("# 銃砲の範囲を定める命令\n本文。\n", encoding="utf-8")
-    (root / "b/銃砲の範囲を定める命令.md").write_text("# 銃砲の範囲を定める命令\n別版の本文。\n", encoding="utf-8")
-    decision = gf.decide("銃砲の範囲を定める命令について教えてください", search.build_source_chunks(root), root)
+    (root / "a/銃砲の範囲を定める命令.md").write_text(
+        "# 銃砲の範囲を定める命令\n本文。\n", encoding="utf-8"
+    )
+    (root / "b/銃砲の範囲を定める命令.md").write_text(
+        "# 銃砲の範囲を定める命令\n別版の本文。\n", encoding="utf-8"
+    )
+    decision = gf.decide(
+        "銃砲の範囲を定める命令について教えてください", search.build_source_chunks(root), root
+    )
     assert decision.kind == "documents"  # 「範囲」は表題の語であり、尋ねている項目ではない
 
 
@@ -486,13 +668,17 @@ def test_deep_does_not_read_a_hit_range_already_read_as_primary(tmp_path, monkey
     root = _root(tmp_path)
     candidates = _candidates(root, [(NOTICE_PATH, 31)])
     patch_retrieval(
-        monkeypatch, deep_research,
+        monkeypatch,
+        deep_research,
         lambda q, ch, **k: deep_candidate_selection.select_candidates(candidates, source_chunks=ch),
     )
     prompts = []
     _fake_models(monkeypatch, prompts)
     result = deep_research.run_deep_research(
-        "会計手続における押印の見直しについての内容詳細", model="m", source_root=root, timeout_seconds=300,
+        "会計手続における押印の見直しについての内容詳細",
+        model="m",
+        source_root=root,
+        timeout_seconds=300,
     )
     ranges = [(e["start_line"], e["end_line"]) for e in result.evidence if e["path"] == NOTICE_PATH]
     assert (31, 31) in ranges and (20, 33) not in ranges
@@ -502,9 +688,22 @@ def test_deep_does_not_read_a_hit_range_already_read_as_primary(tmp_path, monkey
 
 def test_follow_up_leaves_the_selected_section_when_the_asked_item_is_elsewhere():
     """受入（R7）: 「１ 押印の見直し」選択中に「別紙の様式のうち除かれるものは？」で除外の注記を拾う。"""
-    document = {"path": NOTICE_PATH, "title": "会計手続における押印の見直しについて（通知）", "sha256": "x", "text": NOTICE}
+    document = {
+        "path": NOTICE_PATH,
+        "title": "会計手続における押印の見直しについて（通知）",
+        "sha256": "x",
+        "text": NOTICE,
+    }
     options = gf.build_overview(NOTICE)["options"]
-    topic = gf.resolve_follow_up(document, gf.Topic(), options, action=gf.ACTION_SELECT_TOPIC, choice=0).topic
-    plan = gf.resolve_follow_up(document, topic, options, action=gf.ACTION_FOLLOW_UP, text="別紙の様式のうち除かれるものは？")
+    topic = gf.resolve_follow_up(
+        document, gf.Topic(), options, action=gf.ACTION_SELECT_TOPIC, choice=0
+    ).topic
+    plan = gf.resolve_follow_up(
+        document,
+        topic,
+        options,
+        action=gf.ACTION_FOLLOW_UP,
+        text="別紙の様式のうち除かれるものは？",
+    )
     assert plan.ask is None
     assert any(start <= 31 <= end for start, end, _ in plan.focus_ranges)

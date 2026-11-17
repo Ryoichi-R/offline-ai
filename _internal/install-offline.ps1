@@ -211,12 +211,12 @@ function Install-MsiIfMissing {
         Write-Host "  [情報] $Name の MSI が同梱されていないためスキップします: $MsiPath" -ForegroundColor Yellow
         return
     }
-    $args = @("/i", $MsiPath, "/qn", "/norestart") + $MsiProperties
+    $msiArguments = @("/i", $MsiPath, "/qn", "/norestart") + $MsiProperties
     if ($DryRun) {
-        Write-Plan "$Name インストール: msiexec $($args -join ' ')"
+        Write-Plan "$Name インストール: msiexec $($msiArguments -join ' ')"
         return
     }
-    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArguments -Wait -PassThru
     if ($p.ExitCode -ne 0) {
         throw "$Name MSI が失敗しました: exit $($p.ExitCode)"
     }
@@ -808,12 +808,12 @@ function ConvertTo-OfflineAiPlacementObservation {
         [Parameter(Mandatory = $true)][string]$Model
     )
 
-    $matches = @($PsResponse.models | Where-Object {
+    $matchingModels = @($PsResponse.models | Where-Object {
         $properties = @($_.PSObject.Properties.Name)
         $name = if ($properties -contains 'name') { [string]$_.name } elseif ($properties -contains 'model') { [string]$_.model } else { '' }
         $name -eq $Model -or $name -eq "${Model}:latest"
     })
-    if ($matches.Count -eq 0) {
+    if ($matchingModels.Count -eq 0) {
         return [PSCustomObject]@{
             status = 'ModelNotLoaded'
             model = $Model
@@ -824,7 +824,7 @@ function ConvertTo-OfflineAiPlacementObservation {
             contextLength = $null
         }
     }
-    $entry = $matches[0]
+    $entry = $matchingModels[0]
     $properties = @($entry.PSObject.Properties.Name)
     [Int64]$sizeBytes = if ($properties -contains 'size') { [Int64]$entry.size } else { 0 }
     [Int64]$sizeVramBytes = if ($properties -contains 'size_vram') { [Int64]$entry.size_vram } else { 0 }

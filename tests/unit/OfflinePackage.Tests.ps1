@@ -669,11 +669,11 @@ Describe "offline-ai remediation dynamic regressions" -Tag 'WindowsOnly' {
             foreach ($relative in @('installers', 'ollama-models', 'optional-components')) {
                 Test-Path -LiteralPath (Join-Path $output $relative) | Should -BeFalse
             }
-            $matches = @(
+            $sentinelMatches = @(
                 Get-ChildItem -LiteralPath $output -File -Recurse |
                     Select-String -SimpleMatch $sentinel -List
             )
-            $matches.Count | Should -Be 0
+            $sentinelMatches.Count | Should -Be 0
             Test-Path -LiteralPath (Join-Path $output 'checksums.sha256') -PathType Leaf | Should -BeTrue
         } finally {
             Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -719,9 +719,9 @@ Describe "offline-ai remediation dynamic regressions" -Tag 'WindowsOnly' {
             New-Item -Path $tmp -ItemType Directory -Force | Out-Null
             $capture = Join-Path $tmp 'captured.txt'
             $marker = Join-Path $tmp 'injected.txt'
-            $input = Join-Path $tmp 'input.txt'
+            $inputFile = Join-Path $tmp 'input.txt'
             $query = 'x" & echo injected>"' + $marker + '" & rem " | bang!'
-            [System.IO.File]::WriteAllLines($input, @($query, 'n', 'x'), [System.Text.Encoding]::ASCII)
+            [System.IO.File]::WriteAllLines($inputFile, @($query, 'n', 'x'), [System.Text.Encoding]::ASCII)
             $fakePythonSource = @'
 using System;
 using System.IO;
@@ -752,7 +752,7 @@ public static class FakePython
             Copy-Item -LiteralPath $fakePythonPath -Destination (Join-Path $tmp 'curl.exe')
             $env:PATH = "$tmp;$oldPath"
             $env:SEARCH_CAPTURE = $capture
-            $cmdLine = 'call "' + $script:SearchBatPath + '" < "' + $input + '"'
+            $cmdLine = 'call "' + $script:SearchBatPath + '" < "' + $inputFile + '"'
 
             $output = & cmd.exe /d /c $cmdLine 2>&1
             $exitCode = $LASTEXITCODE
@@ -777,15 +777,15 @@ public static class FakePython
         $outputPath = Join-Path $script:OfflineAiRoot "offline-package\dryrun-$([guid]::NewGuid().ToString('N'))"
         try {
             New-Item -Path $tmp -ItemType Directory -Force | Out-Null
-            $input = Join-Path $tmp 'input.txt'
-            [System.IO.File]::WriteAllLines($input, @('x'), [System.Text.Encoding]::ASCII)
+            $inputFile = Join-Path $tmp 'input.txt'
+            [System.IO.File]::WriteAllLines($inputFile, @('x'), [System.Text.Encoding]::ASCII)
 
-            $successCommand = 'call "' + $script:DownloadBatPath + '" -OutputPath "' + $outputPath + '" -SkipInstallers -SkipModels -DryRun < "' + $input + '"'
+            $successCommand = 'call "' + $script:DownloadBatPath + '" -OutputPath "' + $outputPath + '" -SkipInstallers -SkipModels -DryRun < "' + $inputFile + '"'
             $successOutput = & cmd.exe /d /c $successCommand 2>&1
             $successExit = $LASTEXITCODE
             $successExit | Should -Be 0 -Because ($successOutput -join "`n")
 
-            $failureCommand = 'call "' + $script:DownloadBatPath + '" -OutputPath "' + $script:OfflineAiRoot + '" -SkipInstallers -SkipModels -DryRun < "' + $input + '"'
+            $failureCommand = 'call "' + $script:DownloadBatPath + '" -OutputPath "' + $script:OfflineAiRoot + '" -SkipInstallers -SkipModels -DryRun < "' + $inputFile + '"'
             $failureOutput = & cmd.exe /d /c $failureCommand 2>&1
             $failureExit = $LASTEXITCODE
             $failureExit | Should -Not -Be 0 -Because ($failureOutput -join "`n")

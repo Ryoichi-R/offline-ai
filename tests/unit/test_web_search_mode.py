@@ -162,11 +162,15 @@ def test_search_cancel_requires_owner_and_sets_server_token(running_server):
     assert body["error"]["code"] == "unauthorized"
 
 
-
-@pytest.mark.parametrize("suffix", [
-    "&resume_only=", "&resume_only=0", "&resume_only=1&resume_only=1",
-    "&resume_only=1&request_id=",
-])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "&resume_only=",
+        "&resume_only=0",
+        "&resume_only=1&resume_only=1",
+        "&resume_only=1&request_id=",
+    ],
+)
 def test_invalid_resume_never_starts_worker(running_server, suffix):
     server, _ = running_server
     status, _body = _request(server, "/api/search?q=test" + suffix)
@@ -186,7 +190,9 @@ def test_missing_resume_after_restart_or_expiry_never_creates_job(running_server
     assert calls == []
 
 
-def test_resume_preserves_token_deadline_and_replays_terminal_without_worker(running_server, monkeypatch):
+def test_resume_preserves_token_deadline_and_replays_terminal_without_worker(
+    running_server, monkeypatch
+):
     server, _ = running_server
     calls = []
     monkeypatch.setattr(web_server, "run_search", lambda *a, **k: calls.append(1))
@@ -195,8 +201,11 @@ def test_resume_preserves_token_deadline_and_replays_terminal_without_worker(run
     fingerprint = ("test-session-token", "test", "off", 300, "deep")
     entry, _ = server.job_table.submit("existing", token, fingerprint=fingerprint, mode="deep")
     same, is_new = server.job_table.submit(
-        "existing", web_services.CancellationToken(300),
-        fingerprint=fingerprint, mode="deep", resume_only=True,
+        "existing",
+        web_services.CancellationToken(300),
+        fingerprint=fingerprint,
+        mode="deep",
+        resume_only=True,
     )
     assert same is entry and not is_new
     assert same.cancel_token.deadline == deadline
@@ -204,8 +213,14 @@ def test_resume_preserves_token_deadline_and_replays_terminal_without_worker(run
     entry.broadcast({"type": "done", "status": "partial", "stopReason": "time_budget"})
     server.job_table.finish("existing")
     conn = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=10)
-    conn.request("GET", "/api/search?q=test&mode=deep&reasoning=off&timeout_seconds=300&request_id=existing&resume_only=1",
-                 headers={"Host": f"127.0.0.1:{server.bind_port}", "Cookie": "offlineai_session=test-session-token"})
+    conn.request(
+        "GET",
+        "/api/search?q=test&mode=deep&reasoning=off&timeout_seconds=300&request_id=existing&resume_only=1",
+        headers={
+            "Host": f"127.0.0.1:{server.bind_port}",
+            "Cookie": "offlineai_session=test-session-token",
+        },
+    )
     response = conn.getresponse()
     assert response.status == 200
     assert '"type": "done"' in response.read().decode("utf-8")
@@ -213,12 +228,16 @@ def test_resume_preserves_token_deadline_and_replays_terminal_without_worker(run
     assert calls == []
     assert server.job_table.get("existing").cancel_token is token
     assert token.deadline == deadline
-    status, _ = _request(server, "/api/search?q=changed&mode=deep&reasoning=off&request_id=existing&resume_only=1")
+    status, _ = _request(
+        server, "/api/search?q=changed&mode=deep&reasoning=off&request_id=existing&resume_only=1"
+    )
     assert status == 409
     # Expired completed entries are never resurrected by resume.
     entry.completed_at -= server.job_table.JOB_TTL + 1
     server.job_table._cleanup_expired()
-    status, _ = _request(server, "/api/search?q=test&mode=deep&reasoning=off&request_id=existing&resume_only=1")
+    status, _ = _request(
+        server, "/api/search?q=test&mode=deep&reasoning=off&request_id=existing&resume_only=1"
+    )
     assert status == 404
     assert calls == []
 
@@ -229,13 +248,16 @@ def test_resume_rejects_another_owner_atomically():
         token = web_services.CancellationToken(300)
         table.submit("owner", token, fingerprint=("one", "q", "off", 300, "deep"))
         with pytest.raises(web_services.RequestConflictError):
-            table.submit("owner", web_services.CancellationToken(300),
-                         fingerprint=("two", "q", "off", 300, "deep"), resume_only=True)
+            table.submit(
+                "owner",
+                web_services.CancellationToken(300),
+                fingerprint=("two", "q", "off", 300, "deep"),
+                resume_only=True,
+            )
         assert table.running_count == 1
         assert table.get("owner").cancel_token is token
     finally:
         table.shutdown()
-
 
 
 def test_running_search_disconnect_resume_uses_one_worker(running_server, monkeypatch):
@@ -250,7 +272,10 @@ def test_running_search_disconnect_resume_uses_one_worker(running_server, monkey
             event_queue.put({"type": "done", "status": "partial"})
 
     monkeypatch.setattr(web_server, "run_search", worker)
-    headers = {"Host": f"127.0.0.1:{server.bind_port}", "Cookie": "offlineai_session=test-session-token"}
+    headers = {
+        "Host": f"127.0.0.1:{server.bind_port}",
+        "Cookie": "offlineai_session=test-session-token",
+    }
     path = "/api/search?q=test&mode=deep&reasoning=off&timeout_seconds=300&request_id=running"
     first = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=5)
     second = http.client.HTTPConnection("127.0.0.1", server.bind_port, timeout=5)

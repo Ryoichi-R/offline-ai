@@ -89,9 +89,7 @@ class _Env:
 
     def chunk_texts(self, rel: str) -> list[str]:
         return [
-            chunk["text"]
-            for chunk in search.build_source_chunks(self.src)
-            if chunk["path"] == rel
+            chunk["text"] for chunk in search.build_source_chunks(self.src) if chunk["path"] == rel
         ]
 
 
@@ -317,9 +315,13 @@ def test_compatibility_change_recomputes_every_chunk(env, monkeypatch, change):
     if change == "digest":
         env.digest = "replaced-same-name-model"
     elif change == "parser_version":
-        monkeypatch.setattr(search, "EMBED_SOURCE_PARSER_VERSION", search.EMBED_SOURCE_PARSER_VERSION + 1)
+        monkeypatch.setattr(
+            search, "EMBED_SOURCE_PARSER_VERSION", search.EMBED_SOURCE_PARSER_VERSION + 1
+        )
     else:
-        monkeypatch.setattr(search, "EMBED_COMPATIBILITY_VERSION", search.EMBED_COMPATIBILITY_VERSION + 1)
+        monkeypatch.setattr(
+            search, "EMBED_COMPATIBILITY_VERSION", search.EMBED_COMPATIBILITY_VERSION + 1
+        )
 
     assert search.get_embed_index_status(MODEL)["state"] != "ready"
     plan = search.plan_embed_index_update(MODEL)
@@ -631,8 +633,16 @@ def test_plan_is_side_effect_free_and_matches_the_following_build(env):
     [
         ({}, "no_rate", None),
         ({"rate_per_second": 2.0}, "no_rate", None),  # 旧processed基準は流用しない
-        ({"rate_per_second": 2.0, "rate_basis": "generated", "embed_model": "other"}, "no_rate", None),
-        ({"rate_per_second": 2.0, "rate_basis": "generated", "embed_model": MODEL}, "estimated", 1.0),
+        (
+            {"rate_per_second": 2.0, "rate_basis": "generated", "embed_model": "other"},
+            "no_rate",
+            None,
+        ),
+        (
+            {"rate_per_second": 2.0, "rate_basis": "generated", "embed_model": MODEL},
+            "estimated",
+            1.0,
+        ),
     ],
 )
 def test_plan_estimate_uses_same_model_generated_rate_only(
@@ -695,7 +705,9 @@ def test_progress_rate_uses_embedding_time_and_protects_existing_rate():
     )
     assert first["rate_per_second"] == 2.0
 
-    none = fields({"processed": 0, "generated": 0}, 2, started, {"rate_per_second": None, "rate_basis": None})
+    none = fields(
+        {"processed": 0, "generated": 0}, 2, started, {"rate_per_second": None, "rate_basis": None}
+    )
     assert none["rate_per_second"] is None and none["eta_seconds"] is None
 
 
@@ -854,7 +866,10 @@ def test_index_start_api_keeps_legacy_body_and_rejects_bad_requests(web):
         assert status == 400 and payload["error"]["code"] == "invalid_mode"
 
     fake.start_error = ValueError("invalid index mode")
-    assert request("POST", "/api/index/start", '{"mode": "partial"}')[1]["error"]["code"] == "invalid_mode"
+    assert (
+        request("POST", "/api/index/start", '{"mode": "partial"}')[1]["error"]["code"]
+        == "invalid_mode"
+    )
     fake.start_error = index_service.IndexModeConflictError("resume mode differs")
     status, payload = request("POST", "/api/index/resume", '{"mode": "full"}')
     assert status == 409 and payload["error"]["code"] == "index_mode_conflict"

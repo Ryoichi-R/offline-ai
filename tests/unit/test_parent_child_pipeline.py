@@ -204,23 +204,32 @@ def _structural_matches(snippet, *, partial=False, parent_heading="詳細手順"
 def test_sufficient_upgrade_requires_complete_expansion_and_terms():
     """完全展開1件・親の語彙一致・配下の全行・must_find_terms全充足で完全構造根拠になる。"""
     matches = _structural_matches("必須語Aと必須語Bを含む本文です。関連する説明も十分にあります。")
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is True
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is True
+    )
 
 
 def test_sufficient_upgrade_rejected_when_terms_missing():
     matches = _structural_matches("必須語Aだけを含む本文です。")
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is False
+    )
 
 
 def test_sufficient_upgrade_rejected_when_partial():
     matches = _structural_matches("必須語Aと必須語Bを含む本文。", partial=True)
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is False
+    )
 
 
 def test_sufficient_upgrade_rejected_without_must_find_terms():
@@ -237,24 +246,33 @@ def test_sufficient_upgrade_rejected_without_must_find_terms():
 def test_sufficient_upgrade_rejected_without_parent_lexical_support():
     """親見出しが質問と語彙一致しない（意味近接だけの）場合は完全構造根拠にしない。"""
     matches = _structural_matches("必須語Aと必須語Bを含む本文。", parent_heading="別の話題")
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is False
+    )
 
 
 def test_sufficient_upgrade_rejected_when_parent_is_not_adopted():
     matches = _structural_matches("必須語Aと必須語Bを含む本文。")[1:]
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is False
+    )
 
 
 def test_sufficient_upgrade_rejected_when_body_lines_are_not_covered():
     """配下の非空行の一部が採用根拠の行範囲に無ければ、partial印が無くても不完全とする。"""
     matches = _structural_matches("必須語Aと必須語Bを含む本文。", required=[[3, 3], [5, 6]])
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches, ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches, ["必須語A", "必須語B"]
+        )
+        is False
+    )
     covering_direct = {
         "path": "doc.md",
         "chunk_id": "doc.md#0003",
@@ -263,13 +281,19 @@ def test_sufficient_upgrade_rejected_when_body_lines_are_not_covered():
         "snippet": "直接ヒットした残りの本文",
         "source": "keyword",
     }
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches + [covering_direct], ["必須語A", "必須語B"]
-    ) is True
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches + [covering_direct], ["必須語A", "必須語B"]
+        )
+        is True
+    )
     truncated_direct = {**covering_direct, "snippet_truncated": True}
-    assert search._has_complete_structural_evidence(
-        "詳細手順を教えて", matches + [truncated_direct], ["必須語A", "必須語B"]
-    ) is False
+    assert (
+        search._has_complete_structural_evidence(
+            "詳細手順を教えて", matches + [truncated_direct], ["必須語A", "必須語B"]
+        )
+        is False
+    )
 
 
 def test_direct_hit_overlapping_expansion_range_is_deduped():
@@ -302,8 +326,22 @@ def test_direct_hit_overlapping_expansion_range_is_deduped():
 def test_fully_overlapped_expansion_range_is_removed():
     direct = [{"path": "doc.md", "start_line": 3, "end_line": 4, "chunk_id": "doc.md#0002"}]
     expanded = [
-        {"path": "doc.md", "start_line": 3, "end_line": 4, "snippet": "a\nb", "chunk_id": "g1#r01", "group_id": "g1"},
-        {"path": "doc.md", "start_line": 6, "end_line": 7, "snippet": "c\nd", "chunk_id": "g1#r02", "group_id": "g1"},
+        {
+            "path": "doc.md",
+            "start_line": 3,
+            "end_line": 4,
+            "snippet": "a\nb",
+            "chunk_id": "g1#r01",
+            "group_id": "g1",
+        },
+        {
+            "path": "doc.md",
+            "start_line": 6,
+            "end_line": 7,
+            "snippet": "c\nd",
+            "chunk_id": "g1#r02",
+            "group_id": "g1",
+        },
     ]
     kept, _direct, _removed = search._dedupe_expansion_against_direct_hits(expanded, direct)
     assert [(m["start_line"], m["chunk_id"]) for m in kept] == [(6, "g1#r01")]

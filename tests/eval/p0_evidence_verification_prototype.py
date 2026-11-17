@@ -144,7 +144,7 @@ def _parse_json_object(text: str) -> dict | None:
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
         if text.endswith("```"):
-            text = text[: -3]
+            text = text[:-3]
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
@@ -164,7 +164,9 @@ class VerificationCallResult:
     error: str = ""
 
 
-def call_verification_model(model: str, prompt: str, *, timeout: float = VERIFICATION_TIMEOUT) -> VerificationCallResult:
+def call_verification_model(
+    model: str, prompt: str, *, timeout: float = VERIFICATION_TIMEOUT
+) -> VerificationCallResult:
     """検索計画(create_search_plan)と同じ呼び出し設定でOllamaへ問い合わせる。
 
     think=False, keep_alive=OLLAMA_KEEP_ALIVE, options=build_chat_options()を
@@ -202,14 +204,18 @@ def call_verification_model(model: str, prompt: str, *, timeout: float = VERIFIC
 
     parsed = _parse_json_object(raw_text)
     if parsed is None:
-        return VerificationCallResult(latency_ms=latency_ms, raw_text=raw_text, error="json_parse_failed")
+        return VerificationCallResult(
+            latency_ms=latency_ms, raw_text=raw_text, error="json_parse_failed"
+        )
     try:
         validated = validate_verification_json(parsed)
     except VerificationJsonError as exc:
         return VerificationCallResult(
             latency_ms=latency_ms, raw_text=raw_text, parsed=parsed, error=str(exc)
         )
-    return VerificationCallResult(latency_ms=latency_ms, raw_text=raw_text, parsed=parsed, validated=validated)
+    return VerificationCallResult(
+        latency_ms=latency_ms, raw_text=raw_text, parsed=parsed, validated=validated
+    )
 
 
 # --- 試作対象質問 -----------------------------------------------------------
@@ -225,7 +231,9 @@ class ProbeCase:
     notes: str = ""
 
 
-def _corpus_matches(question_id: str, spec_path: Path, route: str = harness.ROUTE_KEYWORD) -> list[dict]:
+def _corpus_matches(
+    question_id: str, spec_path: Path, route: str = harness.ROUTE_KEYWORD
+) -> list[dict]:
     """既存の評価corpusから、指定質問の実際の採用根拠(keyword route)を取得する。"""
     spec = harness.load_spec(spec_path)
     question = next(q for q in spec.questions if q.id == question_id)
@@ -416,7 +424,9 @@ def run_probe(cases: list[ProbeCase], *, model: str, repeat: int) -> dict[str, A
 
 def summarize(results: dict[str, list[dict]], cases: list[ProbeCase]) -> str:
     lines = ["# P0 検証prompt単体試作 結果", ""]
-    lines.append("| ID | 型 | json妥当率 | support分布 | latency中央値(ms) | latency最大(ms) | 期待support |")
+    lines.append(
+        "| ID | 型 | json妥当率 | support分布 | latency中央値(ms) | latency最大(ms) | 期待support |"
+    )
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     case_by_id = {c.id: c for c in cases}
     for case_id, runs in results.items():

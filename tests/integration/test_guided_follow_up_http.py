@@ -44,8 +44,12 @@ def guided_server(monkeypatch, tmp_path):
     calls = []
 
     def fake_core(query, reasoning, event_queue, cancel_token, request_id, **kwargs):
-        calls.append({"query": query, "fixed": kwargs.get("fixed_document"), "mode": kwargs.get("mode")})
-        event_queue.put({"type": "result_meta", "requestId": request_id, "mode": kwargs.get("mode")})
+        calls.append(
+            {"query": query, "fixed": kwargs.get("fixed_document"), "mode": kwargs.get("mode")}
+        )
+        event_queue.put(
+            {"type": "result_meta", "requestId": request_id, "mode": kwargs.get("mode")}
+        )
         event_queue.put({"type": "chunk", "text": "回答"})
         event_queue.put({"type": "done"})
 
@@ -74,7 +78,11 @@ def _request(server, method, path, body=None, session=SESSION):
     headers = {"Host": f"127.0.0.1:{server.bind_port}", "Cookie": f"offlineai_session={session}"}
     data = None
     if body is not None:
-        data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        data = (
+            body
+            if isinstance(body, bytes)
+            else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        )
         headers["Content-Type"] = "application/json"
         headers["Origin"] = f"http://127.0.0.1:{server.bind_port}"
     conn.request(method, path, body=data, headers=headers)
@@ -90,7 +98,9 @@ def _types(events):
 
 
 def _start(server):
-    status, events, _ = _request(server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=g1")
+    status, events, _ = _request(
+        server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=g1"
+    )
     assert status == 200
     return next(event for event in events if event["type"] == "clarification")
 
@@ -107,7 +117,9 @@ def _continue(server, clarification, request_id, **fields):
 
 def test_broad_question_returns_clarification_without_answer_processing(guided_server):
     server, calls, _ = guided_server
-    status, events, _ = _request(server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=g1")
+    status, events, _ = _request(
+        server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=g1"
+    )
     assert status == 200
     assert _types(events) == ["clarification", "done"]
     done = events[-1]
@@ -115,14 +127,20 @@ def test_broad_question_returns_clarification_without_answer_processing(guided_s
     clarification = events[-2]
     assert clarification["kind"] == "topics"
     assert clarification["document"]["title"].startswith("会計事務における押印の取扱い")
-    assert [o["label"] for o in clarification["options"]][:3] == ["1 趣旨", "2 提出書類", "3 領収書の保存"]
+    assert [o["label"] for o in clarification["options"]][:3] == [
+        "1 趣旨",
+        "2 提出書類",
+        "3 領収書の保存",
+    ]
     assert calls == []  # 確認段階ではモデル検出・回答処理へ進まない
 
 
 def test_specific_question_goes_straight_to_the_existing_path(guided_server):
     server, calls, _ = guided_server
     query = "会計事務における押印の取扱いについての適用日はいつですか"
-    status, events, _ = _request(server, "GET", f"/api/search?q={quote(query)}&mode=answer&request_id=g2")
+    status, events, _ = _request(
+        server, "GET", f"/api/search?q={quote(query)}&mode=answer&request_id=g2"
+    )
     assert status == 200 and _types(events) == ["result_meta", "chunk", "done"]
     assert calls == [{"query": query, "fixed": None, "mode": "answer"}]
 
@@ -130,18 +148,25 @@ def test_specific_question_goes_straight_to_the_existing_path(guided_server):
 def test_guided_overview_links_to_the_original_lines_and_restores_access(guided_server):
     server, _, root = guided_server
     initial = _start(server)
-    status, _, payload = _request(server, "GET", f"/api/confirmation?id={initial['confirmationId']}")
+    status, _, payload = _request(
+        server, "GET", f"/api/confirmation?id={initial['confirmationId']}"
+    )
     assert status == 200
     restored = json.loads(payload)["confirmation"]
     for panel in (initial, restored):
         point = panel["points"][0]
-        status, _, body = _request(server, "GET", f"/api/evidence/view?evidence_id={point['evidenceId']}")
+        status, _, body = _request(
+            server, "GET", f"/api/evidence/view?evidence_id={point['evidenceId']}"
+        )
         assert status == 200
         evidence = json.loads(body)
         assert (evidence["highlightStartLine"], evidence["highlightEndLine"]) == (
-            point["startLine"], point["endLine"]
+            point["startLine"],
+            point["endLine"],
         )
-        assert any(line["highlighted"] and line["text"] == NOTICE_LINES[5] for line in evidence["lines"])
+        assert any(
+            line["highlighted"] and line["text"] == NOTICE_LINES[5] for line in evidence["lines"]
+        )
         status, _, _ = _request(
             server, "GET", f"/api/evidence/view?evidence_id={point['evidenceId']}", session="other"
         )
@@ -158,7 +183,11 @@ def test_topic_free_input_and_short_follow_up_keep_the_same_document(guided_serv
     server, calls, _ = guided_server
     clarification = _start(server)
     status, events, _ = _continue(
-        server, clarification, "g3", action="select_topic", choice=1,
+        server,
+        clarification,
+        "g3",
+        action="select_topic",
+        choice=1,
         optionsVersion=clarification["optionsVersion"],
     )
     assert status == 200
@@ -169,7 +198,9 @@ def test_topic_free_input_and_short_follow_up_keep_the_same_document(guided_serv
     state = next(e for e in events if e["type"] == "confirmation_state")
     assert state["topic"]["section"]["label"] == "2 提出書類"
 
-    status, events, _ = _continue(server, clarification, "g4", action="follow_up", text="請求書だけ")
+    status, events, _ = _continue(
+        server, clarification, "g4", action="follow_up", text="請求書だけ"
+    )
     assert "focus_only" not in calls[-1]["fixed"]
     state = next(e for e in events if e["type"] == "confirmation_state")
     assert state["topic"]["targets"] == ["請求書"]
@@ -181,7 +212,9 @@ def test_topic_free_input_and_short_follow_up_keep_the_same_document(guided_serv
 
     # 同じ入力で再購読しても処理を重複実行しない。
     count = len(calls)
-    status, events, _ = _continue(server, clarification, "g5", action="follow_up", text="期限は？", resume_only=True)
+    status, events, _ = _continue(
+        server, clarification, "g5", action="follow_up", text="期限は？", resume_only=True
+    )
     assert status == 200 and len(calls) == count
     assert "done" in _types(events)
 
@@ -196,16 +229,24 @@ def test_panel_restore_and_errors(guided_server):
     assert status == 403
 
     status, _, payload = _continue(
-        server, clarification, "e1", action="select_topic", choice=0,
+        server,
+        clarification,
+        "e1",
+        action="select_topic",
+        choice=0,
         optionsVersion=clarification["optionsVersion"] - 1,
     )
     assert status == 409 and json.loads(payload)["error"]["code"] == "confirmation_invalid"
 
-    status, _, payload = _continue(server, clarification, "e2", action="follow_up", text="あ" * 1001)
+    status, _, payload = _continue(
+        server, clarification, "e2", action="follow_up", text="あ" * 1001
+    )
     assert status == 400 and json.loads(payload)["error"]["code"] == "invalid_query"
     status, _, _ = _continue(server, clarification, "e3", action="follow_up", text="あ" * 1000)
     assert status == 200  # 日本語1000文字はPOSTで送信できる
-    oversized = json.dumps({"confirmationId": cid, "action": "follow_up", "text": "x" * 9000}).encode()
+    oversized = json.dumps(
+        {"confirmationId": cid, "action": "follow_up", "text": "x" * 9000}
+    ).encode()
     status, _, payload = _request(server, "POST", "/api/search", oversized)
     assert status == 400
 
@@ -219,8 +260,12 @@ def test_panel_restore_and_errors(guided_server):
 def test_guided_endpoints_are_absent_when_disabled(guided_server, monkeypatch):
     server, calls, _ = guided_server
     monkeypatch.delenv("OFFLINE_AI_GUIDED_FOLLOW_UP")
-    status, _, _ = _request(server, "POST", "/api/search", {"confirmationId": "x" * 24, "action": "follow_up"})
+    status, _, _ = _request(
+        server, "POST", "/api/search", {"confirmationId": "x" * 24, "action": "follow_up"}
+    )
     assert status == 404
-    status, events, _ = _request(server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=d1")
+    status, events, _ = _request(
+        server, "GET", f"/api/search?q={quote(BROAD)}&mode=answer&request_id=d1"
+    )
     assert _types(events) == ["result_meta", "chunk", "done"]
     assert calls[-1]["fixed"] is None

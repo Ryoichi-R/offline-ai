@@ -1,69 +1,120 @@
 {
-  "schema_version": "1.0",
-  "corpus_dir": "corpus",
-  "notes": "2026-09-27に固定した未実行の独立合成holdout。利用者資料・過去の調整質問を含めない。",
-  "acceptance": {
-    "min_retrieval_hit_rate": 1.0,
-    "min_evidence_coverage": 1.0,
-    "min_evidence_precision": 0.5,
-    "min_evidence_line_overlap": 0.8,
-    "max_forbidden_source_hits": 0,
-    "min_abstain_accuracy": 1.0
-  },
-  "questions": [
-    {
-      "id": "MH01",
-      "category": "scope-condition-exception",
-      "query": "正規職員と派遣職員の対象範囲、通常利用の条件、事故対応時に緩和される条件を教えてください",
-      "answerable": true,
-      "expected_sources": [
-        {"path": "rules/access-control.md", "heading": "利用資格", "line_start": 3, "line_end": 8}
-      ],
-      "required_facts": ["正規職員", "派遣職員", "委託先職員", "事前承認", "安全講習", "情報管理責任者"],
-      "forbidden_facts": ["派遣職員も対象", "事前承認は不要", "講習は不要"],
-      "require_expected_lines": true,
-      "holdout": true,
-      "notes": "対象外、AND条件、緊急時例外と例外の対象範囲を同時に問う。"
+    "schema_version": "1.0",
+    "corpus_dir": "corpus",
+    "notes": "2026-09-27に固定した未実行の独立合成holdout。利用者資料・過去の調整質問を含めない。",
+    "acceptance": {
+        "min_retrieval_hit_rate": 1.0,
+        "min_evidence_coverage": 1.0,
+        "min_evidence_precision": 0.5,
+        "min_evidence_line_overlap": 0.8,
+        "max_forbidden_source_hits": 0,
+        "min_abstain_accuracy": 1.0
     },
-    {
-      "id": "MH02",
-      "category": "table-footnote",
-      "query": "北拠点のタブレット料金と標準期間、標準期間後に延長する条件と上限を教えてください",
-      "answerable": true,
-      "expected_sources": [
-        {"path": "tables/equipment-rate-sheet.md", "heading": "タブレットの月額料金と標準期間", "line_start": 3, "line_end": 9}
-      ],
-      "required_facts": ["北拠点", "1,800円", "12か月", "管理者", "期間満了前", "最長3か月"],
-      "forbidden_facts": ["北拠点の月額料金は2,200円", "標準期間は18か月"],
-      "require_expected_lines": true,
-      "holdout": true,
-      "notes": "表の行と直後の注記を合わせ、別拠点の値を混同しない。"
-    },
-    {
-      "id": "MH03",
-      "category": "multi-document",
-      "query": "モバイル機器一式の貸与期間、延長条件、終了後の返却期限と窓口を教えてください",
-      "answerable": true,
-      "expected_sources": [
-        {"path": "policies/mobile-kit-loan.md", "heading": "貸与期間", "line_start": 3, "line_end": 5},
-        {"path": "procedures/mobile-kit-return.md", "heading": "返却期限と窓口", "line_start": 3, "line_end": 4}
-      ],
-      "required_facts": ["18か月", "資産担当者", "一度だけ", "最長4か月", "5営業日", "機器管理窓口"],
-      "forbidden_facts": ["延長は何度でも可能", "返却期限は10営業日"],
-      "require_expected_lines": true,
-      "holdout": true,
-      "notes": "貸与と返却の別文書を参照する。"
-    },
-    {
-      "id": "MH04",
-      "category": "information-insufficiency",
-      "query": "在宅勤務で保育サービスの費用を会社に請求できますか",
-      "answerable": false,
-      "abstain_layer": "answer",
-      "required_facts": [],
-      "forbidden_facts": ["保育料を会社が負担します", "保育サービス費用も対象です"],
-      "holdout": true,
-      "notes": "関連する在宅勤務費用規程はあるが、保育サービス費用は記載されていない。根拠のない補完をせず情報不足を示す。"
-    }
-  ]
+    "questions": [
+        {
+            "id": "MH01",
+            "category": "scope-condition-exception",
+            "query": "正規職員と派遣職員の対象範囲、通常利用の条件、事故対応時に緩和される条件を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "rules/access-control.md",
+                    "heading": "利用資格",
+                    "line_start": 3,
+                    "line_end": 8
+                }
+            ],
+            "required_facts": [
+                "正規職員",
+                "派遣職員",
+                "委託先職員",
+                "事前承認",
+                "安全講習",
+                "情報管理責任者"
+            ],
+            "forbidden_facts": [
+                "派遣職員も対象",
+                "事前承認は不要",
+                "講習は不要"
+            ],
+            "require_expected_lines": true,
+            "holdout": true,
+            "notes": "対象外、AND条件、緊急時例外と例外の対象範囲を同時に問う。"
+        },
+        {
+            "id": "MH02",
+            "category": "table-footnote",
+            "query": "北拠点のタブレット料金と標準期間、標準期間後に延長する条件と上限を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "tables/equipment-rate-sheet.md",
+                    "heading": "タブレットの月額料金と標準期間",
+                    "line_start": 3,
+                    "line_end": 9
+                }
+            ],
+            "required_facts": [
+                "北拠点",
+                "1,800円",
+                "12か月",
+                "管理者",
+                "期間満了前",
+                "最長3か月"
+            ],
+            "forbidden_facts": [
+                "北拠点の月額料金は2,200円",
+                "標準期間は18か月"
+            ],
+            "require_expected_lines": true,
+            "holdout": true,
+            "notes": "表の行と直後の注記を合わせ、別拠点の値を混同しない。"
+        },
+        {
+            "id": "MH03",
+            "category": "multi-document",
+            "query": "モバイル機器一式の貸与期間、延長条件、終了後の返却期限と窓口を教えてください",
+            "answerable": true,
+            "expected_sources": [
+                {
+                    "path": "policies/mobile-kit-loan.md",
+                    "heading": "貸与期間",
+                    "line_start": 3,
+                    "line_end": 5
+                },
+                {
+                    "path": "procedures/mobile-kit-return.md",
+                    "heading": "返却期限と窓口",
+                    "line_start": 3,
+                    "line_end": 4
+                }
+            ],
+            "required_facts": [
+                "18か月",
+                "資産担当者",
+                "一度だけ",
+                "最長4か月",
+                "5営業日",
+                "機器管理窓口"
+            ],
+            "forbidden_facts": ["延長は何度でも可能", "返却期限は10営業日"],
+            "require_expected_lines": true,
+            "holdout": true,
+            "notes": "貸与と返却の別文書を参照する。"
+        },
+        {
+            "id": "MH04",
+            "category": "information-insufficiency",
+            "query": "在宅勤務で保育サービスの費用を会社に請求できますか",
+            "answerable": false,
+            "abstain_layer": "answer",
+            "required_facts": [],
+            "forbidden_facts": [
+                "保育料を会社が負担します",
+                "保育サービス費用も対象です"
+            ],
+            "holdout": true,
+            "notes": "関連する在宅勤務費用規程はあるが、保育サービス費用は記載されていない。根拠のない補完をせず情報不足を示す。"
+        }
+    ]
 }

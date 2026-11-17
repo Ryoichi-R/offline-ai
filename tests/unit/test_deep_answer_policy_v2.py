@@ -12,7 +12,12 @@ import deep_research as deep
 from answer_fixtures import QUERY, SOURCE_TEXT
 from deep_fakes import patch_retrieval
 
-VERDICT = {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+VERDICT = {
+    "supported": True,
+    "contradictions": [],
+    "missing_conditions": [],
+    "unsupported_claims": [],
+}
 
 
 def evidence_blocks(user):
@@ -42,7 +47,10 @@ def complete_draft_for(user):
     rule = "委員会において審査する内容は、前項の案件について、次のとおりとする。"
     return {
         "conclusion": claim_for(
-            blocks, "委員会は、設備の更新前に計画を審査し、費用削減の可否・仕様の妥当性・競争性の阻害要因の有無を確認します。", rule, aspect="審査内容"
+            blocks,
+            "委員会は、設備の更新前に計画を審査し、費用削減の可否・仕様の妥当性・競争性の阻害要因の有無を確認します。",
+            rule,
+            aspect="審査内容",
         ),
         "sections": [
             {
@@ -91,7 +99,15 @@ class Backend:
     def retrieve(self, query, chunks, **kwargs):
         kwargs["cancel_check"]()
         self.retrieval_queries.append(query)
-        ordered = sorted(chunks, key=lambda c: (("チェックリスト" not in (c.get("heading") or "")) if self.rank == "checklist_first" else 0, c["start_line"]))
+        ordered = sorted(
+            chunks,
+            key=lambda c: (
+                ("チェックリスト" not in (c.get("heading") or ""))
+                if self.rank == "checklist_first"
+                else 0,
+                c["start_line"],
+            ),
+        )
         ranked = [{**c, "source_sha256": c["file_sha256"]} for c in ordered]
         role_of = None
         if "intent" in kwargs:
@@ -99,9 +115,13 @@ class Backend:
             self.intents.append(intent)
 
             def role_of(chunk):
-                return ap.classify_role(chunk.get("text", ""), chunk.get("heading", ""), intent=intent).role
+                return ap.classify_role(
+                    chunk.get("text", ""), chunk.get("heading", ""), intent=intent
+                ).role
 
-        return deep_candidate_selection.select_candidates(ranked, source_chunks=chunks, role_of=role_of)
+        return deep_candidate_selection.select_candidates(
+            ranked, source_chunks=chunks, role_of=role_of
+        )
 
     def model(self, name, system, user, **kwargs):
         if system == deep.DEEP_RELEVANCE_SYSTEM:
@@ -111,7 +131,13 @@ class Backend:
         if system == deep.DEEP_GAPS_SYSTEM:
             return {"queries": [], "unresolved": []}
         if system == deep.DEEP_SECTION_SYSTEM:
-            return {"subject": "対象", "scope": "原文の範囲", "conditions": ["条件"], "exceptions": [], "references": []}
+            return {
+                "subject": "対象",
+                "scope": "原文の範囲",
+                "conditions": ["条件"],
+                "exceptions": [],
+                "references": [],
+            }
         if system.startswith("あなたは質問の意図"):
             return {"granularity": "overview", "target": "設備更新委員会", "required_aspects": []}
         if system.startswith("あなたはローカル資料の調査結果を"):
@@ -133,7 +159,16 @@ class Backend:
         raise AssertionError("unexpected prompt")
 
 
-def run(tmp_path, monkeypatch, *, text=SOURCE_TEXT, policy="v2", timeout=300, query=QUERY, **backend_kwargs):
+def run(
+    tmp_path,
+    monkeypatch,
+    *,
+    text=SOURCE_TEXT,
+    policy="v2",
+    timeout=300,
+    query=QUERY,
+    **backend_kwargs,
+):
     backend = Backend(monkeypatch, **backend_kwargs)
     (tmp_path / "sample.md").write_text(text, encoding="utf-8")
     result = deep.run_deep_research(
@@ -146,7 +181,9 @@ def run(tmp_path, monkeypatch, *, text=SOURCE_TEXT, policy="v2", timeout=300, qu
 
 
 @pytest.mark.parametrize("retry_succeeds", [True, False])
-def test_high_reasoning_draft_output_limit_uses_one_source_only_retry(tmp_path, monkeypatch, retry_succeeds):
+def test_high_reasoning_draft_output_limit_uses_one_source_only_retry(
+    tmp_path, monkeypatch, retry_succeeds
+):
     backend = Backend(monkeypatch)
     prompts = []
 
@@ -157,15 +194,22 @@ def test_high_reasoning_draft_output_limit_uses_one_source_only_retry(tmp_path, 
                 raise deep.DeepWorkerError(code=deep.MODEL_OUTPUT_INCOMPLETE_CODE)
             return complete_draft_for(user)
         assert "num_predict" not in kwargs
-        if system == apipe.CLAIM_VERIFY_SYSTEM and kwargs["timeout"] <= ap.CHECK_CALL_CAP_SECONDS["deep"]:
+        if (
+            system == apipe.CLAIM_VERIFY_SYSTEM
+            and kwargs["timeout"] <= ap.CHECK_CALL_CAP_SECONDS["deep"]
+        ):
             raise TimeoutError("first meaning check requires more than the usual 60 seconds")
         return backend.model(name, system, user, **kwargs)
 
     monkeypatch.setattr(deep, "_call_ollama_json", model)
     (tmp_path / "sample.md").write_text(SOURCE_TEXT, encoding="utf-8")
     result = deep.run_deep_research(
-        QUERY, model="gpt-oss:120b", reasoning="high", source_root=tmp_path,
-        timeout_seconds=1800, answer_policy="v2",
+        QUERY,
+        model="gpt-oss:120b",
+        reasoning="high",
+        source_root=tmp_path,
+        timeout_seconds=1800,
+        answer_policy="v2",
     )
 
     assert [system for system, _, _ in prompts] == [apipe.DRAFT_SYSTEM, apipe.DRAFT_RETRY_SYSTEM]
@@ -199,7 +243,9 @@ def test_default_is_legacy_and_the_request_fixes_its_policy(tmp_path, monkeypatc
 # --- 読取順と枠配分 -------------------------------------------------------------------
 
 
-def test_direct_rule_is_read_before_the_checklist_even_when_the_checklist_ranks_first(tmp_path, monkeypatch):
+def test_direct_rule_is_read_before_the_checklist_even_when_the_checklist_ranks_first(
+    tmp_path, monkeypatch
+):
     legacy, _ = run(tmp_path, monkeypatch, policy="legacy")
     v2, backend = run(tmp_path, monkeypatch, policy="v2")
     assert "チェックリスト" in legacy.evidence[0]["heading"]
@@ -211,14 +257,22 @@ def test_direct_rule_is_read_before_the_checklist_even_when_the_checklist_ranks_
 
 def long_checklist_source():
     rows = "\n".join(f"| ①{i}　設備{i}の図面が添付されているか。 | |" for i in range(260))
-    return SOURCE_TEXT.split("## 別紙１")[0] + "## 別紙１　設備更新　設備更新委員会チェックリスト\n\n| 確認項目 | 結果 |\n|---|---|\n" + rows + "\n"
+    return (
+        SOURCE_TEXT.split("## 別紙１")[0]
+        + "## 別紙１　設備更新　設備更新委員会チェックリスト\n\n| 確認項目 | 結果 |\n|---|---|\n"
+        + rows
+        + "\n"
+    )
 
 
 def test_overview_defers_long_detail_tables_without_calling_them_unconfirmed(tmp_path, monkeypatch):
     result, _ = run(tmp_path, monkeypatch, text=long_checklist_source())
     diag = result.diagnostics["answer_policy_v2"]
     practical_chars = diag["role_chars"].get(ap.ROLE_PRACTICAL, 0)
-    assert practical_chars <= ap.role_budget_caps("overview", deep.DEEP_MAX_EVIDENCE_CHARS)[ap.ROLE_PRACTICAL]
+    assert (
+        practical_chars
+        <= ap.role_budget_caps("overview", deep.DEEP_MAX_EVIDENCE_CHARS)[ap.ROLE_PRACTICAL]
+    )
     assert diag["role_deferred"].get(ap.ROLE_PRACTICAL, 0) >= 1
     deferred = [e for e in result.ledger if e["status"] == "deferred"]
     assert deferred and all(e["reason"] == "role_deferred" for e in deferred)
@@ -238,7 +292,9 @@ def test_a_detail_question_does_not_defer_the_table(tmp_path, monkeypatch):
 # --- 品質状態 -------------------------------------------------------------------------
 
 
-def test_v2_builds_a_checked_answer_and_reports_quality_separately_from_generated(tmp_path, monkeypatch):
+def test_v2_builds_a_checked_answer_and_reports_quality_separately_from_generated(
+    tmp_path, monkeypatch
+):
     result, backend = run(tmp_path, monkeypatch)
     assert result.answer_state == "generated"
     assert result.answer_quality["state"] == "passed"
@@ -254,10 +310,16 @@ def test_v2_builds_a_checked_answer_and_reports_quality_separately_from_generate
     assert result.status == "completed"
 
 
-def test_unsupported_claims_never_reach_the_answer_and_quality_is_needs_review(tmp_path, monkeypatch):
+def test_unsupported_claims_never_reach_the_answer_and_quality_is_needs_review(
+    tmp_path, monkeypatch
+):
     def reject_one(claims):
         return {
-            c["claim_id"]: (("unsupported", "subject_mismatch") if "仕様が妥当" in c["claim"] else ("supported", "ok"))
+            c["claim_id"]: (
+                ("unsupported", "subject_mismatch")
+                if "仕様が妥当" in c["claim"]
+                else ("supported", "ok")
+            )
             for c in claims
         }
 
@@ -272,7 +334,9 @@ def test_unsupported_claims_never_reach_the_answer_and_quality_is_needs_review(t
 
 def test_when_nothing_can_be_verified_the_common_fallback_is_shown(tmp_path, monkeypatch):
     result, _ = run(
-        tmp_path, monkeypatch, g2=lambda claims: {c["claim_id"]: ("unsupported", "not_in_source") for c in claims}
+        tmp_path,
+        monkeypatch,
+        g2=lambda claims: {c["claim_id"]: ("unsupported", "not_in_source") for c in claims},
     )
     assert result.answer_state == "verification_failed"
     assert result.answer.startswith("回答を作成できませんでした。")
@@ -284,7 +348,9 @@ def test_when_nothing_can_be_verified_the_common_fallback_is_shown(tmp_path, mon
     assert len(locations) == len(set(locations))
 
 
-def test_invalid_json_twice_ends_in_fallback_with_exactly_two_generation_calls(tmp_path, monkeypatch):
+def test_invalid_json_twice_ends_in_fallback_with_exactly_two_generation_calls(
+    tmp_path, monkeypatch
+):
     def broken(user):
         raise ValueError("bad json")
 
@@ -306,8 +372,13 @@ def test_no_model_output_is_ever_written_to_the_diagnostics(tmp_path, monkeypatc
 
 def test_exploration_keeps_the_planned_downstream_share(tmp_path, monkeypatch):
     result, _ = run(tmp_path, monkeypatch, timeout=300)
-    assert result.diagnostics["answer_policy_v2"]["downstream_reserve_seconds"] == pytest.approx(141.0)
-    assert result.diagnostics["reserved_seconds"]["integration"] == deep.DEEP_INTEGRATION_RESERVE_SECONDS
+    assert result.diagnostics["answer_policy_v2"]["downstream_reserve_seconds"] == pytest.approx(
+        141.0
+    )
+    assert (
+        result.diagnostics["reserved_seconds"]["integration"]
+        == deep.DEEP_INTEGRATION_RESERVE_SECONDS
+    )
 
 
 # --- 再探索（最大1回） -------------------------------------------------------------------
@@ -369,7 +440,9 @@ def test_intent_plan_makes_at_most_one_call(tmp_path, monkeypatch):
 # --- 中止（既存の終端契約を保つ） -----------------------------------------------------------
 
 
-def test_cancel_during_v2_answer_construction_ends_as_cancelled_without_a_partial_answer(tmp_path, monkeypatch):
+def test_cancel_during_v2_answer_construction_ends_as_cancelled_without_a_partial_answer(
+    tmp_path, monkeypatch
+):
     import web_services
 
     state = {"cancelled": False}
@@ -385,8 +458,12 @@ def test_cancel_during_v2_answer_construction_ends_as_cancelled_without_a_partia
     backend = Backend(monkeypatch, drafts=[cancel_after_draft])
     (tmp_path / "sample.md").write_text(SOURCE_TEXT, encoding="utf-8")
     result = deep.run_deep_research(
-        QUERY, model="fake", source_root=tmp_path, timeout_seconds=300,
-        answer_policy="v2", cancel_check=cancel_check,
+        QUERY,
+        model="fake",
+        source_root=tmp_path,
+        timeout_seconds=300,
+        answer_policy="v2",
+        cancel_check=cancel_check,
     )
     assert result.status == "cancelled" and result.stop_reason == "cancelled"
     assert result.answer_state != "generated"

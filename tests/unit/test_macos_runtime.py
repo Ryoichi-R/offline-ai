@@ -7,9 +7,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = spec_from_file_location(
-    "offline_ai_macos_runtime", ROOT / "scripts" / "macos_runtime.py"
-)
+SPEC = spec_from_file_location("offline_ai_macos_runtime", ROOT / "scripts" / "macos_runtime.py")
 macos_runtime = module_from_spec(SPEC)
 SPEC.loader.exec_module(macos_runtime)
 
@@ -60,28 +58,31 @@ def test_mount_identity_rejects_model_directory_outside_mount(tmp_path):
         )
 
 
-def test_owner_record_requires_same_path_volume_binary_and_process_start():
+def test_owner_record_requires_same_path_volume_binary_and_process_start(tmp_path):
+    models = str((tmp_path / "ollama-models").resolve())
+    other_models = str((tmp_path / "other-models").resolve())
+    executable = str((tmp_path / "ollama").resolve())
     record = {
-        "modelsDirectory": "/Volumes/SUNEAST/ollama-models",
+        "modelsDirectory": models,
         "volumeUuid": "AABB-CCDD",
-        "ollamaExecutable": "/opt/ollama",
+        "ollamaExecutable": executable,
         "processStart": "Mon Sep 27 10:00:00 2026",
     }
     assert macos_runtime.owner_record_matches(
         record,
-        "/Volumes/SUNEAST/ollama-models",
+        models,
         "aabb-ccdd",
-        "/opt/ollama",
+        executable,
         "Mon Sep 27 10:00:00 2026",
-        "/opt/ollama serve",
+        f'"{executable}" serve',
     )
     assert not macos_runtime.owner_record_matches(
         record,
-        "/Volumes/OTHER/ollama-models",
+        other_models,
         "aabb-ccdd",
-        "/opt/ollama",
+        executable,
         "Mon Sep 27 10:00:00 2026",
-        "/opt/ollama serve",
+        f'"{executable}" serve',
     )
 
 
@@ -234,9 +235,7 @@ def test_storage_queries_the_mount_not_a_nested_model_directory(tmp_path, monkey
     models = mount / "nested" / "models"
     models.mkdir(parents=True)
     monkeypatch.setattr(macos_runtime.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        macos_runtime.os.path, "ismount", lambda path: Path(path) == mount
-    )
+    monkeypatch.setattr(macos_runtime.os.path, "ismount", lambda path: Path(path) == mount)
 
     def diskutil(command, **kwargs):
         assert command == ["diskutil", "info", "-plist", str(mount)]

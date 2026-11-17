@@ -434,7 +434,7 @@ class LimitedThreadingServer(ThreadingHTTPServer):
 class OfflineAIHandler(BaseHTTPRequestHandler):
     """offline-ai Web UI HTTP ハンドラ。"""
 
-    server_version = "OfflineAI/0.3.11"
+    server_version = "OfflineAI/0.3.12"
 
     def log_message(self, format, *args):
         """デフォルトのログ出力を抑制（構造化ログに統一）。"""

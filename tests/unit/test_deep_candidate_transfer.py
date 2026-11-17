@@ -32,12 +32,11 @@ def _candidate(path: str, index: int, *, source_sha256: str = "a" * 64) -> dict:
 
 
 def test_worker_selection_matches_previous_parent_selection_order_and_exclusions():
-    ranked = [
-        _candidate("a\\doc.md", index)
-        for index in range(12)
-    ] + [_candidate("b.md", index) for index in range(12)] + [
-        _candidate("c.md", index) for index in range(30)
-    ]
+    ranked = (
+        [_candidate("a\\doc.md", index) for index in range(12)]
+        + [_candidate("b.md", index) for index in range(12)]
+        + [_candidate("c.md", index) for index in range(30)]
+    )
 
     actual = selection.select_candidates(ranked)
 
@@ -281,15 +280,10 @@ def test_empty_path_reaches_parent_source_missing_instead_of_model_error(tmp_pat
 
 
 def test_large_synthetic_retrieval_is_body_free_and_under_worker_limit():
-    ranked = [
-        _candidate(f"資料-{index % 937:03d}-委員会.md", index)
-        for index in range(18_241)
-    ]
+    ranked = [_candidate(f"資料-{index % 937:03d}-委員会.md", index) for index in range(18_241)]
 
     response = selection.select_candidates(ranked)
-    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     assert response["counts"] == {
         "ranked": 18_241,
@@ -498,9 +492,7 @@ def test_later_candidate_transfer_failure_is_partial_when_evidence_exists(tmp_pa
             }
         ),
     )
-    monkeypatch.setattr(
-        deep_research, "_call_ollama_text", lambda *args, **kwargs: "対象。[E1]"
-    )
+    monkeypatch.setattr(deep_research, "_call_ollama_text", lambda *args, **kwargs: "対象。[E1]")
     result = deep_research.run_deep_research(
         "対象", model="fake", source_root=tmp_path, timeout_seconds=300
     )
@@ -541,10 +533,7 @@ def test_candidate_transfer_reason_is_not_hidden_by_other_limits(initial, reason
 
 def test_transfer_failure_wins_after_a_later_document_limit(tmp_path, monkeypatch):
     (tmp_path / "a.md").write_text(
-        "# A1\n"
-        + ("対象1\n" * 3_000)
-        + "# A2\n"
-        + ("対象2\n" * 3_000),
+        "# A1\n" + ("対象1\n" * 3_000) + "# A2\n" + ("対象2\n" * 3_000),
         encoding="utf-8",
     )
     (tmp_path / "b.md").write_text("# B\n別対象\n", encoding="utf-8")
@@ -576,9 +565,7 @@ def test_transfer_failure_wins_after_a_later_document_limit(tmp_path, monkeypatc
                 },
             ]
         else:
-            raise deep_transport.DeepWorkerError(
-                code=selection.CANDIDATE_TRANSFER_LIMIT_CODE
-            )
+            raise deep_transport.DeepWorkerError(code=selection.CANDIDATE_TRANSFER_LIMIT_CODE)
         return selection.select_candidates(ranked, source_chunks=chunks)
 
     def model(_model, system, _user, **_kwargs):
@@ -667,12 +654,23 @@ def test_cli_markdown_and_replay_preserve_the_same_human_reason(monkeypatch, cap
     monkeypatch.setattr(
         cli_search,
         "get_model_identity",
-        lambda _model: {"digest": "8b9d11d807c57feb1e2ecb0d6cbf40334c37dcc3523bed5540af4f927f112a37"},
+        lambda _model: {
+            "digest": "8b9d11d807c57feb1e2ecb0d6cbf40334c37dcc3523bed5540af4f927f112a37"
+        },
     )
     monkeypatch.setattr(
         sys,
         "argv",
-        ["search.py", "対象", "--model", "qwen3.5:122b", "--mode", "deep", "--timeout-seconds", "300"],
+        [
+            "search.py",
+            "対象",
+            "--model",
+            "qwen3.5:122b",
+            "--mode",
+            "deep",
+            "--timeout-seconds",
+            "300",
+        ],
     )
 
     cli_search.main()
@@ -737,7 +735,10 @@ def test_isolated_worker_reads_only_digest_bound_snapshot_cache(tmp_path, monkey
     cache = {
         "version": cli_search.EMBED_CACHE_VERSION,
         "embed_model": model,
-        "chunking": {"max_chars": cli_search.CHUNK_MAX_CHARS, "overlap_chars": cli_search.CHUNK_OVERLAP_CHARS},
+        "chunking": {
+            "max_chars": cli_search.CHUNK_MAX_CHARS,
+            "overlap_chars": cli_search.CHUNK_OVERLAP_CHARS,
+        },
         "compatibility": cli_search._new_embed_compatibility(model, identity, 2),
         "entries": {chunk["chunk_id"]: entry},
     }
@@ -745,11 +746,21 @@ def test_isolated_worker_reads_only_digest_bound_snapshot_cache(tmp_path, monkey
     cache_path.write_text(json.dumps(cache), encoding="utf-8")
     digest = __import__("hashlib").sha256(cache_path.read_bytes()).hexdigest()
     monkeypatch.setattr(cli_search, "get_embed_model_identity", lambda _model: identity)
-    monkeypatch.setattr(cli_search, "detect_embed_model", lambda: pytest.fail("production config read"))
-    monkeypatch.setattr(cli_search, "load_embed_cache", lambda: pytest.fail("production cache read"))
+    monkeypatch.setattr(
+        cli_search, "detect_embed_model", lambda: pytest.fail("production config read")
+    )
+    monkeypatch.setattr(
+        cli_search, "load_embed_cache", lambda: pytest.fail("production cache read")
+    )
 
     observed_model, observed_cache = deep_transport._load_worker_embedding_context(
-        {"isolated_embedding": {"model": model, "cache_path": str(cache_path), "cache_sha256": digest}},
+        {
+            "isolated_embedding": {
+                "model": model,
+                "cache_path": str(cache_path),
+                "cache_sha256": digest,
+            }
+        },
         [chunk],
         cli_search,
     )

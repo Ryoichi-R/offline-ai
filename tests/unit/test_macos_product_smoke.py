@@ -83,10 +83,7 @@ def test_resource_counters_include_descendants_but_not_other_processes():
     table = "100 1 10\n101 100 20\n102 101 30\n200 1 999\n"
     assert smoke.process_rss_bytes(table, 100) == 60 * 1024
     assert smoke.process_rss_bytes(table, 999) is None
-    assert (
-        smoke.parse_swap_bytes("total = 4096.00M used = 2.50M free = 4093.50M")
-        == 2621440
-    )
+    assert smoke.parse_swap_bytes("total = 4096.00M used = 2.50M free = 4093.50M") == 2621440
     assert smoke.parse_swap_bytes("unavailable") is None
 
 
@@ -214,9 +211,7 @@ def test_case_deadline_stops_created_group_and_reports_failure(monkeypatch, tmp_
     stopped = []
     monkeypatch.setattr(smoke.subprocess, "Popen", lambda *_a, **_kw: Process())
     monkeypatch.setattr(smoke, "ResourceSampler", Sampler)
-    monkeypatch.setattr(
-        smoke, "stop_process_group", lambda process: stopped.append(process.pid)
-    )
+    monkeypatch.setattr(smoke, "stop_process_group", lambda process: stopped.append(process.pid))
     case = {"model": MODEL, "mode": "answer", "interface": "cli"}
     result = smoke.run_case(case, {}, tmp_path, 54321)
     assert result["failureType"] == "CaseDeadline"
@@ -309,13 +304,9 @@ def test_diagnostic_wrappers_preserve_signature_results_errors_and_restore(monke
     old_search = search.create_search_plan
     records = []
     with diag.observe(records):
-        assert inspect.signature(
-            web_services.run_retrieval_pipeline
-        ) == inspect.signature(pipeline)
+        assert inspect.signature(web_services.run_retrieval_pipeline) == inspect.signature(pipeline)
         assert (
-            deep_research._json_stage(
-                "m", "s", "u", None, deep_research._verification, reserve=1
-            )
+            deep_research._json_stage("m", "s", "u", None, deep_research._verification, reserve=1)
             is True
         )
         with pytest.raises(ValueError, match="private message"):

@@ -69,12 +69,8 @@ HOLDOUT_GROUP_ID = "MACOS-LARGE-MODEL-20260927-A"
 def snapshot_files(root: Path) -> list[str]:
     """Copy only executable source and the explicit synthetic evaluation inputs."""
     names = set(CODE_FILES) | {"VERSION", "_internal/scripts/collect_skill_source.ps1"}
-    names.update(
-        p.relative_to(root).as_posix() for p in (root / "_internal").glob("*.py")
-    )
-    names.update(
-        p.relative_to(root).as_posix() for p in (root / "tests/eval").glob("*.py")
-    )
+    names.update(p.relative_to(root).as_posix() for p in (root / "_internal").glob("*.py"))
+    names.update(p.relative_to(root).as_posix() for p in (root / "tests/eval").glob("*.py"))
     names.update(
         p.relative_to(root).as_posix()
         for p in (root / "tests/eval/macos-large-model-holdout/corpus").rglob("*")
@@ -86,10 +82,7 @@ def snapshot_files(root: Path) -> list[str]:
 def verify_snapshot(receipt: dict, root: Path = ROOT) -> None:
     for name, digest in receipt["product"]["files"].items():
         path = root / name
-        if (
-            not path.resolve().is_relative_to(root.resolve())
-            or sha256_file(path) != digest
-        ):
+        if not path.resolve().is_relative_to(root.resolve()) or sha256_file(path) != digest:
             raise CompareConfigError("評価snapshotのsourceまたはcorpusが変更されました")
 
 
@@ -122,9 +115,9 @@ def question_spec(spec: dict, question_id: str) -> dict:
         "acceptance": spec["acceptance"],
     }
     digest = hashlib.sha256(
-        json.dumps(
-            binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     ).hexdigest()
     return {**spec, "items": items, "spec_sha256": digest}
 
@@ -161,9 +154,7 @@ def validate_run_id(value: str) -> str:
         or value.startswith(".")
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value)
     ):
-        raise CompareConfigError(
-            "run-idは英数字で始まる64文字以内の安全な名前にしてください"
-        )
+        raise CompareConfigError("run-idは英数字で始まる64文字以内の安全な名前にしてください")
     return value
 
 
@@ -195,9 +186,7 @@ def validate_owned_runtime(runtime_config_path: Path | None = None) -> None:
         ollama_executable=config["ollama_executable"],
     )
     if not macos_runtime._owner_matches(args):
-        raise CompareConfigError(
-            "Ollamaが設定済みMac launcherの所有プロセスではありません"
-        )
+        raise CompareConfigError("Ollamaが設定済みMac launcherの所有プロセスではありません")
 
 
 def planned_case_runs(models: list[str], modes: list[str], repeat: int) -> dict:
@@ -207,9 +196,7 @@ def planned_case_runs(models: list[str], modes: list[str], repeat: int) -> dict:
     deep_cases = len(deep["items"])
     normal_ids = {question.id for question in normal.questions}
     deep_ids = {item["id"] for item in deep["items"]}
-    if normal_ids != deep_ids or any(
-        not question.holdout for question in normal.questions
-    ):
+    if normal_ids != deep_ids or any(not question.holdout for question in normal.questions):
         raise CompareConfigError("normal/deepの固定holdout IDが一致しません")
     deep_queries = {item["id"]: item.get("query", "") for item in deep["items"]}
     if any(
@@ -250,11 +237,7 @@ def build_plan(
     embed_model: str | None,
 ) -> dict:
     run_id = validate_run_id(run_id)
-    if (
-        len(set(models)) != len(models)
-        or not models
-        or set(models) - set(MAC_MODEL_DIGESTS)
-    ):
+    if len(set(models)) != len(models) or not models or set(models) - set(MAC_MODEL_DIGESTS):
         raise CompareConfigError("比較対象は登録済みの固定chat候補から選んでください")
     if embed_model and canonical_model_reference(embed_model) != "bge-m3:latest":
         raise CompareConfigError("評価Embeddingは固定候補bge-m3だけを指定できます")
@@ -350,9 +333,7 @@ def build_plan(
 
 def _http_json(path: str, timeout: float = 3.0) -> dict:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    req = urllib.request.Request(
-        f"{search.OLLAMA_HOST.rstrip('/')}{path}", method="GET"
-    )
+    req = urllib.request.Request(f"{search.OLLAMA_HOST.rstrip('/')}{path}", method="GET")
     with opener.open(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -362,11 +343,7 @@ def loaded_state(model: str) -> str:
         data = _http_json("/api/ps")
     except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError):
         return "unknown"
-    names = {
-        str(item.get("name", ""))
-        for item in data.get("models", [])
-        if isinstance(item, dict)
-    }
+    names = {str(item.get("name", "")) for item in data.get("models", []) if isinstance(item, dict)}
     return "warm" if model in names else "not-loaded-before-run"
 
 
@@ -501,9 +478,7 @@ def run_normal_case(
                     corpus_dir=spec.corpus_dir,
                 )
                 scores.append(
-                    eval_harness.score_question(
-                        question, outcome, run_index=repeat_index
-                    )
+                    eval_harness.score_question(question, outcome, run_index=repeat_index)
                 )
                 if question.answerable and question.required_facts:
                     answer_quality.append(
@@ -529,14 +504,10 @@ def run_normal_case(
             route_report = {
                 "summary": summary,
                 "runs": [{"run": repeat_index, "summary": summary, "scores": scores}],
-                "acceptance": eval_harness.evaluate_acceptance(
-                    summary, spec.acceptance
-                ),
+                "acceptance": eval_harness.evaluate_acceptance(summary, spec.acceptance),
             }
             eval_harness.apply_answer_probe_to_acceptance(route_report, answer_layer)
-            eval_harness.apply_answer_quality_to_acceptance(
-                route_report, answer_quality
-            )
+            eval_harness.apply_answer_quality_to_acceptance(route_report, answer_quality)
     finally:
         search.stream_ollama_chat = original_stream
         search.run_retrieval_pipeline = original_pipeline
@@ -586,9 +557,7 @@ def run_deep_case(
     )
     elapsed = time.monotonic() - started
     scoped_spec = question_spec(spec, query_id)
-    evaluation = coverage_evaluator.evaluate_result(
-        scoped_spec, result.to_public_dict()
-    )
+    evaluation = coverage_evaluator.evaluate_result(scoped_spec, result.to_public_dict())
     diagnostics = result.diagnostics
     return {
         "mode": "deep",
@@ -700,7 +669,9 @@ def mark_calibration(receipt: dict) -> None:
     receipt["acceptanceIneligibleReason"] = "evaluation-group-used-for-remediation"
     receipt["evaluationSplit"] = "synthetic-calibration-only"
     receipt["holdout"]["status"] = "CALIBRATION_USED_FOR_REMEDIATION"
-    receipt["holdout"]["note"] = "修正に使用済みの合成corpus。独立保留評価・実資料の採用判断には使わない。"
+    receipt["holdout"]["note"] = (
+        "修正に使用済みの合成corpus。独立保留評価・実資料の採用判断には使わない。"
+    )
 
 
 def execute(
@@ -748,23 +719,18 @@ def execute(
             embed_cache = eval_harness.build_isolated_embed_cache(embed_model, chunks)
             first_entry = next(iter(embed_cache.get("entries", {}).values()), None)
             dimension = (
-                len(first_entry.get("embedding", []))
-                if isinstance(first_entry, dict)
-                else None
+                len(first_entry.get("embedding", [])) if isinstance(first_entry, dict) else None
             )
             embed_cache["compatibility"] = search._new_embed_compatibility(
                 embed_model, embed_identity, dimension
             )
             receipt["embedding"]["fileCount"] = len(embed_cache.get("entries", {}))
         deep_spec = coverage_evaluator.load_spec(DEEP_SPEC)
-        with tempfile.TemporaryDirectory(
-            prefix="offline-ai-macos-eval-"
-        ) as runtime_dir:
+        with tempfile.TemporaryDirectory(prefix="offline-ai-macos-eval-") as runtime_dir:
             if embed_cache is not None:
                 embed_cache_path = Path(runtime_dir) / "embed-cache.json"
                 cache_bytes = (
-                    json.dumps(embed_cache, ensure_ascii=False, separators=(",", ":"))
-                    + "\n"
+                    json.dumps(embed_cache, ensure_ascii=False, separators=(",", ":")) + "\n"
                 ).encode("utf-8")
                 embed_cache_path.write_bytes(cache_bytes)
                 embed_cache_sha256 = hashlib.sha256(cache_bytes).hexdigest()
@@ -773,9 +739,7 @@ def execute(
                 "status": "COMPLETED",
                 "elapsedSeconds": round(time.monotonic() - preparation_started, 3),
                 "corpusFiles": len(chunks),
-                "embeddingCacheFiles": len(embed_cache.get("entries", {}))
-                if embed_cache
-                else 0,
+                "embeddingCacheFiles": len(embed_cache.get("entries", {})) if embed_cache else 0,
                 "embeddingCacheStorage": "memory plus per-run temporary worker transfer",
             }
             _atomic_write(output_path, receipt)
@@ -845,9 +809,7 @@ def execute(
         raise
     receipt["status"] = "COMPLETED"
     receipt["finishedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    receipt["humanAcceptance"] = (
-        "NOT_RUN: generated answers require item-by-item source review"
-    )
+    receipt["humanAcceptance"] = "NOT_RUN: generated answers require item-by-item source review"
     receipt["qualitySelection"] = (
         "NOT_DECIDED: synthetic holdout cannot establish quality on user material"
     )
@@ -856,17 +818,11 @@ def execute(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Mac大型chat model隔離比較runner")
-    parser.add_argument(
-        "--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    )
-    parser.add_argument(
-        "--model", action="append", choices=tuple(MAC_MODEL_DIGESTS), dest="models"
-    )
+    parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    parser.add_argument("--model", action="append", choices=tuple(MAC_MODEL_DIGESTS), dest="models")
     parser.add_argument("--mode", choices=("answer", "deep", "both"), default="both")
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument(
-        "--reasoning", choices=("off", "low", "medium", "high"), default="off"
-    )
+    parser.add_argument("--reasoning", choices=("off", "low", "medium", "high"), default="off")
     parser.add_argument("--embed-model", default=None)
     parser.add_argument("--runtime-config", type=Path, default=None)
     parser.add_argument("--snapshot-plan", type=Path, help=argparse.SUPPRESS)
@@ -914,11 +870,7 @@ def main(argv=None) -> int:
             embed_model=args.embed_model,
         )
         output_path = (
-            ROOT
-            / ".test-results"
-            / "macos-large-model"
-            / receipt["runId"]
-            / "receipt.json"
+            ROOT / ".test-results" / "macos-large-model" / receipt["runId"] / "receipt.json"
         )
         if output_path.exists():
             raise CompareConfigError(
@@ -939,9 +891,7 @@ def main(argv=None) -> int:
                     ROOT / ".test-results/macos-large-model/host-runtime.json",
                 )
             )
-            with tempfile.TemporaryDirectory(
-                prefix="offline-ai-eval-source-"
-            ) as temporary:
+            with tempfile.TemporaryDirectory(prefix="offline-ai-eval-source-") as temporary:
                 isolated = Path(temporary)
                 copy_snapshot(receipt, isolated)
                 plan_path = isolated / "evaluation-plan.json"
@@ -991,9 +941,7 @@ def main(argv=None) -> int:
         ValueError,
     ) as exc:
         print(
-            json.dumps(
-                {"status": "BLOCKED", "reason": type(exc).__name__}, ensure_ascii=False
-            ),
+            json.dumps({"status": "BLOCKED", "reason": type(exc).__name__}, ensure_ascii=False),
             file=sys.stderr,
         )
         return 2

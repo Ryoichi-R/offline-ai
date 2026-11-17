@@ -39,9 +39,7 @@ def test_expand_recovers_child_body_not_hit_directly(tmp_path):
     # 親（見出しだけ）を検索candidateとして扱う。
     parent_chunk = next(c for c in chunks if c["heading"] == "親見出し")
 
-    items, meta = search.expand_parent_candidates(
-        [parent_chunk], chunks, source_root=tmp_path
-    )
+    items, meta = search.expand_parent_candidates([parent_chunk], chunks, source_root=tmp_path)
 
     assert len(items) == 1
     assert "子の本文行1" in items[0]["snippet"]
@@ -53,17 +51,12 @@ def test_expand_recovers_child_body_not_hit_directly(tmp_path):
 
 def test_expand_does_not_mix_similar_sibling_sections(tmp_path):
     """似た語を含む別の親配下の子を混ぜない。"""
-    text = (
-        "# 親A\n\n## 設定手順\n手順A-1\n手順A-2\n"
-        "# 親B\n\n## 設定手順\n手順B-1\n手順B-2\n"
-    )
+    text = "# 親A\n\n## 設定手順\n手順A-1\n手順A-2\n# 親B\n\n## 設定手順\n手順B-1\n手順B-2\n"
     _write(tmp_path, "doc.md", text)
     chunks = search.chunk_source_file(tmp_path / "doc.md", "doc.md")
     parent_a = next(c for c in chunks if c["heading"] == "親A")
 
-    items, _meta = search.expand_parent_candidates(
-        [parent_a], chunks, source_root=tmp_path
-    )
+    items, _meta = search.expand_parent_candidates([parent_a], chunks, source_root=tmp_path)
 
     joined = "\n".join(item["snippet"] for item in items)
     assert "手順A-1" in joined
@@ -76,9 +69,7 @@ def test_leaf_parent_without_children_is_not_expanded(tmp_path):
     chunks = search.chunk_source_file(tmp_path / "doc.md", "doc.md")
     parent_chunk = chunks[0]
 
-    items, meta = search.expand_parent_candidates(
-        [parent_chunk], chunks, source_root=tmp_path
-    )
+    items, meta = search.expand_parent_candidates([parent_chunk], chunks, source_root=tmp_path)
 
     assert items == []
     assert meta == []
@@ -91,9 +82,7 @@ def test_parent_with_own_body_is_not_expanded_non_blank_gap(tmp_path):
     chunks = search.chunk_source_file(tmp_path / "doc.md", "doc.md")
     parent_chunk = next(c for c in chunks if c["start_line"] == 1)
 
-    items, meta = search.expand_parent_candidates(
-        [parent_chunk], chunks, source_root=tmp_path
-    )
+    items, meta = search.expand_parent_candidates([parent_chunk], chunks, source_root=tmp_path)
 
     assert items == []
 
@@ -105,9 +94,7 @@ def test_quoted_ranges_match_actual_source_lines(tmp_path):
     chunks = search.chunk_source_file(tmp_path / "doc.md", "doc.md")
     parent_chunk = next(c for c in chunks if c["heading"] == "親")
 
-    items, _meta = search.expand_parent_candidates(
-        [parent_chunk], chunks, source_root=tmp_path
-    )
+    items, _meta = search.expand_parent_candidates([parent_chunk], chunks, source_root=tmp_path)
 
     lines = text.splitlines()
     for item in items:
@@ -140,9 +127,7 @@ def test_source_changed_hash_mismatch_skips_expansion(tmp_path):
     parent_chunk = dict(next(c for c in chunks if c["heading"] == "親"))
     parent_chunk["source_sha256"] = "0" * 64  # 資料のhashと一致しない
 
-    items, meta = search.expand_parent_candidates(
-        [parent_chunk], chunks, source_root=tmp_path
-    )
+    items, meta = search.expand_parent_candidates([parent_chunk], chunks, source_root=tmp_path)
 
     assert items == []
     assert meta[0]["reason"] == "source_changed"
@@ -152,9 +137,7 @@ def test_missing_source_file_skips_without_adding_whole_document(tmp_path):
     """資料が取得できない場合、展開を省略し資料全体を代わりに追加しない。"""
     parent_chunk = _parent_match("missing.md", 1, 1)
 
-    items, meta = search.expand_parent_candidates(
-        [parent_chunk], [], source_root=tmp_path
-    )
+    items, meta = search.expand_parent_candidates([parent_chunk], [], source_root=tmp_path)
 
     assert items == []
     assert meta[0]["reason"] == "structure_unavailable"

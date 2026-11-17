@@ -25,7 +25,9 @@ def test_valid_fully_supported_passes():
 
 
 def test_missing_conditions_key_defaults_to_empty_list():
-    result = p0.validate_verification_json({"support": "unsupported", "reason_code": "missing_detail"})
+    result = p0.validate_verification_json(
+        {"support": "unsupported", "reason_code": "missing_detail"}
+    )
     assert result["conditions"] == []
 
 
@@ -40,7 +42,11 @@ def test_missing_conditions_key_defaults_to_empty_list():
             "reason_code": "answer_found",
             "conditions": [{"condition": "x", "supported": "true"}],
         },
-        {"support": "fully_supported", "reason_code": "answer_found", "conditions": [{"condition": "x"}]},
+        {
+            "support": "fully_supported",
+            "reason_code": "answer_found",
+            "conditions": [{"condition": "x"}],
+        },
         "not-a-dict",
         [],
     ],
@@ -80,7 +86,15 @@ def test_parse_json_object_returns_none_for_non_json():
 def test_build_verification_prompt_includes_query_and_matches():
     prompt = p0.build_verification_prompt(
         "質問文",
-        [{"path": "a/b.md", "heading": "見出し", "start_line": 1, "end_line": 2, "snippet": "本文"}],
+        [
+            {
+                "path": "a/b.md",
+                "heading": "見出し",
+                "start_line": 1,
+                "end_line": 2,
+                "snippet": "本文",
+            }
+        ],
     )
     assert "質問文" in prompt
     assert "skill-source/a/b.md" in prompt

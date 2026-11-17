@@ -40,6 +40,4 @@ def test_extraction_scope_does_not_receive_unanswerable_question_parts(
     else:
         assert result.status != "completed"
         assert any(row["reason"] == "extraction_unsupported" for row in result.ledger)
-        assert all(
-            row["verification_status"] != "semantic_checked" for row in result.evidence
-        )
+        assert all(row["verification_status"] != "semantic_checked" for row in result.evidence)

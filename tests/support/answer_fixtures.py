@@ -133,9 +133,16 @@ def good_draft() -> dict:
             {
                 "heading": "審査する内容",
                 "claims": [
-                    claim("費用削減が可能かどうかを審査します。", "E2", "費用削減の可否", aspect="審査内容"),
+                    claim(
+                        "費用削減が可能かどうかを審査します。",
+                        "E2",
+                        "費用削減の可否",
+                        aspect="審査内容",
+                    ),
                     claim("仕様が妥当かどうかを審査します。", "E2", "仕様の妥当性"),
-                    claim("競争性を阻害する要因がないかを審査します。", "E2", "競争性の阻害要因の有無"),
+                    claim(
+                        "競争性を阻害する要因がないかを審査します。", "E2", "競争性の阻害要因の有無"
+                    ),
                 ],
             },
             {
@@ -146,7 +153,11 @@ def good_draft() -> dict:
                     "委員会において審査する案件は、次のとおりとする。",
                 ),
                 "claims": [
-                    claim("概算費用が１，０００万円以上の設備更新が対象です。", "E2", "概算費用１，０００万円以上の設備更新"),
+                    claim(
+                        "概算費用が１，０００万円以上の設備更新が対象です。",
+                        "E2",
+                        "概算費用１，０００万円以上の設備更新",
+                    ),
                     claim(
                         "概算費用が３００万円以上の設備改修が対象ですが、緊急修繕は除きます。",
                         "E2",
@@ -205,8 +216,16 @@ class FakeModel:
             # ワイヤ形式の共有原文IDを解決し、既存の意味検査用偽モデルへ渡す。
             for row in payload["claims"]:
                 if "source_ids" in row:
-                    ranges = {ref["source_id"]: ref["lines"] for ref in row.get("source_ranges", [])}
-                    row["source"] = [dict(payload["source_catalog"][sid], **({"lines": ranges[sid]} if sid in ranges else {})) for sid in row["source_ids"]]
+                    ranges = {
+                        ref["source_id"]: ref["lines"] for ref in row.get("source_ranges", [])
+                    }
+                    row["source"] = [
+                        dict(
+                            payload["source_catalog"][sid],
+                            **({"lines": ranges[sid]} if sid in ranges else {}),
+                        )
+                        for sid in row["source_ids"]
+                    ]
             self.calls.append(("g2", payload))
             verdicts = self.g2(payload["claims"])
             return {

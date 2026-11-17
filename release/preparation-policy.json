@@ -1,5 +1,5 @@
 {
-    "schema_version": "1.0",
+    "schema_version": "3.0",
     "public_root": ".",
     "profiles": ["source-repository"],
     "documents": [
@@ -7,10 +7,11 @@
             "path": "README.md",
             "required_sections": [
                 "配布状態",
-                "対応環境",
-                "導入",
+                "動作要件",
+                "インストール",
                 "プライバシー",
-                "削除・ライセンス・問い合わせ"
+                "ライセンス",
+                "アンインストール"
             ]
         },
         {
@@ -100,53 +101,25 @@
         "minimum_branch_coverage": null,
         "require_formatter": true,
         "require_linter": true,
-        "require_dependency_review": true
+        "require_dependency_review": true,
+        "build_requirement": "not-applicable",
+        "build_not_applicable_reason": "公開物はソース ZIP。実行ファイル、インストーラー、モデルのビルドや同梱は行わず、ZIP の展開と内容の照合を必須とする。"
     },
     "manual_acceptance": [
         {
-            "id": "clean-vm-e2e-install-search-web",
+            "id": "windows-source-entrypoint-smoke",
             "requirement": "required",
-            "reason": "Windows 11 x64 clean VMで標準user・apostropheを含むpath・別drive OLLAMA_MODELSにてinstall/search/web(health/SSE/cancel/shutdown)/restart/uninstallと、checksum不一致・disk不足・model衝突等の失敗系を検証する。旧remediation plan E2E-1、TODO OD-2に対応。"
+            "reason": "Windows 11 x64 のクリーンな環境で ZIP を空白とアポストロフィを含むパスへ展開し、開発依存を手順どおり整備する。合成資料と fixture を使い、索引・CLI 検索・Web の起動、ヘルス確認、検索・中止・終了を確認する。"
         },
         {
-            "id": "hardware-performance-baseline",
+            "id": "source-archive-content-review",
             "requirement": "required",
-            "reason": "選択candidate名、catalog digest、model manifest digest、license layer digest、Ollama版を同一receiptへ固定した上で、CPU-only・partial offload・full GPUの各構成でRAM/VRAM/応答時間をclean machineで実測し、README/setup guideへ反映する。旧remediation plan PERF-1、TODO OD-3に対応。"
+            "reason": "VERSION・release-metadata.json・公開予定のタグを照合。クリーン展開時に候補のファイル一覧・ハッシュ・余剰ファイルがないことを確認し、ZIP と SHA256SUMS.txt を確定する。"
         },
         {
-            "id": "package-candidate-freshness",
+            "id": "source-license-notice-review",
             "requirement": "required",
-            "reason": "現行sourceからuser-built transport release candidateを再生成し、version・createdAt・inventory・legal model copy・checksumsが一致することを確認する。`-PublicRelease`はlicense確定前に使用しない。旧remediation plan PKG-1、TODO OD-4に対応。"
-        },
-        {
-            "id": "installer-pinning-verification",
-            "requirement": "required",
-            "reason": "必須installer(Python/Ollama)のversion・SHA-256・Authenticode signerを固定し検証する。旧remediation plan SUP-1に対応。"
-        },
-        {
-            "id": "model-identity-pinning",
-            "requirement": "required",
-            "reason": "release対象の選択candidate名、download-manifest.json digest、Ollama版、model manifest digest、license layer digestを同一candidate receiptへ固定する。旧remediation plan MODEL-1に対応。"
-        },
-        {
-            "id": "third-party-license-notice-review",
-            "requirement": "required",
-            "reason": "Python・Ollama・選択modelなど残存componentのlicense・版・source・配布条件を人間可読な台帳(THIRD-PARTY-NOTICES.md)へ反映する。旧remediation plan LIC-1に対応。"
-        },
-        {
-            "id": "install-context-privilege-check",
-            "requirement": "conditional",
-            "reason": "optional PowerShell MSI等を公開bundleへ含める場合、必要な権限とinstall contextを事前判定する。含めるか否かは未決(旧remediation plan PRIV-1・未決事項)。含めないと決した場合はnot-applicableへ切替える。"
-        },
-        {
-            "id": "publisher-bundle-go-no-go",
-            "requirement": "conditional",
-            "reason": "publisher配布prebuilt bundleの採否をownerがGO/NO-GO判断する。GOの場合はPython license stack・installer SBOM/pass-through terms・残存model/runtimeの再配布審査が別途必要。旧remediation plan「Publisher prebuilt bundle」節、TODO OD-5に対応。"
-        },
-        {
-            "id": "offline-ai-index-cli-web-acceptance",
-            "requirement": "required",
-            "reason": "現行資料集合相当でindex.bat/Webのbatch build、進捗、cancel、checkpoint resume、source変更stale判定、browser reload、server restart、keyword-only fallback、通常検索120秒、retrieval child timeoutを実機検証する。Embedding初回構築は検索要求から分離し、skip/timeout/NOT_MEASUREDをPASSへ数えない。"
+            "reason": "公開ソースの LICENSE ハッシュ、README の配布範囲、THIRD-PARTY-NOTICES.md を照合し、Python・Ollama・モデル・インストーラー・利用者資料を含まないことを確認する。"
         }
     ],
     "artifacts": [],
@@ -154,6 +127,6 @@
         "require_hashes": true,
         "require_sbom": false,
         "require_dependency_review": true,
-        "require_clean_install": true
+        "require_clean_install": false
     }
 }

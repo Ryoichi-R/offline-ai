@@ -108,7 +108,9 @@ def test_long_paragraph_keeps_leading_sentences_unless_a_qualifier_would_be_drop
     point = gf.build_overview(long_text)["points"][0]
     assert point["kind"] == "excerpt" and point["truncated"] is True
     assert point["text"].endswith("。") and len(point["text"]) <= gf.OVERVIEW_POINT_CHARS * 2
-    qualified = "# 表題\n## 本文\n" + "原則として押印は不要とする。" * 30 + "ただし外国法人は除く。\n"
+    qualified = (
+        "# 表題\n## 本文\n" + "原則として押印は不要とする。" * 30 + "ただし外国法人は除く。\n"
+    )
     assert gf.build_overview(qualified)["points"][0]["kind"] == "guide"
     one_sentence = "# 表題\n## 本文\n" + "あ" * 500 + "。\n"
     assert gf.build_overview(one_sentence)["points"][0]["kind"] == "guide"
@@ -130,11 +132,17 @@ def _options():
 def test_targets_carry_over_to_aspect_only_follow_up():
     doc = _document()
     topic = gf.Topic()
-    first = gf.resolve_follow_up(doc, topic, _options(), action=gf.ACTION_FOLLOW_UP, text="提出書類")
+    first = gf.resolve_follow_up(
+        doc, topic, _options(), action=gf.ACTION_FOLLOW_UP, text="提出書類"
+    )
     assert first.ask is None and first.topic.targets == ()
-    second = gf.resolve_follow_up(doc, first.topic, _options(), action=gf.ACTION_FOLLOW_UP, text="請求書だけ")
+    second = gf.resolve_follow_up(
+        doc, first.topic, _options(), action=gf.ACTION_FOLLOW_UP, text="請求書だけ"
+    )
     assert second.topic.targets == ("請求書",)
-    third = gf.resolve_follow_up(doc, second.topic, _options(), action=gf.ACTION_FOLLOW_UP, text="期限は？")
+    third = gf.resolve_follow_up(
+        doc, second.topic, _options(), action=gf.ACTION_FOLLOW_UP, text="期限は？"
+    )
     assert third.ask is None
     assert third.topic.targets == ("請求書",)
     # 請求書の期限がある「提出書類」の節に絞る（領収書の保存期限の節ではない）。
@@ -149,10 +157,17 @@ def test_replace_add_and_drop_targets():
     base = gf.Topic(None, ("請求書",))
     added = gf.resolve_follow_up(doc, base, options, action=gf.ACTION_FOLLOW_UP, text="領収書も")
     assert added.topic.targets == ("請求書", "領収書")
-    replaced = gf.resolve_follow_up(doc, added.topic, options, action=gf.ACTION_FOLLOW_UP, text="領収書のみ")
+    replaced = gf.resolve_follow_up(
+        doc, added.topic, options, action=gf.ACTION_FOLLOW_UP, text="領収書のみ"
+    )
     assert replaced.topic.targets == ("領収書",)
     dropped = gf.resolve_follow_up(
-        doc, added.topic, options, action=gf.ACTION_FOLLOW_UP, text="期限は？", drop_targets=("請求書",)
+        doc,
+        added.topic,
+        options,
+        action=gf.ACTION_FOLLOW_UP,
+        text="期限は？",
+        drop_targets=("請求書",),
     )
     assert dropped.topic.targets == ("領収書",)
 
@@ -165,7 +180,9 @@ def test_selecting_a_section_clears_targets_and_numbers_map_to_options():
     assert chosen.focus_ranges == [(11, 12, "notice.md")]
     by_number = gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_FOLLOW_UP, text="3")
     assert by_number.topic.section == chosen.topic.section
-    overview = gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_SELECT_TOPIC, choice=len(options) - 1)
+    overview = gf.resolve_follow_up(
+        doc, topic, options, action=gf.ACTION_SELECT_TOPIC, choice=len(options) - 1
+    )
     assert overview.overview is True
     with pytest.raises(gf.ConfirmationError) as error:
         gf.resolve_follow_up(doc, topic, options, action=gf.ACTION_SELECT_TOPIC, choice=99)
@@ -174,9 +191,13 @@ def test_selecting_a_section_clears_targets_and_numbers_map_to_options():
 
 def test_target_in_several_places_is_asked_back_and_unknown_terms_are_reported():
     doc, options = _document(), _options()
-    asked = gf.resolve_follow_up(doc, gf.Topic(), options, action=gf.ACTION_FOLLOW_UP, text="領収書について")
+    asked = gf.resolve_follow_up(
+        doc, gf.Topic(), options, action=gf.ACTION_FOLLOW_UP, text="領収書について"
+    )
     assert asked.ask is not None and len(asked.ask["options"]) == 2
-    missing = gf.resolve_follow_up(doc, gf.Topic(), options, action=gf.ACTION_FOLLOW_UP, text="旅費規程")
+    missing = gf.resolve_follow_up(
+        doc, gf.Topic(), options, action=gf.ACTION_FOLLOW_UP, text="旅費規程"
+    )
     assert missing.ask is not None and "旅費規程" in missing.ask["message"]
     assert missing.topic.targets == ()
 
@@ -202,7 +223,13 @@ class Clock:
 def _fixed_decision():
     return gf.Decision(
         "topics",
-        document={"path": "notice.md", "title": TITLE, "sha256": "x", "sourceRoot": "/s", "text": NOTICE},
+        document={
+            "path": "notice.md",
+            "title": TITLE,
+            "sha256": "x",
+            "sourceRoot": "/s",
+            "text": NOTICE,
+        },
         overview=gf.build_overview(NOTICE),
     )
 
@@ -257,10 +284,14 @@ def test_busy_session_state_and_stale_options_are_rejected():
         store.begin(cid, "other", action=gf.ACTION_FOLLOW_UP, options_version=None, request_id="r")
     assert error.value.code == "confirmation_invalid"
     with pytest.raises(gf.ConfirmationError) as error:
-        store.begin(cid, "s", action=gf.ACTION_SELECT_DOCUMENT, options_version=version, request_id="r")
+        store.begin(
+            cid, "s", action=gf.ACTION_SELECT_DOCUMENT, options_version=version, request_id="r"
+        )
     assert error.value.code == "confirmation_invalid"
     with pytest.raises(gf.ConfirmationError) as error:
-        store.begin(cid, "s", action=gf.ACTION_SELECT_TOPIC, options_version=version - 1, request_id="r")
+        store.begin(
+            cid, "s", action=gf.ACTION_SELECT_TOPIC, options_version=version - 1, request_id="r"
+        )
     assert error.value.code == "confirmation_invalid"
     store.begin(cid, "s", action=gf.ACTION_SELECT_TOPIC, options_version=version, request_id="r1")
     with pytest.raises(gf.ConfirmationError) as error:
@@ -278,7 +309,11 @@ def test_public_view_never_contains_document_text_or_hashes():
     store = gf.ConfirmationStore()
     public = store.create("s", "q", _fixed_decision()).public()
     assert "text" not in public["document"] and "sha256" not in public["document"]
-    pending = store.create("s", "q", gf.Decision("documents", candidates=[{"path": "a.md", "title": "A", "fileSha256": "x"}]))
+    pending = store.create(
+        "s",
+        "q",
+        gf.Decision("documents", candidates=[{"path": "a.md", "title": "A", "fileSha256": "x"}]),
+    )
     assert pending.public()["candidates"] == [{"path": "a.md", "title": "A"}]
 
 
@@ -288,11 +323,20 @@ def test_public_view_never_contains_document_text_or_hashes():
 def test_deferred_deep_jobs_do_not_hold_the_slot_until_research_starts():
     table = web_services.JobTable(max_concurrent=3)
     try:
+
         def token():
             return web_services.CancellationToken(300)
 
-        clarify_a, _ = table.submit("a", token(), fingerprint=("s", "q", "", 300, "deep"), mode="deep", defer_deep_slot=True)
-        clarify_b, _ = table.submit("b", token(), fingerprint=("s", "q2", "", 300, "deep"), mode="deep", defer_deep_slot=True)
+        clarify_a, _ = table.submit(
+            "a", token(), fingerprint=("s", "q", "", 300, "deep"), mode="deep", defer_deep_slot=True
+        )
+        clarify_b, _ = table.submit(
+            "b",
+            token(),
+            fingerprint=("s", "q2", "", 300, "deep"),
+            mode="deep",
+            defer_deep_slot=True,
+        )
         assert table.acquire_deep_slot("a") is True
         assert table.acquire_deep_slot("a") is True  # 同じジョブの再取得
         assert table.acquire_deep_slot("b") is False
@@ -315,13 +359,21 @@ def test_deep_research_starts_only_after_taking_the_slot(monkeypatch):
     calls = []
     monkeypatch.setattr(web_services, "detect_deep_model", lambda: "test-model")
     monkeypatch.setattr(
-        web_services, "run_deep_research",
-        lambda query, **kwargs: calls.append(kwargs.get("fixed_document"))
-        or deep_research.DeepResearchResult(status="completed", stop_reason="scope_processed"),
+        web_services,
+        "run_deep_research",
+        lambda query, **kwargs: (
+            calls.append(kwargs.get("fixed_document"))
+            or deep_research.DeepResearchResult(status="completed", stop_reason="scope_processed")
+        ),
     )
     busy = queue.Queue()
     web_services._run_search_core(
-        "q", "off", busy, web_services.CancellationToken(300), "r1", mode="deep",
+        "q",
+        "off",
+        busy,
+        web_services.CancellationToken(300),
+        "r1",
+        mode="deep",
         acquire_deep_slot=lambda: False,
     )
     events = [busy.get_nowait() for _ in range(busy.qsize())]
@@ -330,8 +382,14 @@ def test_deep_research_starts_only_after_taking_the_slot(monkeypatch):
     fixed = {"path": "notice.md", "sha256": "x", "focus_ranges": [[7, 10]], "primary": False}
     done = queue.Queue()
     web_services._run_search_core(
-        "q", "off", done, web_services.CancellationToken(300), "r2", mode="deep",
-        acquire_deep_slot=lambda: True, fixed_document=fixed,
+        "q",
+        "off",
+        done,
+        web_services.CancellationToken(300),
+        "r2",
+        mode="deep",
+        acquire_deep_slot=lambda: True,
+        fixed_document=fixed,
     )
     assert calls == [fixed]
     assert any(e["type"] == "done" for e in [done.get_nowait() for _ in range(done.qsize())])
@@ -340,6 +398,12 @@ def test_deep_research_starts_only_after_taking_the_slot(monkeypatch):
 def test_disabled_run_search_calls_the_core_unchanged(monkeypatch):
     seen = []
     monkeypatch.delenv("OFFLINE_AI_GUIDED_FOLLOW_UP", raising=False)
-    monkeypatch.setattr(web_services, "_run_search_core", lambda *a, **k: seen.append((a[0], k.get("fixed_document"))))
-    web_services.run_search("質問", "off", None, None, "r", mode="deep", confirmation_store=gf.ConfirmationStore())
+    monkeypatch.setattr(
+        web_services,
+        "_run_search_core",
+        lambda *a, **k: seen.append((a[0], k.get("fixed_document"))),
+    )
+    web_services.run_search(
+        "質問", "off", None, None, "r", mode="deep", confirmation_store=gf.ConfirmationStore()
+    )
     assert seen == [("質問", None)]

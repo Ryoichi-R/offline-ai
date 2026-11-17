@@ -55,6 +55,7 @@ def _normalize_answer_text(text: str) -> str:
     """回答の機械照合用に、NFKC（全角半角）とハイフン類を統一する。"""
     return _ANSWER_DASH_RE.sub("-", unicodedata.normalize("NFKC", str(text or "")))
 
+
 REQUIRED_QUESTION_KEYS = ("id", "category", "query", "answerable")
 _ALLOWED_ACCEPTANCE_KEYS = {
     "min_retrieval_hit_rate",
@@ -235,9 +236,13 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
             raise SpecError(f"{question_id}: answerable な質問へ abstain_layer は指定できない")
         expected_expansion = str(raw.get("expected_expansion", "")).strip()
         if expected_expansion not in EXPECTED_EXPANSIONS:
-            raise SpecError(f"{question_id}: expected_expansion は {EXPECTED_EXPANSIONS} のいずれか")
+            raise SpecError(
+                f"{question_id}: expected_expansion は {EXPECTED_EXPANSIONS} のいずれか"
+            )
         if expected_expansion and not answerable:
-            raise SpecError(f"{question_id}: expected_expansion は answerable な質問だけに指定できる")
+            raise SpecError(
+                f"{question_id}: expected_expansion は answerable な質問だけに指定できる"
+            )
         holdout = raw.get("holdout", False)
         if not isinstance(holdout, bool):
             raise SpecError(f"{question_id}: holdout は真偽値")
@@ -249,7 +254,8 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
         aliases = raw.get("required_fact_aliases", {})
         if not isinstance(aliases, dict) or any(
             key not in raw.get("required_facts", [])
-            or not isinstance(values, list) or not values
+            or not isinstance(values, list)
+            or not values
             or any(not isinstance(value, str) or not value.strip() for value in values)
             for key, values in aliases.items()
         ):
@@ -291,7 +297,9 @@ def parse_spec(data: dict[str, Any], *, spec_path: Path) -> EvalSpec:
                 holdout=holdout,
                 notes=str(raw.get("notes", "")).strip(),
                 allow_abstain_phrase=allow_abstain_phrase,
-                required_fact_aliases=tuple((key, tuple(values)) for key, values in aliases.items()),
+                required_fact_aliases=tuple(
+                    (key, tuple(values)) for key, values in aliases.items()
+                ),
                 allow_scoped_abstention=scoped,
             )
         )
@@ -704,7 +712,8 @@ def run_agentic_lite_route(
         attempts=len(result.attempts),
         trace=list(getattr(result, "trace", {}).get("attempts", [])),
         must_find_terms=tuple(
-            str(term) for term in (getattr(result, "plan", {}) or {}).get("must_find_terms", []) or []
+            str(term)
+            for term in (getattr(result, "plan", {}) or {}).get("must_find_terms", []) or []
         ),
         # agentic-lite は pipeline が既に最終根拠予算を適用した user_prompt を
         # 返す（search_only=False）。matches/confidence/evidence_status と同じ
@@ -890,7 +899,10 @@ def measure_answer_probe(
     # より、diversion_verdict を passed 判定へ採用する。forbidden_facts が無い
     # 質問（流用対象外）は従来どおり abstain_phrase だけで判定する。変更前判定
     # (forbidden_fact 原文一致)は比較のため receipt へ残す。
-    diverted = diversion_verdict is not None and diversion_verdict.verdict == diversion_evaluator.VERDICT_FAIL
+    diverted = (
+        diversion_verdict is not None
+        and diversion_verdict.verdict == diversion_evaluator.VERDICT_FAIL
+    )
     base.update(
         {
             "status": "measured",
@@ -1023,7 +1035,7 @@ def _fact_present(answer: str, fact: str, aliases=()) -> bool:
         token = normalize(value)
         prefix = r"(?<![0-9])" if token[:1].isdigit() else ""
         for match in re.finditer(prefix + re.escape(token), normalized):
-            suffix = normalized[match.end():]
+            suffix = normalized[match.end() :]
             if not re.match(r"(?:ではない|ではありません|ではなく|じゃない|とは限らない)", suffix):
                 return True
     return False
@@ -1131,8 +1143,11 @@ def measure_answer_quality_probe(
             and (
                 not abstained
                 or (question.allow_abstain_phrase and missing_facts == 0)
-                or (question.allow_scoped_abstention and missing_facts == 0
-                    and _only_scoped_abstention(answer_text))
+                or (
+                    question.allow_scoped_abstention
+                    and missing_facts == 0
+                    and _only_scoped_abstention(answer_text)
+                )
             )
             and not transport_error,
             "answer_nonempty": nonempty,
@@ -1450,7 +1465,9 @@ def _expansion_expectation_met(question: Question, outcome: RouteOutcome) -> boo
     return not any(m.get("group_partial") for m in expanded)
 
 
-def score_question(question: Question, outcome: RouteOutcome, *, run_index: int = 1) -> QuestionScore:
+def score_question(
+    question: Question, outcome: RouteOutcome, *, run_index: int = 1
+) -> QuestionScore:
     """1質問1 route の採点。skip / error は PASS でも FAIL でもなく `None` とする。"""
     run_id = _run_id(question.id, outcome.route, run_index)
     if outcome.status != STATUS_COMPLETED:
@@ -1516,7 +1533,9 @@ def score_question(question: Question, outcome: RouteOutcome, *, run_index: int 
                         break
             line_overlap = satisfied / len(ranged)
             if question.require_expected_lines:
-                expected_lines_retained = _expected_lines_retained(question, ranged, outcome.matches)
+                expected_lines_retained = _expected_lines_retained(
+                    question, ranged, outcome.matches
+                )
             candidate_line_recall = _candidate_line_recall(ranged, outcome.trace)
             expanded_irrelevant_ranges = sum(
                 1
@@ -1628,9 +1647,7 @@ def aggregate_route(scores: list[QuestionScore]) -> dict[str, Any]:
         "expected_lines_required": sum(
             1 for s in answerable if s.expected_lines_retained is not None
         ),
-        "expected_lines_missing": sum(
-            1 for s in answerable if s.expected_lines_retained is False
-        ),
+        "expected_lines_missing": sum(1 for s in answerable if s.expected_lines_retained is False),
         "candidate_line_recall_mean": _mean(s.candidate_line_recall for s in answerable),
         "expanded_irrelevant_ranges": sum(s.expanded_irrelevant_ranges or 0 for s in answerable),
         "expansion_expectation_required": sum(

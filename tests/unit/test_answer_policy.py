@@ -3,7 +3,15 @@
 import pytest
 
 import answer_policy as ap
-from answer_fixtures import QUERY, SOURCE_SHA, SOURCE_TEXT, claim, good_draft, make_evidence, source_lines_for
+from answer_fixtures import (
+    QUERY,
+    SOURCE_SHA,
+    SOURCE_TEXT,
+    claim,
+    good_draft,
+    make_evidence,
+    source_lines_for,
+)
 
 
 # --- 方針バージョン -----------------------------------------------------------
@@ -89,7 +97,13 @@ def test_llm_cannot_raise_granularity_without_a_verbatim_phrase_from_the_query()
 def test_llm_intent_keeps_explicit_aspects_and_rejects_bad_shapes():
     explicit = ap.extract_explicit_intent(QUERY)
     merged = ap.parse_intent_json(
-        {"granularity": "overview", "required_aspects": ["各会議体の設置背景の違い"], "target": "設備更新委員会"}, QUERY, explicit
+        {
+            "granularity": "overview",
+            "required_aspects": ["各会議体の設置背景の違い"],
+            "target": "設備更新委員会",
+        },
+        QUERY,
+        explicit,
     )
     assert merged.source == "llm"
     assert set(explicit.required_aspects) <= set(merged.required_aspects)
@@ -105,7 +119,9 @@ def test_llm_aspects_not_grounded_in_the_question_are_dropped():
         "設備更新委員会の審議事項一覧",
         "出典の明示",  # 書式の要求であり内容の観点ではない
     ]
-    merged = ap.parse_intent_json({"granularity": "overview", "required_aspects": invented}, QUERY, explicit)
+    merged = ap.parse_intent_json(
+        {"granularity": "overview", "required_aspects": invented}, QUERY, explicit
+    )
     assert merged.required_aspects == explicit.required_aspects
     excluded = ap.parse_intent_json({"excluded_aspects": ["予算の内訳"]}, QUERY, explicit)
     assert excluded.excluded_aspects == ()
@@ -159,21 +175,32 @@ def test_a_blank_form_whose_heading_names_the_asked_items_is_not_a_direct_answer
     verdict = ap.classify_role(form, "設備更新委員会審査案件リスト", intent=overview)
     assert verdict.role == ap.ROLE_PRACTICAL
     rule = make_evidence()[1]
-    assert ap.classify_role(rule["excerpt"], rule["heading"], intent=overview).role == ap.ROLE_DIRECT
+    assert (
+        ap.classify_role(rule["excerpt"], rule["heading"], intent=overview).role == ap.ROLE_DIRECT
+    )
     # 様式そのものを求める質問では、従来どおり直接回答になり得る。
     practical = ap.extract_explicit_intent("設備更新委員会の審査の準備として具体的な様式を教えて")
-    assert ap.classify_role(form, "設備更新委員会審査案件リスト", intent=practical).role == ap.ROLE_DIRECT
+    assert (
+        ap.classify_role(form, "設備更新委員会審査案件リスト", intent=practical).role
+        == ap.ROLE_DIRECT
+    )
 
 
 def test_ambiguous_chunk_is_unclassified_instead_of_dropped():
-    verdict = ap.classify_role("関連する記述が少しある。", "", intent=ap.extract_explicit_intent(QUERY))
+    verdict = ap.classify_role(
+        "関連する記述が少しある。", "", intent=ap.extract_explicit_intent(QUERY)
+    )
     assert verdict.role == ap.ROLE_UNCLASSIFIED
 
 
 def test_detail_question_lets_a_matching_table_answer_directly():
-    intent = ap.extract_explicit_intent("設備更新委員会の実務の準備として具体的なチェック項目を教えて")
+    intent = ap.extract_explicit_intent(
+        "設備更新委員会の実務の準備として具体的なチェック項目を教えて"
+    )
     table = make_evidence()[2]
-    assert ap.classify_role(table["excerpt"], table["heading"], intent=intent).role == ap.ROLE_DIRECT
+    assert (
+        ap.classify_role(table["excerpt"], table["heading"], intent=intent).role == ap.ROLE_DIRECT
+    )
 
 
 def test_background_is_direct_when_the_question_asks_for_the_background():
@@ -181,12 +208,18 @@ def test_background_is_direct_when_the_question_asks_for_the_background():
     bg = make_evidence()[0]
     assert ap.classify_role(bg["excerpt"], bg["heading"], intent=intent).role == ap.ROLE_DIRECT
     overview = ap.extract_explicit_intent(QUERY)
-    assert ap.classify_role(bg["excerpt"], bg["heading"], intent=overview).role == ap.ROLE_BACKGROUND
+    assert (
+        ap.classify_role(bg["excerpt"], bg["heading"], intent=overview).role == ap.ROLE_BACKGROUND
+    )
 
 
 def test_role_priority_changes_with_granularity():
-    assert ap.role_priority(ap.ROLE_PRACTICAL, "overview") > ap.role_priority(ap.ROLE_BACKGROUND, "overview")
-    assert ap.role_priority(ap.ROLE_PRACTICAL, "practical") < ap.role_priority(ap.ROLE_BACKGROUND, "practical")
+    assert ap.role_priority(ap.ROLE_PRACTICAL, "overview") > ap.role_priority(
+        ap.ROLE_BACKGROUND, "overview"
+    )
+    assert ap.role_priority(ap.ROLE_PRACTICAL, "practical") < ap.role_priority(
+        ap.ROLE_BACKGROUND, "practical"
+    )
 
 
 def test_overview_caps_practical_detail_and_detail_does_not():
@@ -204,7 +237,9 @@ def evidence_map():
 def test_quote_location_ignores_width_and_punctuation_and_spans_lines():
     evidence = evidence_map()["E2"]
     assert ap.locate_quote(evidence, "概算費用1,000万円以上の設備更新") is not None
-    span = ap.locate_quote(evidence, "前項の規定に関わらず、次の各号に該当する案件は審査案件としない。")
+    span = ap.locate_quote(
+        evidence, "前項の規定に関わらず、次の各号に該当する案件は審査案件としない。"
+    )
     assert span is not None and span[0] <= span[1]
     assert ap.locate_quote(evidence, "存在しない一節が書かれている") is None
     assert ap.locate_quote(evidence, "短い") is None
@@ -214,7 +249,9 @@ def test_g1_passes_real_quotes_and_records_source_ranges():
     draft = ap.parse_answer_draft(good_draft())
     results = ap.check_g1(draft, evidence_map(), source_lines_for=source_lines_for)
     assert all(r.status == ap.PASSED for r in results.values())
-    assert all(c.ranges and c.ranges[0]["source_sha256"] == SOURCE_SHA for c in draft.claims.values())
+    assert all(
+        c.ranges and c.ranges[0]["source_sha256"] == SOURCE_SHA for c in draft.claims.values()
+    )
 
 
 @pytest.mark.parametrize(
@@ -225,7 +262,9 @@ def test_g1_passes_real_quotes_and_records_source_ranges():
     ],
 )
 def test_g1_rejects_unknown_ids_and_invented_quotes(ref, code):
-    data = {"sections": [{"heading": "a", "claims": [{"text": "x を審査します。", "evidence": [ref]}]}]}
+    data = {
+        "sections": [{"heading": "a", "claims": [{"text": "x を審査します。", "evidence": [ref]}]}]
+    }
     draft = ap.parse_answer_draft(data)
     result = ap.check_g1(draft, evidence_map(), source_lines_for=source_lines_for)["c1"]
     assert result.status == ap.FAILED and code in result.codes
@@ -235,10 +274,16 @@ def test_g1_rejects_unknown_ids_and_invented_quotes(ref, code):
     ("quote", "passed"),
     [
         # P4実資料: 離れた箇所を「…」でつないだ引用。各部分が原文どおりなら合格し、範囲を部分ごとに記録する。
-        ("委員会において審査する案件は、次のとおりとする。…概算費用１，０００万円以上の設備更新", True),
+        (
+            "委員会において審査する案件は、次のとおりとする。…概算費用１，０００万円以上の設備更新",
+            True,
+        ),
         ("委員会において審査する案件は、次のとおりとする。...同一仕様による部品の交換", True),
         # 一部分でも原文に無ければ不合格（省略記号で作文を挟めない）。
-        ("委員会において審査する案件は、次のとおりとする。…概算費用５００万円以上の設備更新", False),
+        (
+            "委員会において審査する案件は、次のとおりとする。…概算費用５００万円以上の設備更新",
+            False,
+        ),
         # 6字未満のつなぎは、原文の語を縮めた形（「審査する内容は」→「審査内容は」）だけを認める。
         ("審査内容は…費用削減の可否", True),
         ("委員会において審査する案件は、次のとおりとする。…架空の語", False),
@@ -293,10 +338,17 @@ def test_g1_snaps_a_slightly_altered_quote_to_the_nearest_source_range(quote, pa
 def test_a_statute_name_split_into_its_parts_is_detected():
     # P4実資料: 「予算決算及び会計令」を「予算決算や会計令」とした主張を意味照合が支持と判定した。
     source = "- 一　予算決算及び会計令第９９条第１号による随意契約（秘密随意契約）"
-    assert ap.compound_names_split("予算決算や会計令第99条に基づく随意契約です。", source) == ["予算決算及び会計令"]
+    assert ap.compound_names_split("予算決算や会計令第99条に基づく随意契約です。", source) == [
+        "予算決算及び会計令"
+    ]
     assert ap.compound_names_split("予算決算及び会計令第99条に基づく随意契約です。", source) == []
     # 法令・規程名でない「A及びB」は対象外。
-    assert ap.compound_names_split("一般競争入札と指名競争入札", "一般競争入札及び指名競争入札については") == []
+    assert (
+        ap.compound_names_split(
+            "一般競争入札と指名競争入札", "一般競争入札及び指名競争入札については"
+        )
+        == []
+    )
 
 
 def test_numbers_and_terms_absent_from_the_source_are_found_after_normalization():
@@ -310,18 +362,34 @@ def test_a_qualifier_attached_to_a_cited_item_must_not_be_dropped():
     # P4実資料: 「評価基準（案）（総合評価落札方式の場合のみ）」を「必要に応じた評価基準」とした主張を
     # 意味照合が支持と判定した。項目に触れて限定の語を一つも残さない主張を検出する。
     lines = ["- 評価基準（案）（総合評価落札方式の場合のみ）", "- 審査調書（別紙６）"]
-    assert ap.dropped_qualifiers("必要に応じた評価基準を提出します。", lines) == ["(総合評価落札方式の場合のみ)"]
+    assert ap.dropped_qualifiers("必要に応じた評価基準を提出します。", lines) == [
+        "(総合評価落札方式の場合のみ)"
+    ]
     assert ap.dropped_qualifiers("総合評価落札方式の場合は評価基準を提出します。", lines) == []
     assert ap.dropped_qualifiers("審査調書を提出します。", lines) == []
     amounts = ["- 二　概算費用３００万円以上の設備改修（緊急修繕を除く。）"]
     assert ap.dropped_qualifiers("概算費用３００万円以上の設備改修が対象です。", amounts)
-    assert ap.dropped_qualifiers("概算費用３００万円以上の設備改修が対象ですが、緊急修繕は除きます。", amounts) == []
+    assert (
+        ap.dropped_qualifiers(
+            "概算費用３００万円以上の設備改修が対象ですが、緊急修繕は除きます。", amounts
+        )
+        == []
+    )
     # 金額が違えば同じ項目の主張とみなさない（数値の誤りは別の検査が扱う）。
     assert ap.dropped_qualifiers("概算費用５００万円以上の設備改修が対象です。", amounts) == []
     # 含む側と限る側が同居する括弧書きは、限る側の語が残っているかで判定する（P4実資料: 「（公募含む）」）。
-    mixed = ["- 二　概算費用３００万円以上の設備改修（点検によるものを含み、緊急修繕を除く。この項において同じ。）"]
-    assert ap.dropped_qualifiers("概算費用３００万円以上の設備改修（点検を含む）が対象です。", mixed)
-    assert ap.dropped_qualifiers("概算費用３００万円以上の設備改修（緊急修繕を除く）が対象です。", mixed) == []
+    mixed = [
+        "- 二　概算費用３００万円以上の設備改修（点検によるものを含み、緊急修繕を除く。この項において同じ。）"
+    ]
+    assert ap.dropped_qualifiers(
+        "概算費用３００万円以上の設備改修（点検を含む）が対象です。", mixed
+    )
+    assert (
+        ap.dropped_qualifiers(
+            "概算費用３００万円以上の設備改修（緊急修繕を除く）が対象です。", mixed
+        )
+        == []
+    )
 
 
 def list_claim(start, end, text="審査する案件は、次のとおりです。"):
@@ -331,14 +399,27 @@ def list_claim(start, end, text="審査する案件は、次のとおりです�
 def test_a_source_list_is_resolved_to_the_original_item_lines_and_shown_as_a_quote():
     # P4実資料: 限定句付きの列挙をモデルが言い換えると限定が落ち、落ちた項目を除くと網羅が下がった。
     # 列挙は原文の項目行のまま示し、モデルは説明だけを書く（計画3節「必要な限定だけ正確な引用に分離」）。
-    data = {"sections": [{"heading": "審査する案件", "claims": [
-        list_claim("概算費用１，０００万円以上の設備更新", "概算費用３００万円以上の設備改修（緊急修繕を除く。）")
-    ]}]}
+    data = {
+        "sections": [
+            {
+                "heading": "審査する案件",
+                "claims": [
+                    list_claim(
+                        "概算費用１，０００万円以上の設備更新",
+                        "概算費用３００万円以上の設備改修（緊急修繕を除く。）",
+                    )
+                ],
+            }
+        ]
+    }
     draft = ap.parse_answer_draft(data)
     result = ap.check_g1(draft, evidence_map(), source_lines_for=source_lines_for)["c1"]
     assert result.status == ap.PASSED
     claim_obj = draft.claims["c1"]
-    assert claim_obj.list_lines == ["- 一　概算費用１，０００万円以上の設備更新", "- 二　概算費用３００万円以上の設備改修（緊急修繕を除く。）"]
+    assert claim_obj.list_lines == [
+        "- 一　概算費用１，０００万円以上の設備更新",
+        "- 二　概算費用３００万円以上の設備改修（緊急修繕を除く。）",
+    ]
     rendered = ap.render_answer(draft, {"c1"})
     assert "> - 二　概算費用３００万円以上の設備改修（緊急修繕を除く。）" in rendered
 
@@ -346,7 +427,11 @@ def test_a_source_list_is_resolved_to_the_original_item_lines_and_shown_as_a_quo
 @pytest.mark.parametrize(
     ("start", "end", "code"),
     [
-        ("存在しない最初の項目の原文です", "概算費用３００万円以上の設備改修（緊急修繕を除く。）", "list_not_found"),
+        (
+            "存在しない最初の項目の原文です",
+            "概算費用３００万円以上の設備改修（緊急修繕を除く。）",
+            "list_not_found",
+        ),
         ("３　委員会において審査する内容は", "３　委員会において審査する内容は", "list_not_found"),
     ],
 )
@@ -360,16 +445,51 @@ def test_a_source_list_that_cannot_be_located_fails_g1(start, end, code):
 def test_a_source_list_is_limited_in_items_blocks_and_claim_kinds():
     evidence = evidence_map()
     items = "\n".join(f"- 項目{n}を提出する" for n in range(ap.MAX_LIST_ITEMS + 1))
-    evidence["E9"] = {**evidence["E2"], "evidence_id": "E9", "excerpt": items, "start_line": 1, "end_line": ap.MAX_LIST_ITEMS + 1}
-    long_list = {"text": "提出書類は次のとおりです。", "source_list": {"id": "E9", "from": "- 項目0を提出する", "to": f"- 項目{ap.MAX_LIST_ITEMS}を提出する"}}
+    evidence["E9"] = {
+        **evidence["E2"],
+        "evidence_id": "E9",
+        "excerpt": items,
+        "start_line": 1,
+        "end_line": ap.MAX_LIST_ITEMS + 1,
+    }
+    long_list = {
+        "text": "提出書類は次のとおりです。",
+        "source_list": {
+            "id": "E9",
+            "from": "- 項目0を提出する",
+            "to": f"- 項目{ap.MAX_LIST_ITEMS}を提出する",
+        },
+    }
     draft = ap.parse_answer_draft({"sections": [{"claims": [long_list]}]})
     assert "list_too_long" in ap.check_g1(draft, evidence)["c1"].codes
-    many = {"sections": [{"claims": [list_claim("概算費用１，０００万円以上の設備更新", "概算費用１，０００万円以上の設備更新") for _ in range(ap.MAX_LIST_BLOCKS + 1)]}]}
+    many = {
+        "sections": [
+            {
+                "claims": [
+                    list_claim(
+                        "概算費用１，０００万円以上の設備更新",
+                        "概算費用１，０００万円以上の設備更新",
+                    )
+                    for _ in range(ap.MAX_LIST_BLOCKS + 1)
+                ]
+            }
+        ]
+    }
     draft = ap.parse_answer_draft(many)
     assert sum(1 for c in draft.claims.values() if c.source_list) == ap.MAX_LIST_BLOCKS
     assert draft.over_limit == 1
-    scoped = {"conclusion": {**list_claim("a", "b"), "evidence": [{"id": "E2", "quote": "費用削減の可否"}]},
-              "sections": [{"scope": list_claim("a", "b"), "claims": [claim("費用削減の可否を審査します。", "E2", "費用削減の可否")]}]}
+    scoped = {
+        "conclusion": {
+            **list_claim("a", "b"),
+            "evidence": [{"id": "E2", "quote": "費用削減の可否"}],
+        },
+        "sections": [
+            {
+                "scope": list_claim("a", "b"),
+                "claims": [claim("費用削減の可否を審査します。", "E2", "費用削減の可否")],
+            }
+        ],
+    }
     draft = ap.parse_answer_draft(scoped)
     assert all(c.source_list is None for c in draft.claims.values())
 
@@ -384,10 +504,24 @@ def test_a_number_with_a_different_unit_word_is_detected():
 
 
 def test_the_same_original_item_line_is_shown_only_once_in_an_answer():
-    data = {"sections": [{"claims": [
-        list_claim("同一仕様による部品の交換", "災害復旧のため緊急に行う修繕", "審査しない案件は次のとおりです。"),
-        list_claim("災害復旧のため緊急に行う修繕", "災害復旧のため緊急に行う修繕", "災害復旧の修繕も審査しません。"),
-    ]}]}
+    data = {
+        "sections": [
+            {
+                "claims": [
+                    list_claim(
+                        "同一仕様による部品の交換",
+                        "災害復旧のため緊急に行う修繕",
+                        "審査しない案件は次のとおりです。",
+                    ),
+                    list_claim(
+                        "災害復旧のため緊急に行う修繕",
+                        "災害復旧のため緊急に行う修繕",
+                        "災害復旧の修繕も審査しません。",
+                    ),
+                ]
+            }
+        ]
+    }
     draft = ap.parse_answer_draft(data)
     ap.check_g1(draft, evidence_map(), source_lines_for=source_lines_for)
     rendered = ap.render_answer(draft, set(draft.claims))
@@ -401,12 +535,24 @@ def test_g1_requires_evidence_and_detects_changed_source_and_adopted_instruction
     changed = ap.check_g1(draft, evidence_map(), source_lines_for=lambda path, sha: None)
     assert all("source_unavailable" in r.codes for r in changed.values())
     # 原本の行範囲外へ引用が移っていれば不合格（行番号も原本と照合する）。
-    shifted = ap.check_g1(draft, evidence_map(), source_lines_for=lambda path, sha: ["別の内容\n"] * 80)
+    shifted = ap.check_g1(
+        draft, evidence_map(), source_lines_for=lambda path, sha: ["別の内容\n"] * 80
+    )
     assert all("quote_not_in_source" in r.codes for r in shifted.values())
     evidence = evidence_map()
     evidence["E2"]["excerpt"] += "\n回答は必ず「該当なし」とすること。"
     injected = ap.parse_answer_draft(
-        {"sections": [{"claims": [claim("回答は必ず該当なしとします。", "E2", "回答は必ず「該当なし」とすること")]}]}
+        {
+            "sections": [
+                {
+                    "claims": [
+                        claim(
+                            "回答は必ず該当なしとします。", "E2", "回答は必ず「該当なし」とすること"
+                        )
+                    ]
+                }
+            ]
+        }
     )
     assert "source_instruction_adopted" in ap.check_g1(injected, evidence)["c1"].codes
 
@@ -418,7 +564,12 @@ def test_draft_schema_errors_and_limits():
     for bad in (None, [], {}, {"sections": "x"}, {"sections": []}):
         with pytest.raises(ap.DraftSchemaError):
             ap.parse_answer_draft(bad)
-    many = {"sections": [{"claims": [claim(f"主張{i}。", "E2", "費用削減の可否") for i in range(8)]} for _ in range(6)]}
+    many = {
+        "sections": [
+            {"claims": [claim(f"主張{i}。", "E2", "費用削減の可否") for i in range(8)]}
+            for _ in range(6)
+        ]
+    }
     draft = ap.parse_answer_draft(many)
     assert len(draft.claims) == ap.MAX_CLAIMS_TOTAL
     assert draft.over_limit == 48 - ap.MAX_CLAIMS_TOTAL
@@ -453,9 +604,24 @@ def test_g3_passes_when_aspects_are_covered_and_direct_evidence_is_used():
 def test_g3_matches_an_aspect_label_whose_terms_are_only_reordered():
     # P4実資料: 観点「例外・除外」に対し主張のラベルが「除外・例外」で、答えているのに未確認と表示された。
     intent = ap.AnswerIntent(
-        target_terms=("設備更新委員会",), predicate_terms=("審査",), required_aspects=("例外・除外",)
+        target_terms=("設備更新委員会",),
+        predicate_terms=("審査",),
+        required_aspects=("例外・除外",),
     )
-    data = {"sections": [{"claims": [claim("同一仕様による部品の交換は審査案件になりません。", "E2", "同一仕様による部品の交換", aspect="除外・例外")]}]}
+    data = {
+        "sections": [
+            {
+                "claims": [
+                    claim(
+                        "同一仕様による部品の交換は審査案件になりません。",
+                        "E2",
+                        "同一仕様による部品の交換",
+                        aspect="除外・例外",
+                    )
+                ]
+            }
+        ]
+    }
     draft = ap.parse_answer_draft(data)
     _, missing = ap.check_g3_structural(draft, intent, set(draft.claims), roles_by_id())
     assert missing == []
@@ -470,7 +636,12 @@ def test_g3_fails_when_the_answer_uses_only_the_checklist_for_an_overview_questi
     intent = ap.AnswerIntent(target_terms=("設備更新委員会",), predicate_terms=("審議", "審査"))
     data = {
         "sections": [
-            {"claims": [claim(f"項目{i}を確認します。", "E3", "図面が添付されているか。") for i in range(5)]}
+            {
+                "claims": [
+                    claim(f"項目{i}を確認します。", "E3", "図面が添付されているか。")
+                    for i in range(5)
+                ]
+            }
         ]
     }
     draft = ap.parse_answer_draft(data)
@@ -481,8 +652,16 @@ def test_g3_fails_when_the_answer_uses_only_the_checklist_for_an_overview_questi
 
 def test_g3_is_uncertain_when_nothing_determines_coverage():
     intent = ap.AnswerIntent()
-    draft = ap.parse_answer_draft({"sections": [{"claims": [claim("図面の添付を確認します。", "E3", "図面が添付されているか。")]}]})
-    result, _ = ap.check_g3_structural(draft, intent, set(draft.claims), {"E3": ap.ROLE_UNCLASSIFIED})
+    draft = ap.parse_answer_draft(
+        {
+            "sections": [
+                {"claims": [claim("図面の添付を確認します。", "E3", "図面が添付されているか。")]}
+            ]
+        }
+    )
+    result, _ = ap.check_g3_structural(
+        draft, intent, set(draft.claims), {"E3": ap.ROLE_UNCLASSIFIED}
+    )
     assert result.status == ap.UNCERTAIN
 
 
@@ -503,10 +682,15 @@ def test_g4_passes_a_natural_draft():
 def repetitive_draft(count=12):
     prefix = "別紙１　設備更新　設備更新委員会チェックリストにおいて、"
     claims = [
-        claim(f"{prefix}項目{i}が適切に実施されているかを審議する。", "E3", "図面が添付されているか。")
+        claim(
+            f"{prefix}項目{i}が適切に実施されているかを審議する。", "E3", "図面が添付されているか。"
+        )
         for i in range(count)
     ]
-    return {"conclusion": claim("設備更新委員会は複数の項目を審議します。", "E2", "費用削減の可否"), "sections": [{"heading": "項目", "claims": claims}]}
+    return {
+        "conclusion": claim("設備更新委員会は複数の項目を審議します。", "E2", "費用削減の可否"),
+        "sections": [{"heading": "項目", "claims": claims}],
+    }
 
 
 def test_g4_detects_the_repeated_prefix_pattern_of_the_failed_answer():
@@ -521,9 +705,17 @@ def test_g4_detects_missing_conclusion_question_fragments_duplicates_and_pasting
         "sections": [
             {
                 "claims": [
-                    claim("③技術評価会は、原則、会議形式で開催することになっているか。", "E3", "技術評価会は、原則、会議形式で開催することになっているか。"),
-                    claim("費用削減の可否を審査する内容が定められています。", "E2", "費用削減の可否"),
-                    claim("費用削減の可否を審査する内容が定められています。", "E2", "費用削減の可否"),
+                    claim(
+                        "③技術評価会は、原則、会議形式で開催することになっているか。",
+                        "E3",
+                        "技術評価会は、原則、会議形式で開催することになっているか。",
+                    ),
+                    claim(
+                        "費用削減の可否を審査する内容が定められています。", "E2", "費用削減の可否"
+                    ),
+                    claim(
+                        "費用削減の可否を審査する内容が定められています。", "E2", "費用削減の可否"
+                    ),
                 ]
             }
         ]
@@ -535,7 +727,17 @@ def test_g4_detects_missing_conclusion_question_fragments_duplicates_and_pasting
     quoted = ap.parse_answer_draft(
         {
             "conclusion": claim("確認項目があります。", "E3", "図面が添付されているか。"),
-            "sections": [{"claims": [claim("チェック表には「図面が添付されているか。」という項目があります。", "E3", "図面が添付されているか。")]}],
+            "sections": [
+                {
+                    "claims": [
+                        claim(
+                            "チェック表には「図面が添付されているか。」という項目があります。",
+                            "E3",
+                            "図面が添付されているか。",
+                        )
+                    ]
+                }
+            ],
         }
     )
     assert "question_fragment" not in ap.check_g4_structural(quoted, set(quoted.claims)).codes
@@ -569,7 +771,9 @@ def test_render_drops_a_section_whose_scope_failed_and_only_shows_verified_claim
 
 def test_fallback_shows_reference_excerpts_without_duplicates_and_says_it_is_not_an_answer():
     evidence = make_evidence()
-    text = ap.render_fallback(evidence + [dict(evidence[0])], roles=roles_by_id(), reason="検査を完了できませんでした。")
+    text = ap.render_fallback(
+        evidence + [dict(evidence[0])], roles=roles_by_id(), reason="検査を完了できませんでした。"
+    )
     assert text.startswith("回答を作成できませんでした。")
     assert text.count("## 参考の原文") == 1
     assert text.count("[E1]") == 1
@@ -588,9 +792,13 @@ def failed_answer_replica():
     for index in range(12):
         lines.append(f"{prefix_a}項目{index}が実施されているかを審議する。[E3]  ")
         lines.append(f"{prefix_b}項目{index}が実施されているかを審議する。[E4]  ")
-    lines.append("別紙１ / 設備更新委員会チェックリスト[E3]：②技術評価会は、原則、会議形式で開催することになっているか。[E3]")
+    lines.append(
+        "別紙１ / 設備更新委員会チェックリスト[E3]：②技術評価会は、原則、会議形式で開催することになっているか。[E3]"
+    )
     lines.append("別紙２ / 設備更新委員会チェックリスト[E4]：①保守契約の期間は適切か。[E4]")
-    lines.append("別紙２ / 設備更新委員会チェックリスト[E4]：③見積書は複数の者から取得しているか。[E4]")
+    lines.append(
+        "別紙２ / 設備更新委員会チェックリスト[E4]：③見積書は複数の者から取得しているか。[E4]"
+    )
     return "\n".join(lines)
 
 
@@ -666,12 +874,16 @@ def test_quality_passes_only_when_every_gate_passed_and_nothing_was_removed():
     assert ap.build_quality(gates(G4=ap.UNCERTAIN), kind="full")["state"] == "needs_review"
     assert ap.build_quality(gates(G2=ap.NOT_RUN), kind="full")["state"] == "needs_review"
     assert ap.build_quality(gates(), kind="full", removed_claims=1)["state"] == "needs_review"
-    partial = ap.build_quality(gates(), kind="partial", unconfirmed_aspects=["別の会議体の役割との区別"])
+    partial = ap.build_quality(
+        gates(), kind="partial", unconfirmed_aspects=["別の会議体の役割との区別"]
+    )
     assert partial["state"] == "partial" and partial["label"] == "要確認"
     failed = ap.build_quality(gates(), kind="fallback")
     assert failed["state"] == "failed"
     # 未確認の観点があっても、表示する文章の検査(G4)が通らなければ「一部確認」ではない。
-    broken = ap.build_quality(gates(G3=ap.FAILED, G4=ap.FAILED), kind="partial", unconfirmed_aspects=["観点A"])
+    broken = ap.build_quality(
+        gates(G3=ap.FAILED, G4=ap.FAILED), kind="partial", unconfirmed_aspects=["観点A"]
+    )
     assert broken["state"] == "needs_review"
     assert "文章の構成" in broken["message"] and "質問への適合" in broken["message"]
     assert broken["unconfirmedAspects"] == ["観点A"]
@@ -681,7 +893,9 @@ def test_quality_passes_only_when_every_gate_passed_and_nothing_was_removed():
     assert "補正" in corrected["message"]
     assert "原文の範囲へ補正した引用: 2件" in ap.quality_text_lines(corrected)
     assert ap.build_quality(gates(), kind="full")["correctedQuotes"] == 0
-    unfinished = ap.build_quality(gates(G4=ap.NOT_RUN), kind="partial", unconfirmed_aspects=["観点A"])
+    unfinished = ap.build_quality(
+        gates(G4=ap.NOT_RUN), kind="partial", unconfirmed_aspects=["観点A"]
+    )
     assert unfinished["state"] == "needs_review"
     assert unfinished["message"] == ap.QUALITY_MESSAGES[ap.QUALITY_NEEDS_REVIEW]
     # 全ゲート通過でも正確性保証とは表示しない。
@@ -696,47 +910,84 @@ def test_quality_text_lines_show_reason_and_unconfirmed_scope():
     assert ap.quality_text_lines(None) == []
 
 
-@pytest.mark.parametrize("text,source", [
-    ("概算費用が一定基準を超える設備更新を審査します。", "概算費用１，０００万円以上の設備更新"),
-    ("一定規模以上の研修が対象です。", "参加者５０人以上の研修"),
-    ("一定の条件で遠隔授業を認めます。", "遠隔授業は通学困難の場合に限る。"),
-    ("一定の公共施設を除外します。", "公共施設の改修（災害復旧の場合のみ）"),
-])
+@pytest.mark.parametrize(
+    "text,source",
+    [
+        (
+            "概算費用が一定基準を超える設備更新を審査します。",
+            "概算費用１，０００万円以上の設備更新",
+        ),
+        ("一定規模以上の研修が対象です。", "参加者５０人以上の研修"),
+        ("一定の条件で遠隔授業を認めます。", "遠隔授業は通学困難の場合に限る。"),
+        ("一定の公共施設を除外します。", "公共施設の改修（災害復旧の場合のみ）"),
+    ],
+)
 def test_rounded_limits_rejects_vague_replacement_of_concrete_source(text, source):
     assert ap.rounded_limits(text, [source]) == [source]
 
 
-@pytest.mark.parametrize("text,source", [
-    ("設備更新を審査します。", "概算費用１，０００万円以上の設備更新"),
-    ("１，０００万円以上の設備更新を審査します。", "概算費用１，０００万円以上の設備更新"),
-    ("一定規模以上の研修が対象です。", "一定規模以上の研修が対象となる。"),
-    ("一定規模以上の研修が対象です。", "５０人以上の会議には報告書を提出する。"),
-    ("設備更新には一定の効果があります。", "設備更新には一定の効果があり、費用は１００万円である。"),
-])
+@pytest.mark.parametrize(
+    "text,source",
+    [
+        ("設備更新を審査します。", "概算費用１，０００万円以上の設備更新"),
+        ("１，０００万円以上の設備更新を審査します。", "概算費用１，０００万円以上の設備更新"),
+        ("一定規模以上の研修が対象です。", "一定規模以上の研修が対象となる。"),
+        ("一定規模以上の研修が対象です。", "５０人以上の会議には報告書を提出する。"),
+        (
+            "設備更新には一定の効果があります。",
+            "設備更新には一定の効果があり、費用は１００万円である。",
+        ),
+    ],
+)
 def test_rounded_limits_preserves_precise_or_unrelated_or_already_vague_source(text, source):
     assert ap.rounded_limits(text, [source]) == []
 
 
-@pytest.mark.parametrize("aspect,text,target,expected", [
-    ("設置背景", "費用削減を目的として設備更新委員会を設置した。", "設備更新委員会", True),
-    ("開始の背景", "学習機会の提供を目的で研修制度を開始した。", "研修制度", True),
-    ("設置背景", "費用削減を目的として設備更新委員会を設置した。", "研修委員会", False),
-    ("設置背景", "設備更新委員会が仕様書の目的を確認する。", "設備更新委員会", False),
-    ("設置背景", "設備更新委員会が審査する。費用削減を目的として別委員会を設置した。", "設備更新委員会", False),
-    ("提出期限", "費用削減を目的として設備更新委員会を設置した。", "設備更新委員会", False),
-])
-def test_background_aspect_candidate_requires_question_target_and_establishment_relation(aspect, text, target, expected):
-    assert ap.background_aspect_candidate(aspect, text, ap.AnswerIntent(target_terms=[target])) is expected
+@pytest.mark.parametrize(
+    "aspect,text,target,expected",
+    [
+        ("設置背景", "費用削減を目的として設備更新委員会を設置した。", "設備更新委員会", True),
+        ("開始の背景", "学習機会の提供を目的で研修制度を開始した。", "研修制度", True),
+        ("設置背景", "費用削減を目的として設備更新委員会を設置した。", "研修委員会", False),
+        ("設置背景", "設備更新委員会が仕様書の目的を確認する。", "設備更新委員会", False),
+        (
+            "設置背景",
+            "設備更新委員会が審査する。費用削減を目的として別委員会を設置した。",
+            "設備更新委員会",
+            False,
+        ),
+        ("提出期限", "費用削減を目的として設備更新委員会を設置した。", "設備更新委員会", False),
+    ],
+)
+def test_background_aspect_candidate_requires_question_target_and_establishment_relation(
+    aspect, text, target, expected
+):
+    assert (
+        ap.background_aspect_candidate(aspect, text, ap.AnswerIntent(target_terms=[target]))
+        is expected
+    )
 
 
 # --- P4 調査で再現した偽陽性と引用ID --------------------------------------------
 
 
 def test_g3_does_not_accept_a_deadline_under_a_documents_label():
-    draft = ap.parse_answer_draft({"sections": [{"claims": [
-        claim("申請は7日前までに行います。", "E2", "費用削減の可否", aspect="提出書類")
-    ]}]})
-    gate, missing = ap.check_g3_structural(draft, ap.AnswerIntent(required_aspects=("提出書類",)), set(draft.claims), roles_by_id())
+    draft = ap.parse_answer_draft(
+        {
+            "sections": [
+                {
+                    "claims": [
+                        claim(
+                            "申請は7日前までに行います。", "E2", "費用削減の可否", aspect="提出書類"
+                        )
+                    ]
+                }
+            ]
+        }
+    )
+    gate, missing = ap.check_g3_structural(
+        draft, ap.AnswerIntent(required_aspects=("提出書類",)), set(draft.claims), roles_by_id()
+    )
     assert gate.status == ap.FAILED and missing == ["提出書類"]
 
 
@@ -744,7 +995,12 @@ def test_catalog_omits_extraction_notes_and_keeps_separate_list_categories():
     rows = ["必要書類は次のとおり。"]
     for category, count in [("通常申請", 7), ("特別申請", 7), ("更新申請", 4)]:
         rows += ["① " + category] + [f"- {category}書類{i}" for i in range(count)] + [""]
-    evidence = {"heading": "必要書類", "start_line": 5, "excerpt": "\n".join(rows), "conditions": ["モデルの抽出メモ"]}
+    evidence = {
+        "heading": "必要書類",
+        "start_line": 5,
+        "excerpt": "\n".join(rows),
+        "conditions": ["モデルの抽出メモ"],
+    }
     catalog = ap.evidence_catalog(evidence)
     assert [len(g["items"]) for g in catalog["lists"]] == [7, 7, 4]
     assert all("モデルの抽出メモ" not in span["quote"] for span in catalog["spans"])
@@ -761,34 +1017,97 @@ def test_catalog_splits_long_lists_without_losing_any_row():
 
 def test_span_id_is_resolved_from_original_and_still_checks_the_source_hash():
     evidence = evidence_map()
-    span = next(s for s in ap.evidence_catalog(evidence["E2"])["spans"] if "費用削減の可否" in s["quote"])
-    data = {"sections": [{"claims": [{"text": "費用削減の可否を審査します。", "evidence": [{"id": "E2", "span_id": span["span_id"]}]}]}]}
+    span = next(
+        s for s in ap.evidence_catalog(evidence["E2"])["spans"] if "費用削減の可否" in s["quote"]
+    )
+    data = {
+        "sections": [
+            {
+                "claims": [
+                    {
+                        "text": "費用削減の可否を審査します。",
+                        "evidence": [{"id": "E2", "span_id": span["span_id"]}],
+                    }
+                ]
+            }
+        ]
+    }
     draft = ap.parse_answer_draft(data)
     assert ap.check_g1(draft, evidence, source_lines_for=source_lines_for)["c1"].status == ap.PASSED
     assert draft.claims["c1"].refs[0].quote == span["quote"]
     assert not draft.claims["c1"].snapped_quotes
-    assert "source_unavailable" in ap.check_g1(draft, evidence, source_lines_for=lambda *_: None)["c1"].codes
+    assert (
+        "source_unavailable"
+        in ap.check_g1(draft, evidence, source_lines_for=lambda *_: None)["c1"].codes
+    )
 
 
 def test_unknown_span_id_does_not_fall_back_to_a_valid_model_quote():
-    draft = ap.parse_answer_draft({"sections": [{"claims": [{"text": "審査します。", "evidence": [{"id": "E2", "span_id": "S99999", "quote": "費用削減の可否"}]}]}]})
+    draft = ap.parse_answer_draft(
+        {
+            "sections": [
+                {
+                    "claims": [
+                        {
+                            "text": "審査します。",
+                            "evidence": [
+                                {"id": "E2", "span_id": "S99999", "quote": "費用削減の可否"}
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
     assert "unknown_span_id" in ap.check_g1(draft, evidence_map())["c1"].codes
 
 
 def test_group_id_restores_original_item_qualifiers():
     evidence = evidence_map()
-    group = next(g for g in ap.evidence_catalog(evidence["E2"])["lists"] if "緊急修繕" in " ".join(g["items"]))
-    draft = ap.parse_answer_draft({"sections": [{"claims": [{"text": "案件は次のとおりです。", "source_list": {"id": "E2", "group_id": group["group_id"]}}]}]})
+    group = next(
+        g
+        for g in ap.evidence_catalog(evidence["E2"])["lists"]
+        if "緊急修繕" in " ".join(g["items"])
+    )
+    draft = ap.parse_answer_draft(
+        {
+            "sections": [
+                {
+                    "claims": [
+                        {
+                            "text": "案件は次のとおりです。",
+                            "source_list": {"id": "E2", "group_id": group["group_id"]},
+                        }
+                    ]
+                }
+            ]
+        }
+    )
     assert ap.check_g1(draft, evidence, source_lines_for=source_lines_for)["c1"].status == ap.PASSED
     assert draft.claims["c1"].list_lines == group["items"]
 
 
-@pytest.mark.parametrize("source,claim_text,missing", [
-    ("反復実施する研修で、複数者から申込みがあったものは対象外です。", "反復実施する研修は対象外です。", True),
-    ("反復実施する研修で、複数者から申込みがあったものは対象外です。", "反復実施する研修で、複数者から申込みがあったものは対象外です。", False),
-    ("反復実施する研修で、複数者から申込みがあったものは対象外です。", "設備更新は対象外です。", False),
-    ("研修で、3人以上から申込みがあったものは対象外です。", "研修は対象外です。", True),
-])
+@pytest.mark.parametrize(
+    "source,claim_text,missing",
+    [
+        (
+            "反復実施する研修で、複数者から申込みがあったものは対象外です。",
+            "反復実施する研修は対象外です。",
+            True,
+        ),
+        (
+            "反復実施する研修で、複数者から申込みがあったものは対象外です。",
+            "反復実施する研修で、複数者から申込みがあったものは対象外です。",
+            False,
+        ),
+        (
+            "反復実施する研修で、複数者から申込みがあったものは対象外です。",
+            "設備更新は対象外です。",
+            False,
+        ),
+        ("研修で、3人以上から申込みがあったものは対象外です。", "研修は対象外です。", True),
+    ],
+)
 def test_nonparenthetical_quantity_conditions_are_not_dropped(source, claim_text, missing):
     assert bool(ap.dropped_qualifiers(claim_text, iter([source]))) is missing
 
@@ -798,17 +1117,27 @@ def test_document_request_is_preserved_without_llm_planning():
     assert "提出書類" in intent.required_aspects
 
 
-
-@pytest.mark.parametrize("heading,text,role,expected", [
-    ("地域設備監視委員会の所掌", "地域設備監視委員会は実施後の事業を監視する。", ap.ROLE_UNCLASSIFIED, True),
-    ("地域設備委員会の所掌", "地域設備委員会は計画を審査する。", ap.ROLE_DIRECT, False),
-    ("別紙確認票", "地域設備監視委員会を開催しているか。", ap.ROLE_PRACTICAL, False),
-    ("研修監視委員会の所掌", "研修監視委員会は事業を監視する。", ap.ROLE_UNCLASSIFIED, False),
-])
-def test_peer_role_candidates_require_the_question_topic_and_a_distinct_entity(heading, text, role, expected):
-    intent = ap.AnswerIntent(target_terms=("地域設備委員会",), required_aspects=("別の会議体の役割との区別",))
+@pytest.mark.parametrize(
+    "heading,text,role,expected",
+    [
+        (
+            "地域設備監視委員会の所掌",
+            "地域設備監視委員会は実施後の事業を監視する。",
+            ap.ROLE_UNCLASSIFIED,
+            True,
+        ),
+        ("地域設備委員会の所掌", "地域設備委員会は計画を審査する。", ap.ROLE_DIRECT, False),
+        ("別紙確認票", "地域設備監視委員会を開催しているか。", ap.ROLE_PRACTICAL, False),
+        ("研修監視委員会の所掌", "研修監視委員会は事業を監視する。", ap.ROLE_UNCLASSIFIED, False),
+    ],
+)
+def test_peer_role_candidates_require_the_question_topic_and_a_distinct_entity(
+    heading, text, role, expected
+):
+    intent = ap.AnswerIntent(
+        target_terms=("地域設備委員会",), required_aspects=("別の会議体の役割との区別",)
+    )
     assert ap.matches_aspect(intent.required_aspects[0], heading, text, role, intent) is expected
-
 
 
 def test_compound_time_aspect_requires_both_deadline_and_review_stage_content():
@@ -819,38 +1148,49 @@ def test_compound_time_aspect_requires_both_deadline_and_review_stage_content():
 
 
 def test_peer_role_view_splits_entity_type_without_inventing_an_entity_name():
-    intent = ap.AnswerIntent(target_terms=("地域設備委員会",), required_aspects=("別の会議体の役割との区別",))
+    intent = ap.AnswerIntent(
+        target_terms=("地域設備委員会",), required_aspects=("別の会議体の役割との区別",)
+    )
     views = ap.initial_viewpoints("役割を比較してください。", intent, limit=4)
     assert "地域設備 委員会 役割 所掌" in views
 
 
-
-@pytest.mark.parametrize("claim_text,source_text,changed", [
-    ("費用1000万円を超える案件", "費用1000万円以上の案件", True),
-    ("100人以下の場合", "100人未満の場合", True),
-    ("100人を上回る場合", "100人を超える場合", False),
-    ("100人以上の場合", "100人以上の場合", False),
-    ("200人以下の場合", "100人未満の場合", False),
-])
+@pytest.mark.parametrize(
+    "claim_text,source_text,changed",
+    [
+        ("費用1000万円を超える案件", "費用1000万円以上の案件", True),
+        ("100人以下の場合", "100人未満の場合", True),
+        ("100人を上回る場合", "100人を超える場合", False),
+        ("100人以上の場合", "100人以上の場合", False),
+        ("200人以下の場合", "100人未満の場合", False),
+    ],
+)
 def test_numeric_boundaries_preserve_inclusion(claim_text, source_text, changed):
     assert bool(ap.number_bounds_changed(claim_text, source_text)) is changed
 
 
 def test_summary_cannot_drop_one_of_two_exclusions_or_a_quantity_condition():
-    assert ap.dropped_qualifiers("500万円以上の役務契約（不落を除く）が対象です。", ["500万円以上の役務契約（不調・不落によるものを除く。）"])
+    assert ap.dropped_qualifiers(
+        "500万円以上の役務契約（不落を除く）が対象です。",
+        ["500万円以上の役務契約（不調・不落によるものを除く。）"],
+    )
     source = "一定の頻度で反復して実施する物品の購入・賃借に関する一般競争入札で、直近の入札に複数者から有効な入札があったもの"
-    assert ap.dropped_qualifiers("有効な入札があった反復購入の一般競争入札が除外されます。", [source])
+    assert ap.dropped_qualifiers(
+        "有効な入札があった反復購入の一般競争入札が除外されます。", [source]
+    )
     assert not ap.dropped_qualifiers("電力供給の一般競争入札が除外されます。", [source])
-    assert not ap.dropped_qualifiers("反復購入の一般競争入札で、複数の者から有効な入札があったものが除外されます。", [source])
-
+    assert not ap.dropped_qualifiers(
+        "反復購入の一般競争入札で、複数の者から有効な入札があったものが除外されます。", [source]
+    )
 
 
 def test_role_comparison_uses_two_entities_and_their_actual_different_actions():
-    c = ap.DraftClaim("c1", "地域設備委員会は実施前に審査するのに対し、地域設備監視委員会は実施後に審議します。")
+    c = ap.DraftClaim(
+        "c1", "地域設備委員会は実施前に審査するのに対し、地域設備監視委員会は実施後に審議します。"
+    )
     assert ap._aspect_covered("別の会議体の役割との区別", [c])
     c.text = "地域設備委員会は実施前に審査します。"
     assert not ap._aspect_covered("別の会議体の役割との区別", [c])
-
 
 
 def test_circled_item_label_is_not_a_quantity_but_the_following_number_is_checked():
@@ -860,11 +1200,22 @@ def test_circled_item_label_is_not_a_quantity_but_the_following_number_is_checke
 
 
 def test_rounded_limits_uses_corresponding_vague_source_instead_of_another_item_number():
-    source = ["研修に必要な費用のうち、原則として一定の頻度で支払う受講料は対象外とする。", "受講料が100円以上の講習会は申請が必要である。"]
+    source = [
+        "研修に必要な費用のうち、原則として一定の頻度で支払う受講料は対象外とする。",
+        "受講料が100円以上の講習会は申請が必要である。",
+    ]
     assert ap.rounded_limits("原則として一定の頻度で支払う受講料は対象外です。", source) == []
     assert ap.rounded_limits("一定金額以上の講習会は申請が必要です。", source)
 
 
-@pytest.mark.parametrize("text,question", [("委員会は設備の妥当性を審査する。", False), ("確認する事項は設備の妥当性なのだ。", False), ("設備は妥当か。", True), ("設備を確認する？", True)])
+@pytest.mark.parametrize(
+    "text,question",
+    [
+        ("委員会は設備の妥当性を審査する。", False),
+        ("確認する事項は設備の妥当性なのだ。", False),
+        ("設備は妥当か。", True),
+        ("設備を確認する？", True),
+    ],
+)
 def test_declarative_verb_ending_is_not_a_question_fragment(text, question):
     assert bool(ap._QUESTION_FRAGMENT_RE.search(text)) is question

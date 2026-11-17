@@ -149,10 +149,7 @@ def test_deep_runner_grades_only_the_requested_question(monkeypatch):
     assert "answer" not in checks
 
     assert report["questionSpecSha256"] != report["parentSpecSha256"]
-    assert (
-        compare.question_spec(spec, "MH03")["spec_sha256"]
-        != report["questionSpecSha256"]
-    )
+    assert compare.question_spec(spec, "MH03")["spec_sha256"] != report["questionSpecSha256"]
 
 
 def test_question_scoped_review_is_bound_to_the_exact_question():
@@ -162,9 +159,7 @@ def test_question_scoped_review_is_bound_to_the_exact_question():
     scoped = compare.question_spec(spec, "MH04")
     changed = copy.deepcopy(spec)
     changed["items"][3]["abstention_patterns"] = ["changed"]
-    assert (
-        compare.question_spec(changed, "MH04")["spec_sha256"] != scoped["spec_sha256"]
-    )
+    assert compare.question_spec(changed, "MH04")["spec_sha256"] != scoped["spec_sha256"]
     with pytest.raises(compare.CompareConfigError):
         compare.question_spec(spec, "unknown")
 
@@ -192,12 +187,14 @@ def test_snapshot_copies_transitive_source_and_preserves_corpus(tmp_path):
         [
             sys.executable,
             "-I",
+            "-X",
+            "utf8",
             "-B",
             str(tmp_path / "tests/eval/macos_large_model_compare.py"),
             "--help",
         ],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=15,
     )
     assert result.returncode == 0, result.stderr
@@ -223,8 +220,12 @@ def test_snapshot_refuses_changed_source_and_out_of_root_paths(tmp_path):
 
 def test_full_hybrid_plan_for_used_group_is_not_independent_acceptance():
     plan = compare.build_plan(
-        run_id="calibration", models=list(compare.MAC_MODEL_DIGESTS),
-        modes=["answer", "deep"], repeat=3, reasoning="off", embed_model="bge-m3",
+        run_id="calibration",
+        models=list(compare.MAC_MODEL_DIGESTS),
+        modes=["answer", "deep"],
+        repeat=3,
+        reasoning="off",
+        embed_model="bge-m3",
     )
     assert plan["acceptanceEligible"] is False
     assert plan["acceptanceIneligibleReason"] == "evaluation-group-used-for-remediation"

@@ -206,7 +206,8 @@ def _matching_evidence(
     matches: list[dict[str, Any]] = []
     for expected in item["expected_sources"]:
         candidates = [
-            actual for actual in evidence
+            actual
+            for actual in evidence
             if str(actual.get("path", "")).replace("\\", "/") == expected["path"]
             and type(actual.get("start_line")) is int
             and type(actual.get("end_line")) is int

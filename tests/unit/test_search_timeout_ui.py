@@ -170,8 +170,13 @@ def _run_diag_node(diag) -> list:
         pytest.skip("node is not available in this environment")
     match = _DIAG_BLOCK_RE.search(_html())
     assert match, "deepDiagnosticsFormat block markers not found in index.html"
-    script = match.group(1) + f"\nconsole.log(JSON.stringify(deepDiagnosticsFormat.lines({json.dumps(diag)})));"
-    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=15, encoding="utf-8")
+    script = (
+        match.group(1)
+        + f"\nconsole.log(JSON.stringify(deepDiagnosticsFormat.lines({json.dumps(diag)})));"
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=15, encoding="utf-8"
+    )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip())
 
@@ -202,8 +207,18 @@ def test_deep_diagnostics_lines_show_final_answer_check_counts():
             "final_answer": {
                 "result": "accepted",
                 "attempts": [
-                    {"normalized_citations": 1, "dropped_unconfirmed_lines": 3, "uncited_lines": 2, "unknown_id_lines": 0},
-                    {"normalized_citations": 0, "dropped_unconfirmed_lines": 0, "uncited_lines": 0, "unknown_id_lines": 0},
+                    {
+                        "normalized_citations": 1,
+                        "dropped_unconfirmed_lines": 3,
+                        "uncited_lines": 2,
+                        "unknown_id_lines": 0,
+                    },
+                    {
+                        "normalized_citations": 0,
+                        "dropped_unconfirmed_lines": 0,
+                        "uncited_lines": 0,
+                        "unknown_id_lines": 0,
+                    },
                 ],
             }
         }
@@ -214,7 +229,10 @@ def test_deep_diagnostics_lines_show_final_answer_check_counts():
 
 
 def test_deep_diagnostics_list_units_read_but_judged_irrelevant():
-    ranges = [{"path": f"notice/doc-{i}.md", "start_line": 10 * i + 1, "end_line": 10 * i + 5} for i in range(7)]
+    ranges = [
+        {"path": f"notice/doc-{i}.md", "start_line": 10 * i + 1, "end_line": 10 * i + 5}
+        for i in range(7)
+    ]
     lines = _run_diag_node({"irrelevant_ranges": ranges})
     assert lines == [
         "読んだが質問と関係なしと判定した節: 7件（doc-0.md L1-5 / doc-1.md L11-15 / doc-2.md L21-25"
@@ -224,7 +242,13 @@ def test_deep_diagnostics_list_units_read_but_judged_irrelevant():
 
 def test_deep_diagnostics_show_repaired_lines_only_when_present():
     lines = _run_diag_node(
-        {"final_answer": {"result": "accepted", "repaired_lines": 2, "attempts": [{"limitation_lines": 2}, {"limitation_lines": 2}]}}
+        {
+            "final_answer": {
+                "result": "accepted",
+                "repaired_lines": 2,
+                "attempts": [{"limitation_lines": 2}, {"limitation_lines": 2}],
+            }
+        }
     )
     assert lines[0].endswith("限定の欠け 2行 / 原文に置き換えた行 2")
 
@@ -235,15 +259,25 @@ def test_deep_diagnostics_show_enumeration_gaps_and_added_items_only_when_presen
             "final_answer": {
                 "result": "accepted",
                 "added_items": 1,
-                "attempts": [{"limitation_lines": 0, "enumeration_gaps": 2}, {"limitation_lines": 0, "enumeration_gaps": 1}],
+                "attempts": [
+                    {"limitation_lines": 0, "enumeration_gaps": 2},
+                    {"limitation_lines": 0, "enumeration_gaps": 1},
+                ],
             }
         }
     )
     assert lines[0].endswith("限定の欠け 0行 / 列挙の欠け 1項目 / 原文から補った列挙項目 1")
 
+
 def test_deep_diagnostics_show_duplicate_lines_only_when_present():
     lines = _run_diag_node(
-        {"final_answer": {"result": "accepted", "duplicate_lines": 2, "attempts": [{"limitation_lines": 0}]}}
+        {
+            "final_answer": {
+                "result": "accepted",
+                "duplicate_lines": 2,
+                "attempts": [{"limitation_lines": 0}],
+            }
+        }
     )
     assert lines[0].endswith("限定の欠け 0行 / 重複を除いた行 2")
 
@@ -254,11 +288,20 @@ def test_deep_diagnostics_show_line_by_line_check_counts():
             "final_answer": {
                 "result": "accepted",
                 "attempts": [{"limitation_lines": 0}],
-                "line_checks": {"checked": 12, "unsupported": 2, "replaced": 1, "dropped": 1, "unchecked": 0},
+                "line_checks": {
+                    "checked": 12,
+                    "unsupported": 2,
+                    "replaced": 1,
+                    "dropped": 1,
+                    "unchecked": 0,
+                },
             }
         }
     )
-    assert lines[1] == "1行ずつの照合: 照合 12行 / 支持されない 2行（原文に置換 1・削除 1） / 未照合 0行"
+    assert (
+        lines[1]
+        == "1行ずつの照合: 照合 12行 / 支持されない 2行（原文に置換 1・削除 1） / 未照合 0行"
+    )
 
 
 def test_deep_diagnostics_show_background_lines_dropped_only_when_present():
@@ -267,11 +310,22 @@ def test_deep_diagnostics_show_background_lines_dropped_only_when_present():
             "final_answer": {
                 "result": "accepted",
                 "attempts": [{"limitation_lines": 0}],
-                "line_checks": {"checked": 12, "unsupported": 2, "replaced": 0, "dropped": 2, "off_question": 1, "unchecked": 0},
+                "line_checks": {
+                    "checked": 12,
+                    "unsupported": 2,
+                    "replaced": 0,
+                    "dropped": 2,
+                    "off_question": 1,
+                    "unchecked": 0,
+                },
             }
         }
     )
-    assert lines[1] == "1行ずつの照合: 照合 12行 / 支持されない 2行（原文に置換 0・削除 2、うち質問外の背景 1） / 未照合 0行"
+    assert (
+        lines[1]
+        == "1行ずつの照合: 照合 12行 / 支持されない 2行（原文に置換 0・削除 2、うち質問外の背景 1） / 未照合 0行"
+    )
+
 
 def test_deep_diagnostics_label_limitation_rejection():
     lines = _run_diag_node(
@@ -293,8 +347,14 @@ def test_deep_diagnostics_lines_tolerate_missing_diagnostics(diag):
 
 def test_deep_diagnostics_are_rendered_on_screen_and_in_saved_markdown():
     html = _html()
-    assert 'const diagnostics = ev.route === "deep" ? deepDiagnosticsFormat.lines(ev.deepDiagnostics) : [];' in html
-    assert "deepDiagnosticsFormat.lines(evidence.deepDiagnostics).map((line) => `- ${this._markdownMeta(line)}`)" in html
+    assert (
+        'const diagnostics = ev.route === "deep" ? deepDiagnosticsFormat.lines(ev.deepDiagnostics) : [];'
+        in html
+    )
+    assert (
+        "deepDiagnosticsFormat.lines(evidence.deepDiagnostics).map((line) => `- ${this._markdownMeta(line)}`)"
+        in html
+    )
 
 
 # Execute the production storage, transport and UI methods together. These tests
@@ -457,12 +517,28 @@ function page(storage, behavior, storageFails = false) {
 """
 
 
-@pytest.mark.parametrize("scenario", [
-    "eof", "network_error", "abort", "done", "terminal_error",
-    "http_400", "http_403", "http_404", "http_409",
-    "http_408", "http_429", "http_503",
-    "cancel_success", "cancel_failed", "stale_end", "cancel_done_race", "storage_denied",
-])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "eof",
+        "network_error",
+        "abort",
+        "done",
+        "terminal_error",
+        "http_400",
+        "http_403",
+        "http_404",
+        "http_409",
+        "http_408",
+        "http_429",
+        "http_503",
+        "cancel_success",
+        "cancel_failed",
+        "stale_end",
+        "cancel_done_race",
+        "storage_denied",
+    ],
+)
 def test_search_resume_lifecycle(scenario):
     node = shutil.which("node")
     if node is None:
@@ -470,7 +546,10 @@ def test_search_resume_lifecycle(scenario):
     result = subprocess.run(
         [node, "-e", _RECONNECT_JS],
         input=json.dumps({"html": _html(), "scenario": scenario}),
-        capture_output=True, text=True, encoding="utf-8", timeout=15,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["passed"]

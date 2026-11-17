@@ -156,9 +156,7 @@ def test_verify_evidence_support_propagates_cancel_check_exception_without_wrapp
 
     monkeypatch.setattr(search.urllib.request, "urlopen", fail_if_called)
     with pytest.raises(_StopCancel):
-        search.verify_evidence_support(
-            "質問", [], "m", cancel_check=cancel_check, timeout=5
-        )
+        search.verify_evidence_support("質問", [], "m", cancel_check=cancel_check, timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +272,9 @@ def test_verification_downgrades_sufficient_when_not_fully_supported(monkeypatch
 def test_verification_does_not_upgrade_partial_to_sufficient(monkeypatch, tmp_path):
     """partial かつ fully_supported でも格上げしない（非目標の固定）。"""
     monkeypatch.setattr(search, "_evidence_verify_enabled", lambda: True)
-    _prepare_pipeline(monkeypatch, tmp_path, "# 規程\n日当は3,000円である。", final_status="partial")
+    _prepare_pipeline(
+        monkeypatch, tmp_path, "# 規程\n日当は3,000円である。", final_status="partial"
+    )
     monkeypatch.setattr(
         search,
         "verify_evidence_support",
@@ -297,17 +297,21 @@ def test_verification_does_not_upgrade_partial_to_sufficient(monkeypatch, tmp_pa
 def test_verification_runs_for_partial_retrieval_status(monkeypatch, tmp_path):
     """検索時点でpartialの場合も検証・不足理由の受け渡しを実行する（Q16・F05対応）。"""
     monkeypatch.setattr(search, "_evidence_verify_enabled", lambda: True)
-    _prepare_pipeline(monkeypatch, tmp_path, "# 規程\n日当は3,000円である。", final_status="partial")
+    _prepare_pipeline(
+        monkeypatch, tmp_path, "# 規程\n日当は3,000円である。", final_status="partial"
+    )
     calls = []
     monkeypatch.setattr(
         search,
         "verify_evidence_support",
-        lambda *a, **k: calls.append(1)
-        or {
-            "support": "unsupported",
-            "reason_code": "different_subject",
-            "conditions": [],
-        },
+        lambda *a, **k: (
+            calls.append(1)
+            or {
+                "support": "unsupported",
+                "reason_code": "different_subject",
+                "conditions": [],
+            }
+        ),
     )
 
     result = search.run_retrieval_pipeline("日当はいくらか", model="m", mode="answer")
@@ -375,13 +379,13 @@ def test_verification_cancel_propagates_and_stops_before_answer_prompt(monkeypat
 
 def test_verification_not_applicable_when_insufficient(monkeypatch, tmp_path):
     monkeypatch.setattr(search, "_evidence_verify_enabled", lambda: True)
-    _prepare_pipeline(monkeypatch, tmp_path, "# 無関係\n無関係な内容。", final_status="insufficient")
+    _prepare_pipeline(
+        monkeypatch, tmp_path, "# 無関係\n無関係な内容。", final_status="insufficient"
+    )
     monkeypatch.setattr(
         search,
         "verify_evidence_support",
-        lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("insufficientでは検証してはならない")
-        ),
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("insufficientでは検証してはならない")),
     )
 
     result = search.run_retrieval_pipeline("存在しない話題は何か", model="m", mode="answer")
@@ -521,7 +525,6 @@ def test_verification_prompt_defines_supported_as_answered_not_applicable():
 
     assert "明示的に答えているか" in system
     assert "対象外" in system
-
 
 
 # ---------------------------------------------------------------------------

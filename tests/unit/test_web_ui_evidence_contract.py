@@ -39,7 +39,7 @@ def test_index_ui_exposes_incremental_preview_and_explicit_full_rebuild():
     html = INDEX_HTML.read_text(encoding="utf-8")
 
     assert 'id="indexFullBtn"' in html
-    assert 'fetch(`/api/index/plan?mode=${encodeURIComponent(mode)}`)' in html
+    assert "fetch(`/api/index/plan?mode=${encodeURIComponent(mode)}`)" in html
     assert "expected_generation" in html
     assert "再計算${plan.generated_chunks}チャンク・再利用${plan.reused_chunks}チャンク" in html
     assert "全件再構築" in html
@@ -55,7 +55,10 @@ def test_evidence_list_and_markdown_mark_expanded_and_partial_evidence():
     )
     render_start = html.index("    renderEvidence(ev) {")
     render_end = html.index("\n    },", render_start)
-    assert "if (item.groupId) metaParts.push(this._expansionLabel(item));" in html[render_start:render_end]
+    assert (
+        "if (item.groupId) metaParts.push(this._expansionLabel(item));"
+        in html[render_start:render_end]
+    )
     save_start = html.index("    saveMarkdown()")
     save_end = html.index("    async cancelSearch()", save_start)
     assert 'item.groupId ? this._expansionLabel(item) : ""' in html[save_start:save_end]

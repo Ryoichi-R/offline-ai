@@ -227,7 +227,9 @@ def test_partial_expansion_group_does_not_create_sufficient_status():
     )
 
     assert status == "partial"
-    assert confidence > search._calculate_confidence(query, [direct])[0], "confidence は採用本文全体で測る"
+    assert confidence > search._calculate_confidence(query, [direct])[0], (
+        "confidence は採用本文全体で測る"
+    )
 
 
 def test_pre_limit_conflict_survives_final_selection():

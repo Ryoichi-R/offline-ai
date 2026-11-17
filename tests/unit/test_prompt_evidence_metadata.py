@@ -131,15 +131,21 @@ def test_no_evidence_prompt_has_no_immunity_text():
 
 def test_insufficiency_reason_adds_answer_contract_at_prompt_end():
     """2026-09-19: 案Aが根拠不足と判定した場合だけ、末尾へ流用禁止の契約を置く。"""
-    snippets = [{"path": "regulations/training.md", "snippet": "外部セミナー受講には所属長の承認が必要。"}]
+    snippets = [
+        {"path": "regulations/training.md", "snippet": "外部セミナー受講には所属長の承認が必要。"}
+    ]
     reason = {"reason_code": "different_subject", "unsupported_conditions": ["外部講師への依頼"]}
 
     with_reason = build_user_prompt(
-        "外部の講師に研修を依頼する手続きは", snippets,
-        evidence_status="partial", insufficiency_reason=reason,
+        "外部の講師に研修を依頼する手続きは",
+        snippets,
+        evidence_status="partial",
+        insufficiency_reason=reason,
     )
     without_reason = build_user_prompt(
-        "外部の講師に研修を依頼する手続きは", snippets, evidence_status="partial",
+        "外部の講師に研修を依頼する手続きは",
+        snippets,
+        evidence_status="partial",
     )
 
     assert with_reason.rstrip().endswith(prompt_templates.INSUFFICIENCY_ANSWER_CONTRACT)
@@ -160,12 +166,47 @@ import pytest  # noqa: E402
     "reason, expected",
     [
         # 該当なし質問で観測された判定（T01・Q16・F05・T04）
-        ({"support": "unsupported", "reason_code": "missing_detail", "unsupported_conditions": []}, True),
-        ({"support": "partially_supported", "reason_code": "related_only", "unsupported_conditions": []}, True),
-        ({"support": "partially_supported", "reason_code": "different_subject", "unsupported_conditions": []}, True),
-        ({"support": "partially_supported", "reason_code": "missing_detail", "unsupported_conditions": ["x"]}, True),
+        (
+            {
+                "support": "unsupported",
+                "reason_code": "missing_detail",
+                "unsupported_conditions": [],
+            },
+            True,
+        ),
+        (
+            {
+                "support": "partially_supported",
+                "reason_code": "related_only",
+                "unsupported_conditions": [],
+            },
+            True,
+        ),
+        (
+            {
+                "support": "partially_supported",
+                "reason_code": "different_subject",
+                "unsupported_conditions": [],
+            },
+            True,
+        ),
+        (
+            {
+                "support": "partially_supported",
+                "reason_code": "missing_detail",
+                "unsupported_conditions": ["x"],
+            },
+            True,
+        ),
         # 言い換え型の正例（G16）で観測された控えめな判定は契約を置かない
-        ({"support": "partially_supported", "reason_code": "missing_detail", "unsupported_conditions": []}, False),
+        (
+            {
+                "support": "partially_supported",
+                "reason_code": "missing_detail",
+                "unsupported_conditions": [],
+            },
+            False,
+        ),
         ({"support": "unknown", "reason_code": "unclear", "unsupported_conditions": []}, False),
     ],
 )
@@ -174,7 +215,11 @@ def test_insufficiency_requires_abstain(reason, expected):
 
 
 def test_partial_support_without_conditions_keeps_reason_but_not_contract():
-    reason = {"support": "partially_supported", "reason_code": "missing_detail", "unsupported_conditions": []}
+    reason = {
+        "support": "partially_supported",
+        "reason_code": "missing_detail",
+        "unsupported_conditions": [],
+    }
     prompt = build_user_prompt(
         "目標設定面談で決める目標の件数を教えてください",
         [{"path": "guides/onboarding.md", "snippet": "目標は3件以上5件以下とする。"}],

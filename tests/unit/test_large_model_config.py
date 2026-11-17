@@ -17,13 +17,8 @@ def test_model_selection_precedence_and_read_only_file(tmp_path):
     model_file.write_text("gpt-oss:120b\n", encoding="utf-8")
     env = {"OFFLINE_AI_CHAT_MODEL": "qwen3.5:122b"}
 
-    assert (
-        resolve_model_selection("gpt-oss:120b", model_file, environ=env).source
-        == "command-line"
-    )
-    assert (
-        resolve_model_selection(None, model_file, environ=env).model == "qwen3.5:122b"
-    )
+    assert resolve_model_selection("gpt-oss:120b", model_file, environ=env).source == "command-line"
+    assert resolve_model_selection(None, model_file, environ=env).model == "qwen3.5:122b"
     assert resolve_model_selection(None, model_file, environ={}).model == "gpt-oss:120b"
     assert model_file.read_text(encoding="utf-8") == "gpt-oss:120b\n"
 
@@ -61,9 +56,7 @@ def test_fixed_model_digest_is_checked_against_api_tags():
         == digest
     )
     with pytest.raises(ModelConfigurationError, match="digest"):
-        validate_model_digest(
-            "qwen3.5:122b", [{"name": "qwen3.5:122b", "digest": "sha256:wrong"}]
-        )
+        validate_model_digest("qwen3.5:122b", [{"name": "qwen3.5:122b", "digest": "sha256:wrong"}])
 
 
 def test_fixed_model_digest_rejects_missing_model():
@@ -94,11 +87,7 @@ def test_search_plan_uses_the_requested_model_reasoning(
 
         def read(self):
             return json.dumps(
-                {
-                    "message": {
-                        "content": '{"keywords":["policy"],"search_queries":["query"]}'
-                    }
-                }
+                {"message": {"content": '{"keywords":["policy"],"search_queries":["query"]}'}}
             ).encode("utf-8")
 
     def fake_urlopen(request, timeout):
@@ -147,9 +136,7 @@ def test_evidence_verification_uses_the_requested_model_reasoning(monkeypatch):
 
     monkeypatch.setattr(search.urllib.request, "urlopen", fake_urlopen)
 
-    search.verify_evidence_support(
-        "query", [], "qwen3.5:122b", timeout=30, reasoning="high"
-    )
+    search.verify_evidence_support("query", [], "qwen3.5:122b", timeout=30, reasoning="high")
 
     assert captured["think"] is True
     assert captured["timeout"] == 30

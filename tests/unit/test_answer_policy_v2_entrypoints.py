@@ -23,7 +23,9 @@ def corpus(tmp_path, monkeypatch):
     (tmp_path / "notice").mkdir()
     (tmp_path / SAMPLE).write_text(SOURCE_TEXT, encoding="utf-8")
     for index in range(4):
-        rows = "\n".join(f"| ①{n}　設備更新委員会の図面{n}が添付されているか。 | |" for n in range(12))
+        rows = "\n".join(
+            f"| ①{n}　設備更新委員会の図面{n}が添付されているか。 | |" for n in range(12)
+        )
         (tmp_path / "notice" / f"checklist-{index}.md").write_text(
             f"## 別紙{index}　設備更新　設備更新委員会チェックリスト\n\n| 確認項目 | 結果 |\n|---|---|\n{rows}\n",
             encoding="utf-8",
@@ -31,7 +33,9 @@ def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_search, "SKILL_SOURCE_DIR", tmp_path)
     monkeypatch.setattr(cli_search, "_chunk_retrieval_enabled", lambda: True)
     monkeypatch.setattr(cli_search, "detect_embed_model", lambda: None)
-    monkeypatch.setattr(cli_search, "RERANK_CONFIG", cli_search.RerankConfig("off", "", 8, 8, 1, False))
+    monkeypatch.setattr(
+        cli_search, "RERANK_CONFIG", cli_search.RerankConfig("off", "", 8, 8, 1, False)
+    )
     monkeypatch.setattr(cli_search, "_evidence_verify_enabled", lambda: False)
     plan_calls = []
 
@@ -68,7 +72,9 @@ def crowded_candidates(tmp_path):
     ]
 
 
-def test_v2_retrieval_carries_the_intent_adds_the_rule_view_and_keeps_the_rule_in_the_frame(corpus, monkeypatch):
+def test_v2_retrieval_carries_the_intent_adds_the_rule_view_and_keeps_the_rule_in_the_frame(
+    corpus, monkeypatch
+):
     tmp_path, plan_calls = corpus
     candidates = crowded_candidates(tmp_path)
     queries_seen = []
@@ -94,12 +100,16 @@ def test_v2_retrieval_carries_the_intent_adds_the_rule_view_and_keeps_the_rule_i
     assert "審査案件及び審査内容" in v2.matches[0]["snippet"]
 
 
-def test_v2_takes_a_wider_pool_before_the_candidate_limit_so_a_low_ranked_rule_survives(corpus, monkeypatch):
+def test_v2_takes_a_wider_pool_before_the_candidate_limit_so_a_low_ranked_rule_survives(
+    corpus, monkeypatch
+):
     # P4実資料: 直接規定は質問viewで31位・根拠規定viewで26位。検索viewごとの上位8件で打ち切る旧経路では、
     # 後段の役割並べ替えでは救えない（並べ替えるのは既に残った候補だけ）。
     tmp_path, _ = corpus
     for index in range(4, 14):
-        rows = "\n".join(f"| ①{n}　設備更新委員会の配線{n}が確認されているか。 | |" for n in range(12))
+        rows = "\n".join(
+            f"| ①{n}　設備更新委員会の配線{n}が確認されているか。 | |" for n in range(12)
+        )
         (tmp_path / "notice" / f"checklist-{index}.md").write_text(
             f"## 別紙{index}　設備更新委員会チェックリスト\n\n| 確認項目 | 結果 |\n|---|---|\n{rows}\n",
             encoding="utf-8",
@@ -133,7 +143,10 @@ def test_v2_takes_a_wider_pool_before_the_candidate_limit_so_a_low_ranked_rule_s
 def test_role_selection_keeps_original_rank_slots_for_candidates_it_cannot_classify():
     intent = ap.extract_explicit_intent(QUERY)
     rules = [
-        {"snippet": f"第{n}条　委員会において審査する内容は、次のとおりとする。", "heading": "（審査案件及び審査内容）"}
+        {
+            "snippet": f"第{n}条　委員会において審査する内容は、次のとおりとする。",
+            "heading": "（審査案件及び審査内容）",
+        }
         for n in range(5)
     ]
     vague = [{"snippet": f"関連する記述{n}。", "heading": ""} for n in range(10)]
@@ -169,24 +182,38 @@ def test_aspect_slots_split_listed_aspects_and_skip_practical_detail_for_an_over
     assert ap.aspect_units("期限・時期") == ["期限", "時期"]
     assert ap.aspect_units("別の会議体の役割との区別") == ["別の会議体の役割との区別"]
     _, rule, checklist = (evidence_match(e) for e in make_evidence())
-    overview = ap.AnswerIntent(target_terms=("設備更新委員会",), predicate_terms=("審査",), required_aspects=("図面",))
+    overview = ap.AnswerIntent(
+        target_terms=("設備更新委員会",), predicate_terms=("審査",), required_aspects=("図面",)
+    )
     practical = ap.AnswerIntent(
-        granularity="practical", target_terms=("設備更新委員会",), predicate_terms=("審査",), required_aspects=("図面",)
+        granularity="practical",
+        target_terms=("設備更新委員会",),
+        predicate_terms=("審査",),
+        required_aspects=("図面",),
     )
     rules = [dict(rule, path=f"r{n}.md") for n in range(3)]
     assert checklist not in cli_search.prioritize_matches_by_role([*rules, checklist], overview)[:3]
-    assert cli_search.prioritize_matches_by_role([*rules, checklist], practical)[:3].count(checklist) == 1
+    assert (
+        cli_search.prioritize_matches_by_role([*rules, checklist], practical)[:3].count(checklist)
+        == 1
+    )
 
 
 def test_policy_is_fixed_per_request_and_an_invalid_value_is_rejected(corpus, monkeypatch):
     monkeypatch.setenv(ap.POLICY_ENV, "v2")
     assert "answer_intent" in cli_search.run_retrieval_pipeline(QUERY, model="m").plan
     # 明示引数は環境より優先される。
-    assert "answer_intent" not in cli_search.run_retrieval_pipeline(QUERY, model="m", answer_policy="legacy").plan
+    assert (
+        "answer_intent"
+        not in cli_search.run_retrieval_pipeline(QUERY, model="m", answer_policy="legacy").plan
+    )
     with pytest.raises(ValueError):
         cli_search.run_retrieval_pipeline(QUERY, model="m", answer_policy="v9")
     # 検索専用は回答方針と無関係で、LLMを呼ばない。
-    assert "answer_intent" not in cli_search.run_retrieval_pipeline(QUERY, model="", mode="search").plan
+    assert (
+        "answer_intent"
+        not in cli_search.run_retrieval_pipeline(QUERY, model="", mode="search").plan
+    )
 
 
 def test_plan_intent_failure_keeps_a_conservative_intent(monkeypatch):
@@ -242,7 +269,9 @@ def simple_draft_for(user):
     blocks = evidence_blocks(user)
     rule = "委員会において審査する内容は、前項の案件について、次のとおりとする。"
     return {
-        "conclusion": claim_for(blocks, "委員会は、費用削減の可否と仕様の妥当性を審査します。", rule),
+        "conclusion": claim_for(
+            blocks, "委員会は、費用削減の可否と仕様の妥当性を審査します。", rule
+        ),
         "sections": [
             {
                 "heading": "審査する内容",
@@ -260,10 +289,17 @@ def test_run_answer_v2_builds_a_checked_answer_from_the_retrieved_evidence(corpu
     model = FakeModel(drafts=[simple_draft_for])
     captured = patch_chat(monkeypatch, model)
     outcome = cli_search.run_answer_v2(
-        SIMPLE_QUERY, v2, model="m", total_seconds=300, cancel_check=lambda: None, touch=lambda: None
+        SIMPLE_QUERY,
+        v2,
+        model="m",
+        total_seconds=300,
+        cancel_check=lambda: None,
+        touch=lambda: None,
     )
     assert outcome.kind == "full" and outcome.quality["state"] == "passed"
-    assert outcome.answer.splitlines()[0].startswith("委員会は、費用削減の可否と仕様の妥当性を審査します。")
+    assert outcome.answer.splitlines()[0].startswith(
+        "委員会は、費用削減の可否と仕様の妥当性を審査します。"
+    )
     assert (model.count("draft"), model.count("g2")) == (1, 1)
     assert callable(captured["cancel_check"]) and callable(captured["touch"])
 
@@ -310,7 +346,10 @@ def test_retrieval_signals_reach_the_draft_prompt_as_notes():
     notes = "\n".join(cli_search.answer_v2_note_lines(retrieval))
     assert "根拠ステータス: partial" in notes
     assert "限定条件の明示的な矛盾" in notes and "部分展開" in notes
-    assert cli_search.answer_v2_note_lines(SimpleNamespace(evidence_status="sufficient", matches=[])) == []
+    assert (
+        cli_search.answer_v2_note_lines(SimpleNamespace(evidence_status="sufficient", matches=[]))
+        == []
+    )
 
 
 # --- Web SSE --------------------------------------------------------------------------
@@ -322,7 +361,9 @@ def run_web(monkeypatch, *, mode="answer", query=QUERY):
     token = web_services.CancellationToken(timeout=300)
     entry = web_services.JobEntry(token)
     subscriber = entry.add_subscriber()
-    web_services.run_search(query, "off", web_services._BroadcastQueue(entry), token, "rid", mode=mode)
+    web_services.run_search(
+        query, "off", web_services._BroadcastQueue(entry), token, "rid", mode=mode
+    )
     events = []
     while not subscriber.empty():
         events.append(subscriber.get_nowait())
@@ -339,7 +380,9 @@ def test_web_answer_v2_emits_one_checked_answer_and_the_quality_on_done(corpus, 
     meta = next(e for e in events if e["type"] == "result_meta")
     assert meta["answerPolicy"] == "v2"
     chunks = [e["text"] for e in events if e["type"] == "chunk"]
-    assert len(chunks) == 1 and chunks[0].splitlines()[0].startswith("委員会は、費用削減の可否と仕様の妥当性を審査します。")
+    assert len(chunks) == 1 and chunks[0].splitlines()[0].startswith(
+        "委員会は、費用削減の可否と仕様の妥当性を審査します。"
+    )
     done = events[-1]
     assert done["answerQuality"]["state"] == "passed"
     assert done["answerQuality"]["label"] == "検査済み"
@@ -370,20 +413,33 @@ def test_web_invalid_policy_is_a_fixed_error_before_any_work(monkeypatch):
 
 def deep_result(state, quality):
     return deep_research.DeepResearchResult(
-        status="partial", stop_reason="scope_processed", answer="回答", answer_state=state,
+        status="partial",
+        stop_reason="scope_processed",
+        answer="回答",
+        answer_state=state,
         answer_quality=quality,
     )
 
 
 def test_deep_event_never_calls_an_unchecked_answer_verified():
     legacy = web_services.build_deep_evidence_event(deep_result("generated", {}))
-    assert legacy["answerStateMessage"] == "回答生成済み（原文照合を通過）" and "answerQuality" not in legacy
-    review = ap.build_quality({gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS}, kind="full", removed_claims=1)
+    assert (
+        legacy["answerStateMessage"] == "回答生成済み（原文照合を通過）"
+        and "answerQuality" not in legacy
+    )
+    review = ap.build_quality(
+        {gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS}, kind="full", removed_claims=1
+    )
     event = web_services.build_deep_evidence_event(deep_result("generated", review))
     assert event["answerQuality"]["state"] == "needs_review"
-    assert "要確認" in event["answerStateMessage"] and "原文照合を通過" not in event["answerStateMessage"]
+    assert (
+        "要確認" in event["answerStateMessage"]
+        and "原文照合を通過" not in event["answerStateMessage"]
+    )
     passed = ap.build_quality({gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS}, kind="full")
-    message = web_services.build_deep_evidence_event(deep_result("generated", passed))["answerStateMessage"]
+    message = web_services.build_deep_evidence_event(deep_result("generated", passed))[
+        "answerStateMessage"
+    ]
     assert "保証ではありません" in message
     failed = web_services.build_deep_evidence_event(
         deep_result("verification_failed", ap.build_quality({}, kind="fallback"))
@@ -394,7 +450,10 @@ def test_deep_event_never_calls_an_unchecked_answer_verified():
 def test_web_deep_done_event_carries_the_quality(monkeypatch):
     quality = ap.build_quality({gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS}, kind="full")
     result = deep_research.DeepResearchResult(
-        status="completed", stop_reason="scope_processed", answer="回答", answer_state="generated",
+        status="completed",
+        stop_reason="scope_processed",
+        answer="回答",
+        answer_state="generated",
         answer_quality=quality,
     )
     seen = {}
@@ -417,15 +476,25 @@ def test_web_deep_done_event_carries_the_quality(monkeypatch):
 
 def patch_cli(monkeypatch, outcome, *, platform=None):
     retrieval = SimpleNamespace(
-        attempts=[], matches=[], evidence_status="sufficient", confidence=0.5, plan={},
-        user_prompt="", verification_status="skipped", retrieval_status="sufficient",
+        attempts=[],
+        matches=[],
+        evidence_status="sufficient",
+        confidence=0.5,
+        plan={},
+        user_prompt="",
+        verification_status="skipped",
+        retrieval_status="sufficient",
     )
     captured = {}
     if platform:
         monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(cli_search, "_is_model_available", lambda *a: cli_search.ModelStatus.AVAILABLE)
+    monkeypatch.setattr(
+        cli_search, "_is_model_available", lambda *a: cli_search.ModelStatus.AVAILABLE
+    )
     monkeypatch.setattr(cli_search, "detect_embed_model", lambda: None)
-    monkeypatch.setattr(cli_search, "run_retrieval_pipeline", lambda *a, **k: captured.update(k) or retrieval)
+    monkeypatch.setattr(
+        cli_search, "run_retrieval_pipeline", lambda *a, **k: captured.update(k) or retrieval
+    )
 
     def fake_v2(query, retrieved, **kwargs):
         captured["v2"] = kwargs
@@ -436,7 +505,11 @@ def patch_cli(monkeypatch, outcome, *, platform=None):
 
 
 def review_outcome():
-    quality = ap.build_quality({gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS}, kind="partial", unconfirmed_aspects=["観点A"])
+    quality = ap.build_quality(
+        {gid: ap.GateResult(ap.PASSED) for gid in ap.GATE_IDS},
+        kind="partial",
+        unconfirmed_aspects=["観点A"],
+    )
     return apipe.PipelineResult("検査済みの本文。[E1]", "partial", quality, {}, ["E1"])
 
 
@@ -487,7 +560,9 @@ def test_source_reader_rejects_changed_and_out_of_root_files(tmp_path):
 # --- 中止・期限（v2でも既存の終端契約を保つ） -------------------------------------------
 
 
-def test_web_cancel_during_the_semantic_check_ends_with_cancelled_and_no_answer(corpus, monkeypatch):
+def test_web_cancel_during_the_semantic_check_ends_with_cancelled_and_no_answer(
+    corpus, monkeypatch
+):
     monkeypatch.setenv(ap.POLICY_ENV, "v2")
     monkeypatch.setattr(web_services, "_search_available", True)
     monkeypatch.setattr(web_services, "detect_model", lambda: "fake-model")
@@ -530,4 +605,6 @@ def test_a_deadline_during_v2_generation_is_not_swallowed_as_a_failed_call():
     env.check = check
     env.is_control_error = lambda exc: isinstance(exc, Expired)
     with pytest.raises(Expired):
-        pipeline_module.run_answer_pipeline(QUERY, ap.extract_explicit_intent(QUERY), make_evidence(), env)
+        pipeline_module.run_answer_pipeline(
+            QUERY, ap.extract_explicit_intent(QUERY), make_evidence(), env
+        )

@@ -1,14 +1,24 @@
 """Unaligned claims must not silently pass checks on limited evidence."""
+
 import deep_research as deep
 from test_deep_remediation import backend, research
 
 
 def evidence():
-    return [{"evidence_id": "E1", "path": "test.md", "excerpt": "| 条件 | 記録を五年間保存する。 |", "context": [{"path": "test.md", "text": "## 試験設備専用"}]}]
+    return [
+        {
+            "evidence_id": "E1",
+            "path": "test.md",
+            "excerpt": "| 条件 | 記録を五年間保存する。 |",
+            "context": [{"path": "test.md", "text": "## 試験設備専用"}],
+        }
+    ]
 
 
 def test_unmatched_claim_is_reported_and_rewrite_requests_source():
-    candidate, issues = deep._check_final_candidate("検査を行う。[E1]", evidence(), {"attempts": []})
+    candidate, issues = deep._check_final_candidate(
+        "検査を行う。[E1]", evidence(), {"attempts": []}
+    )
     assert issues["unmatched_limited_lines"] == [1]
     assert "原文" in deep._final_retry_prompt("prompt", candidate, issues)
 
@@ -34,9 +44,11 @@ def test_repeated_unmatched_answer_cannot_pass_model_only_verification(tmp_path,
 def test_rewrite_to_scoped_source_is_accepted(tmp_path, monkeypatch):
     backend(monkeypatch)
     calls = []
+
     def answer(*args, **kwargs):
         calls.append(args)
         return "検査を行う。[E1]" if len(calls) == 1 else "試験設備専用：記録を五年間保存する。[E1]"
+
     monkeypatch.setattr(deep, "_call_ollama_text", answer)
     result = research(tmp_path, "## 試験設備専用\n| 条件 | 記録を五年間保存する。 |")
     assert len(calls) == 2

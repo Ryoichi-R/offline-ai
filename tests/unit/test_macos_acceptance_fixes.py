@@ -70,8 +70,7 @@ def test_parent_conditions_are_not_discarded_when_relevance_is_disputed(
     assert result.stop_reason == reason
     assert any(reason in text for text in result.unconfirmed)
     assert any(
-        "特定の対象を除く。" in e["excerpt"]
-        and e["verification_status"] == "raw_unverified"
+        "特定の対象を除く。" in e["excerpt"] and e["verification_status"] == "raw_unverified"
         for e in result.evidence
     )
     assert result.diagnostics["irrelevant_ranges"] == []
@@ -97,16 +96,12 @@ def test_negative_extraction_support_has_semantic_reason_code(tmp_path, monkeypa
     )
     result = research(tmp_path)
     assert any(row["reason"] == "extraction_unsupported" for row in result.ledger)
-    assert not any(
-        e["verification_status"] == "semantic_checked" for e in result.evidence
-    )
+    assert not any(e["verification_status"] == "semantic_checked" for e in result.evidence)
     assert result.status != "completed"
 
 
 @pytest.mark.parametrize("model", ["qwen3.5:122b", "gpt-oss:120b"])
-def test_large_model_planning_can_take_134_seconds_inside_bounded_retrieval(
-    monkeypatch, model
-):
+def test_large_model_planning_can_take_134_seconds_inside_bounded_retrieval(monkeypatch, model):
     clock = [0.0]
     monkeypatch.setattr(web.time, "monotonic", lambda: clock[0])
     observed = {}
@@ -141,9 +136,7 @@ def test_large_model_planning_can_take_134_seconds_inside_bounded_retrieval(
 
 
 @pytest.mark.parametrize("model,budget", [("qwen3.5:122b", 270), ("legacy", 120)])
-def test_call_and_retrieval_share_deadline_without_extending_request(
-    monkeypatch, model, budget
-):
+def test_call_and_retrieval_share_deadline_without_extending_request(monkeypatch, model, budget):
     clock = [0.0]
     monkeypatch.setattr(web.time, "monotonic", lambda: clock[0])
 
@@ -169,18 +162,14 @@ def test_call_and_retrieval_share_deadline_without_extending_request(
     assert not any(e["type"] == "done" for e in events)
 
 
-def test_bodyless_container_expands_children_and_preserves_scope_heading(
-    tmp_path, monkeypatch
-):
+def test_bodyless_container_expands_children_and_preserves_scope_heading(tmp_path, monkeypatch):
     backend(monkeypatch)
     original = deep._call_ollama_json
     section_prompts = []
 
     def model(name, system, user, **kwargs):
         if system == deep.DEEP_RELEVANCE_SYSTEM:
-            pytest.fail(
-                "container heading must be context, not independently discarded"
-            )
+            pytest.fail("container heading must be context, not independently discarded")
         if system == deep.DEEP_SECTION_SYSTEM:
             section_prompts.append(user)
         return original(name, system, user, **kwargs)
@@ -188,9 +177,7 @@ def test_bodyless_container_expands_children_and_preserves_scope_heading(
     monkeypatch.setattr(deep, "_call_ollama_json", model)
     text = "# 未成年者を除く\n\n## 条件\n対象である。\n## 例外\n特別な場合は対象外である。\n"
     result = research(tmp_path, text)
-    assert section_prompts and all(
-        "未成年者を除く" in prompt for prompt in section_prompts
-    )
+    assert section_prompts and all("未成年者を除く" in prompt for prompt in section_prompts)
     assert {e["start_line"] for e in result.evidence} == {3, 5}
     assert all(
         e["context"]

@@ -52,10 +52,10 @@ def test_bundle_preserves_review_material_without_receipt_text(sample):
     assert receipt["acceptanceEligible"] is False
     assert receipt["sourceVerification"] == "MATCH"
     assert "SENTINEL" not in json.dumps(receipt)
-    assert "SENTINEL_ANSWER" in (output / "answer.md").read_text()
-    assert "SENTINEL_SOURCE" in (output / "review.md").read_text()
-    assert "SENTINEL_NOTE" in (output / "review.md").read_text()
-    assert "raw_unverified" in (output / "review.md").read_text()
+    assert "SENTINEL_ANSWER" in (output / "answer.md").read_text(encoding="utf-8")
+    assert "SENTINEL_SOURCE" in (output / "review.md").read_text(encoding="utf-8")
+    assert "SENTINEL_NOTE" in (output / "review.md").read_text(encoding="utf-8")
+    assert "raw_unverified" in (output / "review.md").read_text(encoding="utf-8")
     assert (source / "a.md").read_bytes() == before
     assert (
         receipt["answerMarkdownSha256"]
@@ -85,9 +85,14 @@ def test_bad_source_reference_never_gets_a_completed_bundle(sample, field, value
 
 def test_symlink_cannot_read_outside_source(sample, tmp_path):
     outside = tmp_path / "outside.md"
-    outside.write_text("原文限定 SENTINEL_SOURCE")
+    outside.write_text("原文限定 SENTINEL_SOURCE", encoding="utf-8")
     link = sample[0] / "link.md"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows runner cannot create symbolic links")
+        raise
     sample[2]["evidence"][0]["path"] = "link.md"
     with pytest.raises(ValueError, match="escaped"):
         export(sample)
@@ -123,11 +128,9 @@ def test_duplicate_ids_are_rejected_before_writing(sample):
 
 def test_context_is_verified_and_exported(sample):
     row = sample[2]["evidence"][0]
-    row["context"] = [
-        {"path": "a.md", "start_line": 1, "end_line": 1, "text": "# 条件"}
-    ]
+    row["context"] = [{"path": "a.md", "start_line": 1, "end_line": 1, "text": "# 条件"}]
     export(sample)
-    assert "補助文脈 L1-1" in (sample[1] / "review.md").read_text()
+    assert "補助文脈 L1-1" in (sample[1] / "review.md").read_text(encoding="utf-8")
     row["context"][0]["text"] = "forged parent condition"
     with pytest.raises(ValueError, match="mismatch"):
         export((sample[0], sample[1].with_name("other"), sample[2]))
@@ -154,7 +157,15 @@ def axes(a=2, b=2, c=2, d=2):
 
 
 def test_axis_scores_reject_wrong_keys_bools_and_out_of_range():
-    for bad in (None, {}, {**axes(), "speed": 2}, axes(a=3), axes(a=True), axes(a=1.0), axes(a="2")):
+    for bad in (
+        None,
+        {},
+        {**axes(), "speed": 2},
+        axes(a=3),
+        axes(a=True),
+        axes(a=1.0),
+        axes(a="2"),
+    ):
         with pytest.raises(ValueError):
             _review.validate_axis_scores(bad)
     assert _review.validate_axis_scores(axes()) == axes()
@@ -181,20 +192,42 @@ def test_review_bundle_records_quality_states_and_leaves_axes_unscored(tmp_path)
 
     sha = _hashlib.sha256((source / "a.md").read_bytes()).hexdigest()
     result = {
-        "status": "partial", "stop_reason": "scope_processed", "answer_state": "generated",
-        "answer": "回答。[E1]", "unconfirmed": [],
-        "evidence": [{"evidence_id": "E1", "path": "a.md", "source_sha256": sha, "start_line": 1, "end_line": 2,
-                      "excerpt": "原文の一行目\n原文の二行目", "verification_status": "semantic_checked"}],
+        "status": "partial",
+        "stop_reason": "scope_processed",
+        "answer_state": "generated",
+        "answer": "回答。[E1]",
+        "unconfirmed": [],
+        "evidence": [
+            {
+                "evidence_id": "E1",
+                "path": "a.md",
+                "source_sha256": sha,
+                "start_line": 1,
+                "end_line": 2,
+                "excerpt": "原文の一行目\n原文の二行目",
+                "verification_status": "semantic_checked",
+            }
+        ],
         "answer_quality": {
-            "state": "needs_review", "removedClaims": 1, "unconfirmedAspects": ["観点A"],
-            "gates": {g: {"status": "passed"} for g in ("G1", "G2", "G3")} | {"G4": {"status": "not_run"}},
+            "state": "needs_review",
+            "removedClaims": 1,
+            "unconfirmedAspects": ["観点A"],
+            "gates": {g: {"status": "passed"} for g in ("G1", "G2", "G3")}
+            | {"G4": {"status": "not_run"}},
         },
     }
     receipt = _review.export_review_bundle(
-        query="質問", result=result, source_root=source, destination=tmp_path / "out", model_digest="a" * 64
+        query="質問",
+        result=result,
+        source_root=source,
+        destination=tmp_path / "out",
+        model_digest="a" * 64,
     )
     assert receipt["qualityAxes"] == "NOT_SCORED" and receipt["acceptanceEligible"] is False
-    assert receipt["answerQuality"] == {"state": "needs_review", "gates": {"G1": "passed", "G2": "passed", "G3": "passed", "G4": "not_run"}}
+    assert receipt["answerQuality"] == {
+        "state": "needs_review",
+        "gates": {"G1": "passed", "G2": "passed", "G3": "passed", "G4": "not_run"},
+    }
     review = (tmp_path / "out" / "review.md").read_text(encoding="utf-8")
     assert "自動品質検査（暫定" in review and "| 意味支持 | 未採点 | 未確認 |" in review
     # 回答本文は受領票へ入れない。

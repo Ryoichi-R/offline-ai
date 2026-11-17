@@ -30,12 +30,23 @@ def role_of(chunk):
 
 
 def ranked_from(chunks):
-    return [{**c, "source_sha256": c["file_sha256"], "score": 1.0 / (i + 1)} for i, c in enumerate(chunks)]
+    return [
+        {**c, "source_sha256": c["file_sha256"], "score": 1.0 / (i + 1)}
+        for i, c in enumerate(chunks)
+    ]
 
 
 def tables_then_rule(count=30, rule_rank=None):
     """チェック表が上位を占め、直接規定が下位にある検索結果。"""
-    tables = [chunk(i, path=f"checklist-{i % 6}.md", heading="別紙　設備更新委員会チェックリスト", text=TABLE) for i in range(count)]
+    tables = [
+        chunk(
+            i,
+            path=f"checklist-{i % 6}.md",
+            heading="別紙　設備更新委員会チェックリスト",
+            text=TABLE,
+        )
+        for i in range(count)
+    ]
     rule = chunk(900, path="rule.md", heading="（審査案件及び審査内容）", text=RULE)
     position = len(tables) if rule_rank is None else rule_rank
     return [*tables[:position], rule, *tables[position:]]
@@ -45,7 +56,9 @@ def test_legacy_selection_is_unchanged_without_a_role_function():
     chunks = tables_then_rule(count=60)
     legacy = selection.select_candidates(ranked_from(chunks), source_chunks=chunks)
     assert legacy["counts"] == {"ranked": 61, "selected": 40, "excluded": 21}
-    assert all(ref["path"] != "rule.md" for ref in legacy["selected"])  # 下位の直接規定は旧順位では落ちる
+    assert all(
+        ref["path"] != "rule.md" for ref in legacy["selected"]
+    )  # 下位の直接規定は旧順位では落ちる
     assert "role_selected" not in legacy["counts"]
 
 
@@ -72,8 +85,14 @@ def test_selected_candidates_stay_in_rank_order_and_limits_hold():
 
 
 def test_the_priority_share_does_not_starve_the_original_rank_path():
-    rules = [chunk(i, path=f"rule-{i}.md", heading="（審査案件及び審査内容）", text=RULE) for i in range(40)]
-    tables = [chunk(100 + i, path=f"checklist-{i}.md", heading="別紙チェックリスト", text=TABLE) for i in range(40)]
+    rules = [
+        chunk(i, path=f"rule-{i}.md", heading="（審査案件及び審査内容）", text=RULE)
+        for i in range(40)
+    ]
+    tables = [
+        chunk(100 + i, path=f"checklist-{i}.md", heading="別紙チェックリスト", text=TABLE)
+        for i in range(40)
+    ]
     chunks = [*tables[:10], *rules, *tables[10:]]
     result = selection.select_candidates(ranked_from(chunks), source_chunks=chunks, role_of=role_of)
     selected = [ref["path"] for ref in result["selected"]]
@@ -117,15 +136,28 @@ def test_excluded_references_still_account_for_every_candidate():
     assert sum(counts["role_excluded"].values()) == counts["excluded"]
 
 
-def test_worker_payload_intent_is_validated_and_the_real_worker_reports_roles(tmp_path, monkeypatch):
+def test_worker_payload_intent_is_validated_and_the_real_worker_reports_roles(
+    tmp_path, monkeypatch
+):
     import search
 
-    text = "# 制度\n\n### （審査案件及び審査内容）\n\n" + RULE + "\n\n## 別紙　チェックリスト\n\n" + TABLE + "\n"
+    text = (
+        "# 制度\n\n### （審査案件及び審査内容）\n\n"
+        + RULE
+        + "\n\n## 別紙　チェックリスト\n\n"
+        + TABLE
+        + "\n"
+    )
     source = tmp_path / "sample.md"
     source.write_text(text, encoding="utf-8")
     chunks = search._chunk_source_bytes(text.encode("utf-8"), source, "sample.md")
     monkeypatch.setenv("OFFLINE_AI_EMBED_MODEL", "")
-    payload = {"operation": "retrieve", "query": QUERY, "chunks": chunks, "isolated_embedding": {"model": None, "cache_path": None, "cache_sha256": None}}
+    payload = {
+        "operation": "retrieve",
+        "query": QUERY,
+        "chunks": chunks,
+        "isolated_embedding": {"model": None, "cache_path": None, "cache_sha256": None},
+    }
     legacy = deep_transport._execute(dict(payload))
     assert "role_selected" not in legacy["counts"]
     with_intent = deep_transport._execute({**payload, "intent": INTENT.to_dict()})

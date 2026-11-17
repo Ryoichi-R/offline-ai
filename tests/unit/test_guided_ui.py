@@ -121,8 +121,17 @@ def _run(scenario):
         pytest.skip("Node.js is required for dynamic UI contract tests")
     result = subprocess.run(
         [node, "-e", _JS],
-        input=json.dumps({"html": INDEX_HTML.read_text(encoding="utf-8").replace("\r\n", "\n"), "scenario": scenario}),
-        capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+        input=json.dumps(
+            {
+                "html": INDEX_HTML.read_text(encoding="utf-8").replace("\r\n", "\n"),
+                "scenario": scenario,
+            }
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])

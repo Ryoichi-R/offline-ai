@@ -45,13 +45,8 @@ def load_runtime_config(path):
         "ollama_version": data.get("ollamaVersion"),
         "minimum_free_bytes": data.get("minimumFreeBytes"),
     }
-    string_values = {
-        key: value for key, value in required.items() if key != "minimum_free_bytes"
-    }
-    if any(
-        not isinstance(value, str) or not value.strip()
-        for value in string_values.values()
-    ):
+    string_values = {key: value for key, value in required.items() if key != "minimum_free_bytes"}
+    if any(not isinstance(value, str) or not value.strip() for value in string_values.values()):
         raise ValueError("Mac runtime configに必須項目がありません")
     minimum_free = required["minimum_free_bytes"]
     if type(minimum_free) is not int or minimum_free < 1:
@@ -67,20 +62,14 @@ def validate_mount_identity(models_directory, expected_uuid, info):
         raise ValueError("model directory is not a directory")
     mount_value = info.get("MountPoint")
     actual_uuid = str(info.get("VolumeUUID", "")).strip().upper()
-    filesystem = (
-        str(info.get("FilesystemName") or info.get("FilesystemType") or "")
-        .strip()
-        .lower()
-    )
+    filesystem = str(info.get("FilesystemName") or info.get("FilesystemType") or "").strip().lower()
     if not mount_value or not actual_uuid:
         raise ValueError("diskutil did not return mounted volume identity")
     mount = Path(mount_value).resolve(strict=True)
     try:
         relative = models.relative_to(mount)
     except ValueError as exc:
-        raise ValueError(
-            "model directory is not inside the requested mounted volume"
-        ) from exc
+        raise ValueError("model directory is not inside the requested mounted volume") from exc
     if not relative.parts:
         raise ValueError("model directory must be below the volume mount point")
     if actual_uuid != str(expected_uuid).strip().upper():
@@ -93,9 +82,7 @@ def validate_mount_identity(models_directory, expected_uuid, info):
 
 
 def validate_free_space(models_directory, minimum_free_bytes, *, free_bytes=None):
-    available = (
-        shutil.disk_usage(models_directory).free if free_bytes is None else free_bytes
-    )
+    available = shutil.disk_usage(models_directory).free if free_bytes is None else free_bytes
     if type(minimum_free_bytes) is not int or minimum_free_bytes < 1:
         raise ValueError("minimum free space must be a positive integer")
     if type(available) is not int or available < minimum_free_bytes:
@@ -125,16 +112,12 @@ def validate_storage(models_directory, expected_uuid, minimum_free_bytes):
         )
         info = plistlib.loads(completed.stdout)
     except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as exc:
-        raise ValueError(
-            "model volume identity could not be verified with diskutil"
-        ) from exc
+        raise ValueError("model volume identity could not be verified with diskutil") from exc
     resolved, _ = validate_mount_identity(models, expected_uuid, info)
     validate_free_space(resolved, minimum_free_bytes)
     probe_path = None
     try:
-        fd, probe_path = tempfile.mkstemp(
-            prefix=".offline-ai-write-check-", dir=str(resolved)
-        )
+        fd, probe_path = tempfile.mkstemp(prefix=".offline-ai-write-check-", dir=str(resolved))
         os.write(fd, b"offline-ai storage probe")
         os.fsync(fd)
         os.close(fd)
@@ -206,10 +189,7 @@ def owner_record_matches(
     if record.get("processStart") != process_start or not process_start:
         return False
     command = str(process_command or "")
-    return (
-        expected_binary in command
-        and re.search(r"(?:^|\s)serve(?:\s|$)", command) is not None
-    )
+    return expected_binary in command and re.search(r"(?:^|\s)serve(?:\s|$)", command) is not None
 
 
 def _read_owner():
@@ -269,9 +249,7 @@ def _write_owner(args):
             old_command,
         ):
             raise ValueError("a different owned Ollama process is already recorded")
-    fd, temporary = tempfile.mkstemp(
-        prefix="ollama-owner-", suffix=".tmp", dir=str(path.parent)
-    )
+    fd, temporary = tempfile.mkstemp(prefix="ollama-owner-", suffix=".tmp", dir=str(path.parent))
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -361,9 +339,7 @@ def main(argv=None):
         if args.command == "config-value":
             print(load_runtime_config(args.path)[args.key])
         elif args.command == "validate-storage":
-            validate_storage(
-                args.models_directory, args.volume_uuid, args.minimum_free_bytes
-            )
+            validate_storage(args.models_directory, args.volume_uuid, args.minimum_free_bytes)
         elif args.command == "resolve-model":
             sys.path.insert(0, str(REPO_ROOT / "_internal"))
             from model_config import resolve_model_selection

@@ -98,7 +98,7 @@ Embedding生成はOllamaの`/api/embed`配列入力を使い、件数・順序�
 | `OFFLINE_AI_GENERATION_STALL_TIMEOUT` | `60`（秒）  | 回答生成中にOllamaから何のバイトも届かない時間の上限。thinkingデルタも受信として数える。超過時はWeb UIに「モデルからの応答が途絶えました」と表示される                                                                     |
 | `OFFLINE_AI_KEEP_ALIVE`               | `30m`       | chat/embed両モデルをOllama側に保持する時間。`gpt-oss:20b`は初回cold検索でモデルロード約32秒、検索evidence到達約80秒の実測があるため、クエリ間隔が空いても再ロードを避ける。`0`にすると応答直後に従来どおりアンロードされる |
 | `OFFLINE_AI_EMBED_CACHE_MEMO`         | `1`（有効） | `embed_cache.json`をmtime/size一致時に再読込しないメモ化。`0`にすると毎回読み直す（トラブルシュート用の退避路）                                                                                                            |
-| `OFFLINE_AI_SOURCE_CHUNK_MEMO`        | `1`（有効） | `/api/index/status`が毎回行うskill-source走査（chunk化とgeneration算出）を、相対path・更新時刻・サイズ・実SHA-256集合の一致時に省略するメモ化。同サイズ・同mtimeの変更も見逃さない。`0`で無効化 |
+| `OFFLINE_AI_SOURCE_CHUNK_MEMO`        | `1`（有効） | `/api/index/status`が毎回行うskill-source走査（chunk化とgeneration算出）を、相対path・更新時刻・サイズ・実SHA-256集合の一致時に省略するメモ化。同サイズ・同mtimeの変更も見逃さない。`0`で無効化                            |
 
 資料の更新を見逃さないため、検索要求ごとにskill-sourceの全ファイルを読み、実SHA-256と更新時刻・サイズで資料世代を確認します（同サイズ・同mtimeの変更も検出）。E版と同規模（479ファイル・約17.9MB）の合成資料で測った目安は、全ファイルのhash走査が中央値約57ms、chunk再構築が約294ms、keyword経路の検索専用処理全体が約413msです（2026-09-14、実資料・実モデルは未使用）。作成直後のファイルでは初回だけ数秒かかる場合がありました（ウイルス対策の走査等によると推測、原因は未確認）。資料規模が大きい環境ではこの分が検索時間に加わります。
 
@@ -111,13 +111,13 @@ Embedding生成はOllamaの`/api/embed`配列入力を使い、件数・順序�
 - 直接ヒットした根拠と展開した根拠は件数枠を分け合います。直接ヒットが多い質問でも、展開した根拠が上限で黙って落ちないよう、展開元ごとに先に1枠を確保します。
 - 検索計画の必須語（`must_find_terms`）を持たない経路（「資料を探す」など）では、展開した根拠だけを理由に根拠ステータスを`sufficient`にしません。
 
-| 変数 | 既定値 | 用途 |
-| --- | --- | --- |
-| `OFFLINE_AI_PARENT_CHILD_EXPANSION` | `true` | 親子展開の有効化。`false`で無効（起動し直すと反映） |
-| `OFFLINE_AI_EXPANSION_MAX_PARENTS` | `2` | 1質問あたりの展開元の最大数 |
-| `OFFLINE_AI_EXPANSION_MAX_RANGES_PER_PARENT` | `4` | 1展開元あたりに採用する子見出しの最大数 |
-| `OFFLINE_AI_EXPANSION_MAX_TOTAL_RANGES` | `4` | 1質問あたりの展開範囲の合計上限 |
-| `OFFLINE_AI_EXPANSION_BUDGET_RATIO` | `0.5` | 根拠の文字数上限のうち展開本文に使える割合 |
+| 変数                                         | 既定値 | 用途                                                |
+| -------------------------------------------- | ------ | --------------------------------------------------- |
+| `OFFLINE_AI_PARENT_CHILD_EXPANSION`          | `true` | 親子展開の有効化。`false`で無効（起動し直すと反映） |
+| `OFFLINE_AI_EXPANSION_MAX_PARENTS`           | `2`    | 1質問あたりの展開元の最大数                         |
+| `OFFLINE_AI_EXPANSION_MAX_RANGES_PER_PARENT` | `4`    | 1展開元あたりに採用する子見出しの最大数             |
+| `OFFLINE_AI_EXPANSION_MAX_TOTAL_RANGES`      | `4`    | 1質問あたりの展開範囲の合計上限                     |
+| `OFFLINE_AI_EXPANSION_BUDGET_RATIO`          | `0.5`  | 根拠の文字数上限のうち展開本文に使える割合          |
 
 ### prompt予算とcontextウィンドウ（推論あり運用）
 
@@ -155,7 +155,6 @@ prompt・thinking・回答本文は同じcontextウィンドウ（`OLLAMA_NUM_CT
 - **時間**: 通常回答は検索後に「草稿生成（最大2回）→意味照合（最大2batch/案）→必要時のみ評価1回」を行い、全体上限（Webの検索タイムアウト、CLIは品質処理用に既定300秒）の内側で止まります。検査を実施できなかった部分は「未実施」とし、合格にはしません。上限は検査1回あたり通常20秒・deep60秒で、大型モデルで回し切れるかは実測で確認する前提です。
 - **通常回答の表示**: v2の通常回答は検査が済んでから回答を一度に表示します（途中の未検査本文をストリーミングしません）。
 - **戻し方**: 環境変数を外すか`legacy`にします。索引・資料・モデル設定は変更されません。
-
 
 ## 確認案内と追質問（実験中、既定は無効）
 

@@ -39,14 +39,10 @@ def test_numeric_typography_is_not_missing_information():
         ("料金は2,500円または3,000円。a/b.md\n派遣職員については該当情報なし。", False),
     ],
 )
-def test_scoped_abstention_keeps_facts_and_forbidden_fact_gate(
-    monkeypatch, answer, expected
-):
+def test_scoped_abstention_keeps_facts_and_forbidden_fact_gate(monkeypatch, answer, expected):
     question = replace(_answerable_question(), allow_scoped_abstention=True)
     monkeypatch.setattr(harness.search, "stream_ollama_chat", lambda *a, **k: answer)
-    result = harness.measure_answer_quality_probe(
-        question, _outcome([]), chat_model="fake"
-    )
+    result = harness.measure_answer_quality_probe(question, _outcome([]), chat_model="fake")
     assert result["passed"] is expected
 
 
@@ -71,9 +67,7 @@ def test_alias_and_scope_options_round_trip():
     assert question.allow_scoped_abstention
 
 
-def test_complete_irrelevant_scope_can_abstain_without_fabricated_answer(
-    tmp_path, monkeypatch
-):
+def test_complete_irrelevant_scope_can_abstain_without_fabricated_answer(tmp_path, monkeypatch):
     from test_macos_acceptance_fixes import _independent_backend
     from test_deep_remediation import research
 
@@ -87,13 +81,8 @@ def test_complete_irrelevant_scope_can_abstain_without_fabricated_answer(
 
     event = web_services.build_deep_evidence_event(result)
     assert event["answerState"] == "not_generated"
-    assert (
-        event["answerStateMessage"]
-        == "資料の確認を完了しましたが、質問に答える根拠はありません"
-    )
-    assert (
-        result.diagnostics["final_answer"]["result"] == "abstained_no_relevant_evidence"
-    )
+    assert event["answerStateMessage"] == "資料の確認を完了しましたが、質問に答える根拠はありません"
+    assert result.diagnostics["final_answer"]["result"] == "abstained_no_relevant_evidence"
 
 
 def test_unread_long_line_slice_cannot_be_declared_fully_reviewed():
@@ -134,10 +123,7 @@ def test_changed_irrelevant_source_cannot_complete(tmp_path, monkeypatch):
     result = research(tmp_path, "# 資料\n沿革の説明のみ。\n")
     assert result.status == "failed"
     assert result.stop_reason == "source_changed"
-    assert (
-        result.diagnostics["final_answer"].get("result")
-        != "abstained_no_relevant_evidence"
-    )
+    assert result.diagnostics["final_answer"].get("result") != "abstained_no_relevant_evidence"
 
 
 @pytest.mark.parametrize(
@@ -152,7 +138,7 @@ def test_split_cited_evidence_requires_complete_validated_union(gap, uncited, ex
     spec["items"] = spec["items"][:1]
     result = _result()
     original = result["evidence"][0]
-    lines = (SPEC.parent / "corpus" / original["path"]).read_text().splitlines()
+    lines = (SPEC.parent / "corpus" / original["path"]).read_text(encoding="utf-8").splitlines()
     first = dict(original, end_line=5, excerpt=lines[4])
     second_start = 7 if gap else 6
     second = dict(
@@ -180,8 +166,5 @@ def test_required_second_document_cannot_be_replaced_by_first_document():
         ]
     }
     assert (
-        evaluator._matching_evidence(
-            item, [{"path": "a.md", "start_line": 1, "end_line": 2}]
-        )
-        == []
+        evaluator._matching_evidence(item, [{"path": "a.md", "start_line": 1, "end_line": 2}]) == []
     )

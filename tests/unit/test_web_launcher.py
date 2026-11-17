@@ -50,9 +50,7 @@ def test_failure_notification(launcher, monkeypatch, error, expected):
     assert len(notices) == expected
 
 
-@pytest.mark.parametrize(
-    "running, missing", [(True, False), (False, False), (False, True)]
-)
+@pytest.mark.parametrize("running, missing", [(True, False), (False, False), (False, True)])
 def test_detached_ollama_start(monkeypatch, running, missing):
     from contextlib import nullcontext
 
@@ -74,9 +72,7 @@ def test_detached_ollama_start(monkeypatch, running, missing):
 
     monkeypatch.setattr(module.urllib.request, "urlopen", probe)
     monkeypatch.setattr(module.subprocess, "Popen", spawn)
-    monkeypatch.setattr(
-        module.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False
-    )
+    monkeypatch.setattr(module.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
     module.ensure_ollama()
     assert len(calls) == (0 if running else 1)
     if calls:

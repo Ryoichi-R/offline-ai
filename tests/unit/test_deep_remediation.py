@@ -31,9 +31,7 @@ def backend(monkeypatch, *, extract=None, answer="対象である。[E1]", verdi
         kwargs["cancel_check"]()
         calls.append(query)
         ranked = [{**c, "source_sha256": c["file_sha256"]} for c in chunks]
-        return deep_candidate_selection.select_candidates(
-            ranked, source_chunks=chunks
-        )
+        return deep_candidate_selection.select_candidates(ranked, source_chunks=chunks)
 
     def model(name, system, user, **kwargs):
         if system == deep.DEEP_RELEVANCE_SYSTEM:
@@ -77,6 +75,7 @@ def test_long_line_survives_pipeline_and_metadata_budget(tmp_path, monkeypatch):
 
 def test_parent_scope_preserved_separately(tmp_path, monkeypatch):
     backend(monkeypatch)
+
     def retrieve_parent(q, chunks, **kwargs):
         candidate = dict(chunks[0])
         candidate["start_line"] = 4
@@ -498,16 +497,24 @@ def test_answer_state_is_not_generated_when_final_model_call_fails(tmp_path, mon
 
 
 def _two_section_source(tmp_path):
-    (tmp_path / "source.md").write_text("# A\n対象である。\n# B\n対象でもある。\n", encoding="utf-8")
+    (tmp_path / "source.md").write_text(
+        "# A\n対象である。\n# B\n対象でもある。\n", encoding="utf-8"
+    )
     return deep.run_deep_research("対象", model="fake", source_root=tmp_path, timeout_seconds=300)
 
 
 @pytest.mark.parametrize(
     "call_error",
-    [TimeoutError("deep worker deadline"), deep_transport.DeepWorkerError(code="timeout"), deep_transport.DeepWorkerError(code="stall")],
+    [
+        TimeoutError("deep worker deadline"),
+        deep_transport.DeepWorkerError(code="timeout"),
+        deep_transport.DeepWorkerError(code="stall"),
+    ],
     ids=["worker-deadline", "worker-timeout", "worker-stall"],
 )
-def test_call_timeout_during_exploration_still_integrates_verified_evidence(tmp_path, monkeypatch, call_error):
+def test_call_timeout_during_exploration_still_integrates_verified_evidence(
+    tmp_path, monkeypatch, call_error
+):
     """2026-09-23の実資料受入(300秒中175秒で回答未生成): 探索中の呼出には
     「残り時間−統合予約」がtimeoutとして渡るため、その呼出のtimeoutは探索の
     予定終了である。照合済み根拠があれば統合へ進むこと。"""
@@ -579,7 +586,9 @@ def test_run_deadline_during_exploration_is_not_treated_as_call_timeout(tmp_path
     assert calls["text"] == 0
 
 
-def test_answer_state_is_verification_failed_when_final_citations_are_invalid(tmp_path, monkeypatch):
+def test_answer_state_is_verification_failed_when_final_citations_are_invalid(
+    tmp_path, monkeypatch
+):
     """回答は返ったが根拠ID検査に通らない場合は検証失敗とする。"""
     backend(monkeypatch, answer="根拠のない断定。")
     result = research(tmp_path)

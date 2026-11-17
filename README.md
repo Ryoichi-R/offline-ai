@@ -100,4 +100,4 @@ python _internal/search.py --mode assistant --interactive
 
 ## 既知の制限
 
-PDFの直接検索には対応していません。モデルの速度やGPU配置は機器構成に依存します。公開前の検証状況は[開発手順](CONTRIBUTING.md)の公開前未完了条件を参照してください。
+PDFの直接検索には対応していません。モデルの速度やGPU配置は機器構成に依存します。公開前の検証状況は[ソース配布の公開前検証](CONTRIBUTING.md#ソース配布の公開前検証)を参照してください。

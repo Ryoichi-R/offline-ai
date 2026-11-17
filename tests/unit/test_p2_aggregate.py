@@ -47,14 +47,38 @@ def _receipt(verify: str = "on") -> dict:
                 "runs": [
                     {
                         "questions": [
-                            q("T01", "near-miss", "answer", "sufficient", "partial", "verified", 3000.0),
+                            q(
+                                "T01",
+                                "near-miss",
+                                "answer",
+                                "sufficient",
+                                "partial",
+                                "verified",
+                                3000.0,
+                            ),
                             q("T05", "synonym", "", "partial", "partial", "failed", 15000.0),
                         ]
                     },
                     {
                         "questions": [
-                            q("T01", "near-miss", "answer", "sufficient", "sufficient", "skipped_budget", 0.0),
-                            q("T05", "synonym", "", "insufficient", "insufficient", "skipped_not_applicable", 0.0),
+                            q(
+                                "T01",
+                                "near-miss",
+                                "answer",
+                                "sufficient",
+                                "sufficient",
+                                "skipped_budget",
+                                0.0,
+                            ),
+                            q(
+                                "T05",
+                                "synonym",
+                                "",
+                                "insufficient",
+                                "insufficient",
+                                "skipped_not_applicable",
+                                0.0,
+                            ),
                         ]
                     },
                 ]
@@ -62,10 +86,26 @@ def _receipt(verify: str = "on") -> dict:
         },
         "answer_probes": {
             "agentic-lite": [
-                probe("T01", 1, "sufficient", "partial", "verified", passed=False,
-                      diversion_verdict="FAIL", forbidden_fact=True),
-                probe("T01", 2, "sufficient", "partial", "verified", passed=True,
-                      diversion_verdict="PASS", forbidden_fact=False),
+                probe(
+                    "T01",
+                    1,
+                    "sufficient",
+                    "partial",
+                    "verified",
+                    passed=False,
+                    diversion_verdict="FAIL",
+                    forbidden_fact=True,
+                ),
+                probe(
+                    "T01",
+                    2,
+                    "sufficient",
+                    "partial",
+                    "verified",
+                    passed=True,
+                    diversion_verdict="PASS",
+                    forbidden_fact=False,
+                ),
             ]
         },
         "answer_probes_same_evidence": {
@@ -134,12 +174,27 @@ def test_percentile_nearest_rank():
 
 def test_verification_summary_breaks_down_failure_reasons():
     samples = [
-        {"pre": "partial", "post": "partial", "verification_status": "failed",
-         "verification_latency_ms": 900.0, "failure_reason": "contradiction"},
-        {"pre": "partial", "post": "partial", "verification_status": "failed",
-         "verification_latency_ms": 15000.0, "failure_reason": "timeout"},
-        {"pre": "partial", "post": "partial", "verification_status": "verified",
-         "verification_latency_ms": 4000.0, "failure_reason": ""},
+        {
+            "pre": "partial",
+            "post": "partial",
+            "verification_status": "failed",
+            "verification_latency_ms": 900.0,
+            "failure_reason": "contradiction",
+        },
+        {
+            "pre": "partial",
+            "post": "partial",
+            "verification_status": "failed",
+            "verification_latency_ms": 15000.0,
+            "failure_reason": "timeout",
+        },
+        {
+            "pre": "partial",
+            "post": "partial",
+            "verification_status": "verified",
+            "verification_latency_ms": 4000.0,
+            "failure_reason": "",
+        },
     ]
     summary = agg.verification_summary(samples)["partial"]
     assert summary["counts"] == {

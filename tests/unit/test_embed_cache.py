@@ -570,9 +570,7 @@ def test_incremental_plan_counts_file_delta_and_reuse(tmp_path, monkeypatch):
     (src / "a.md").write_text("本文Aを変更", encoding="utf-8")
     (src / "deleted.md").unlink()
     (src / "added.md").write_text("追加本文", encoding="utf-8")
-    plan = search.plan_embed_index_update(
-        "bge-m3", mode="incremental", model_identity=identity
-    )
+    plan = search.plan_embed_index_update("bge-m3", mode="incremental", model_identity=identity)
 
     assert plan["added_files"] == 1
     assert plan["changed_files"] == 1
@@ -595,14 +593,14 @@ def test_incremental_build_reuses_only_unchanged_files(tmp_path, monkeypatch):
     identity = _fixture_model_identity()
     monkeypatch.setattr(search, "get_embed_model_identity", lambda model: dict(identity))
     calls = []
-    monkeypatch.setattr(search, "_get_embedding", lambda text, model: calls.append(text) or [1.0, 0.0])
+    monkeypatch.setattr(
+        search, "_get_embedding", lambda text, model: calls.append(text) or [1.0, 0.0]
+    )
     search.build_or_update_embed_index("bge-m3", model_identity=identity)
     calls.clear()
 
     (src / "a.md").write_text("本文Aを変更", encoding="utf-8")
-    search.build_or_update_embed_index(
-        "bge-m3", mode="incremental", model_identity=identity
-    )
+    search.build_or_update_embed_index("bge-m3", mode="incremental", model_identity=identity)
 
     assert calls == ["本文Aを変更"]
 
@@ -626,9 +624,7 @@ def test_full_build_ignores_completed_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(search, "_get_embedding", embed)
     search.build_or_update_embed_index("bge-m3", model_identity=identity)
     calls["n"] = 0
-    search.build_or_update_embed_index(
-        "bge-m3", mode="full", model_identity=identity
-    )
+    search.build_or_update_embed_index("bge-m3", mode="full", model_identity=identity)
 
     assert calls["n"] == 2
 
@@ -986,9 +982,7 @@ def test_second_writer_reuses_existing_cache_without_new_embeddings(tmp_path, mo
     )
     assert search._EMBED_PROCESS_LOCK.acquire(blocking=False)
     try:
-        result = search.build_or_update_embed_index(
-            "bge-m3", chunks, model_identity=identity
-        )
+        result = search.build_or_update_embed_index("bge-m3", chunks, model_identity=identity)
     finally:
         search._EMBED_PROCESS_LOCK.release()
 

@@ -78,9 +78,7 @@ def test_memo_invalidated_when_file_updated(source_root, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_memo_invalidated_when_same_size_and_mtime_file_content_changes(
-    source_root, monkeypatch
-):
+def test_memo_invalidated_when_same_size_and_mtime_file_content_changes(source_root, monkeypatch):
     """mtime/sizeが同じでもhash差分でmemoを無効化する。"""
     calls = _count_calls(monkeypatch)
     target = source_root / "a.md"

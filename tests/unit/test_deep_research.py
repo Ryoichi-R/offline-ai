@@ -32,10 +32,7 @@ def test_deep_json_verification_has_a_separate_output_budget(monkeypatch):
         "supported": True
     }
     assert payloads[0]["body"]["options"]["num_ctx"] == deep_research.DEEP_NUM_CTX
-    assert (
-        payloads[0]["body"]["options"]["num_predict"]
-        == deep_research.DEEP_JSON_NUM_PREDICT
-    )
+    assert payloads[0]["body"]["options"]["num_predict"] == deep_research.DEEP_JSON_NUM_PREDICT
 
     payloads.clear()
     monkeypatch.setattr(
@@ -251,9 +248,9 @@ def test_summarize_unconfirmed_collapses_bulk_reasons_for_prompt():
         {"reason": "candidate_limit", "path": f"doc-{i}.md", "status": "unconfirmed"}
         for i in range(500)
     ] + [{"reason": "model_error", "path": "important.md", "status": "unconfirmed"}]
-    unconfirmed = [
-        f"candidate_limit: doc-{i}.md L1-2000000000" for i in range(500)
-    ] + ["model_error: important.md — 追加観点の確認に失敗"]
+    unconfirmed = [f"candidate_limit: doc-{i}.md L1-2000000000" for i in range(500)] + [
+        "model_error: important.md — 追加観点の確認に失敗"
+    ]
 
     summary = deep_research._summarize_unconfirmed_for_prompt(unconfirmed, ledger)
 
@@ -267,8 +264,13 @@ def test_summarize_unconfirmed_collapses_bulk_reasons_for_prompt():
 
 
 def test_summarize_unconfirmed_truncates_when_detail_lines_overflow_budget():
-    ledger = [{"reason": "model_error", "path": f"doc-{i}.md", "status": "unconfirmed"} for i in range(200)]
-    unconfirmed = [f"model_error: doc-{i}.md — 詳細理由がここに入る想定の長めの文言" for i in range(200)]
+    ledger = [
+        {"reason": "model_error", "path": f"doc-{i}.md", "status": "unconfirmed"}
+        for i in range(200)
+    ]
+    unconfirmed = [
+        f"model_error: doc-{i}.md — 詳細理由がここに入る想定の長めの文言" for i in range(200)
+    ]
 
     summary = deep_research._summarize_unconfirmed_for_prompt(unconfirmed, ledger, max_chars=500)
 
@@ -299,10 +301,21 @@ def test_diagnostics_stage_seconds_include_final_integration_time(tmp_path, monk
 
     def model(name, system, user, **kwargs):
         if system == deep_research.DEEP_VERIFY_SYSTEM:
-            return {"supported": True, "contradictions": [], "missing_conditions": [], "unsupported_claims": []}
+            return {
+                "supported": True,
+                "contradictions": [],
+                "missing_conditions": [],
+                "unsupported_claims": [],
+            }
         if system == deep_research.DEEP_GAPS_SYSTEM:
             return {"queries": [], "unresolved": []}
-        return {"subject": "対象", "scope": "s", "conditions": ["対象である"], "exceptions": [], "references": []}
+        return {
+            "subject": "対象",
+            "scope": "s",
+            "conditions": ["対象である"],
+            "exceptions": [],
+            "references": [],
+        }
 
     clock = {"now": 1000.0}
     monkeypatch.setattr(deep_research.time, "monotonic", lambda: clock["now"])
@@ -344,7 +357,13 @@ def test_fallback_answer_collapses_bulk_exclusions_but_keeps_important_entries()
         "model_error:  — 最終回答を生成できず原文抜粋を表示"
     ]
     evidence = [
-        {"evidence_id": "E1", "path": "a.md", "start_line": 1, "end_line": 1, "excerpt": "対象である。"}
+        {
+            "evidence_id": "E1",
+            "path": "a.md",
+            "start_line": 1,
+            "end_line": 1,
+            "excerpt": "対象である。",
+        }
     ]
 
     answer = deep_research._fallback_answer(evidence, unconfirmed, ledger, "time_budget")
@@ -382,7 +401,9 @@ def test_run_deep_research_diagnostics_separate_elapsed_from_call_timeout(tmp_pa
     }
 
 
-def test_deep_answer_reaches_generation_with_deep_headings_and_bulk_exclusions(tmp_path, monkeypatch):
+def test_deep_answer_reaches_generation_with_deep_headings_and_bulk_exclusions(
+    tmp_path, monkeypatch
+):
     """回答未生成の是正（2026-09-23計画・最優先節）の受入条件そのもの:
     深い見出し階層と、候補・資料・単位の各上限を超える大量の除外候補が
     同時にあっても、本文読取から回答生成・検証まで到達することを確認する。

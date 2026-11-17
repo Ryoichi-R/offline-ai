@@ -46,7 +46,11 @@ def run_node(tail: str):
         pytest.skip("Node.js is required for dynamic UI contract tests")
     result = subprocess.run(
         [node, "-e", HARNESS + tail, str(INDEX_HTML)],
-        capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
@@ -62,7 +66,11 @@ def quality(state, **extra):
         else "一部の観点は根拠を確認できませんでした。確認できた範囲だけを回答しています。",
         "gates": {
             "G1": {"label": "原文・引用", "status": "passed", "codes": []},
-            "G2": {"label": "意味の支持", "status": "passed" if state == "passed" else "uncertain", "codes": []},
+            "G2": {
+                "label": "意味の支持",
+                "status": "passed" if state == "passed" else "uncertain",
+                "codes": [],
+            },
             "G3": {"label": "質問への適合", "status": "passed", "codes": []},
             "G4": {"label": "文章の構成", "status": "not_run", "codes": []},
         },
@@ -83,25 +91,40 @@ def test_static_structure_declares_the_banner_events_and_markdown_hook():
     assert "answerQualityFormat.lines(state.resultAnswerQuality)" in html[save_start:save_end]
     # 画面は textContent で描画し、サーバー文字列をHTMLとして解釈しない。
     render_start = html.index("    renderAnswerQuality()")
-    assert "innerHTML" not in html[render_start : html.index("    renderEvidence(ev)", render_start)]
+    assert (
+        "innerHTML" not in html[render_start : html.index("    renderEvidence(ev)", render_start)]
+    )
 
 
 def test_lines_show_reason_unconfirmed_scope_gates_and_removed_claims():
-    lines = run_node(f"out(answerQualityFormat.lines({json.dumps(quality('partial'), ensure_ascii=False)}));")
+    lines = run_node(
+        f"out(answerQualityFormat.lines({json.dumps(quality('partial'), ensure_ascii=False)}));"
+    )
     assert lines[0].startswith("品質状態: 要確認（一部の観点は根拠を確認できませんでした")
     assert lines[1] == "未確認の範囲: 別の会議体の役割との区別"
-    assert lines[2] == "検査: 原文・引用 通過 / 意味の支持 判定不能 / 質問への適合 通過 / 文章の構成 未実施"
+    assert (
+        lines[2]
+        == "検査: 原文・引用 通過 / 意味の支持 判定不能 / 質問への適合 通過 / 文章の構成 未実施"
+    )
     assert lines[3] == "検査を通らず除いた主張: 2件"
-    corrected = run_node(f"out(answerQualityFormat.lines({json.dumps(quality('needs_review', correctedQuotes=3), ensure_ascii=False)}));")
+    corrected = run_node(
+        f"out(answerQualityFormat.lines({json.dumps(quality('needs_review', correctedQuotes=3), ensure_ascii=False)}));"
+    )
     assert corrected[-1] == "原文の範囲へ補正した引用: 3件"
     assert all("補正" not in line for line in lines)
 
 
 def test_passed_is_shown_as_checked_but_never_as_a_guarantee_and_empty_is_hidden():
-    lines = run_node(f"out(answerQualityFormat.lines({json.dumps(quality('passed'), ensure_ascii=False)}));")
+    lines = run_node(
+        f"out(answerQualityFormat.lines({json.dumps(quality('passed'), ensure_ascii=False)}));"
+    )
     assert lines[0].startswith("品質状態: 検査済み")
-    assert "保証するものではありません" in lines[0] and "正確" not in lines[0].replace("正確性を保証するものではありません", "")
-    assert run_node("out([answerQualityFormat.lines(null), answerQualityFormat.lines({}), answerQualityFormat.needsReview(null)]);") == [[], [], False]
+    assert "保証するものではありません" in lines[0] and "正確" not in lines[0].replace(
+        "正確性を保証するものではありません", ""
+    )
+    assert run_node(
+        "out([answerQualityFormat.lines(null), answerQualityFormat.lines({}), answerQualityFormat.needsReview(null)]);"
+    ) == [[], [], False]
 
 
 @pytest.mark.parametrize("state", ["passed", "partial", "needs_review", "failed"])
@@ -150,7 +173,9 @@ out({{screen: ui.els.answerQuality.textContent, markdown: saved[0]}});
 
 def test_a_new_search_clears_the_previous_quality_and_errors_do_not_keep_it():
     html = INDEX_HTML.read_text(encoding="utf-8")
-    start = html.index("state.resultAnswerEmpty = false;\n        state.resultAnswerQuality = null;")
+    start = html.index(
+        "state.resultAnswerEmpty = false;\n        state.resultAnswerQuality = null;"
+    )
     assert "this.renderAnswerQuality();" in html[start : start + 200]
     assert html.count("state.resultAnswerQuality = null;") >= 3  # 新規検索・SSE error・onError
 
@@ -207,7 +232,16 @@ def test_deep_diagnostics_lines_describe_v2_calls_and_deferred_detail():
         "final_answer": {
             "attempts": [],
             "result": "v2_needs_review",
-            "v2": {"calls": {"counts": {"draft": {"ok": 2}, "g2": {"ok": 1, "not_run": 3}, "g34": {"error": 1}}}, "reexplored": True},
+            "v2": {
+                "calls": {
+                    "counts": {
+                        "draft": {"ok": 2},
+                        "g2": {"ok": 1, "not_run": 3},
+                        "g34": {"error": 1},
+                    }
+                },
+                "reexplored": True,
+            },
         },
         "answer_policy_v2": {"role_deferred": {"practical_detail": 3, "background": 1}},
     }
@@ -217,7 +251,9 @@ def test_deep_diagnostics_lines_describe_v2_calls_and_deferred_detail():
     assert "草稿 2回 / 意味照合 1回 / 評価 1回 / 再探索 あり" in v2
     assert any("展開しなかった詳細の範囲: 4件" in line for line in lines)
     # 旧経路の診断は従来どおり（v2の行を出さない）。
-    legacy = run_node("out(deepDiagnosticsFormat.lines({final_answer: {attempts: [{uncited_lines: 0}], result: 'accepted'}}));")
+    legacy = run_node(
+        "out(deepDiagnosticsFormat.lines({final_answer: {attempts: [{uncited_lines: 0}], result: 'accepted'}}));"
+    )
     assert not any("(v2)" in line for line in legacy)
 
 

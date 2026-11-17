@@ -94,8 +94,10 @@ actionlint -shellcheck= -pyflakes= .github/workflows/*.yml
 - 変更したtestの実行結果を記載する。
 - 影響範囲（`search.bat`/`web.bat`のいずれか、または両方、あるいはpackage生成のみ等）を明記する。
 
-## 公開前の未完了条件
+## ソース配布の公開前検証
 
-公開先URL・非公開報告窓口・第三者再配布承認は未確定。`release/preparation-policy.json`のformatter、lint、coverage 90%および要求receiptは公開gateであり、pytest/Pester成功だけでは満たさない。standaloneでこれら全てを再現する検証環境とreceiptは未整備のため、公開準備完了とは扱わない。
+`release/preparation-policy.json` は GitHub Release のソース ZIP に適用します。Windows 上の Python 3.11・3.12 と Pester、formatter、lint、依存関係レビュー、行カバレッジ90%以上を確認します。ZIP のクリーン展開、内容とチェックサムの照合、ライセンスの確認、Windows 11 x64 で合成資料を使う索引・CLI・Web のスモーク結果を、候補に結び付けて記録します。
+
+利用者が作る搬送パッケージでは、インストーラーの署名、モデルの固定、実機性能、インストールとアンインストールを別途検証します。第三者コンポーネントを同梱して公開する場合は再配布審査が必要です。
 
 `_internal/download-manifest.json`のinstaller固定版・hashReviewの日付は、現在のhash照合の記録を保持する。実利用Ollama版と同梱installer版は別管理であり、版を更新する際はartifactのhash・署名・互換性を再検証する。日付だけを最新化しない。

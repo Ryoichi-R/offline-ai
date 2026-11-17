@@ -1,65 +1,146 @@
 {
-  "schema_version": "1.1",
-  "corpus_dir": "corpus",
-  "notes": "2026-09-27に固定した未実行の独立合成holdout。意味上の支持は人手レビューを要求する。",
-  "acceptance": {
-    "min_item_coverage": 1.0,
-    "max_critical_misses": 0,
-    "max_unsupported_citations": 0
-  },
-  "items": [
-    {
-      "id": "MH01",
-      "query": "正規職員と派遣職員の対象範囲、通常利用の条件、事故対応時に緩和される条件を教えてください",
-      "category": "scope-condition-exception",
-      "required_terms": ["正規職員", "派遣職員", "委託先職員", "事前承認", "安全講習", "情報管理責任者", "両方"],
-      "required_evidence_terms": ["正規職員", "派遣職員", "委託先職員", "事前承認", "安全講習", "同伴"],
-      "expected_sources": [
-        {"path": "rules/access-control.md", "line_start": 3, "line_end": 8, "sha256": "0a24bd0e3058701e6fe18085a1e36ee75100a7ff0166fe2b24a84ad5c16cf5b3"}
-      ],
-      "critical": true,
-      "expected_statements": ["正規職員が対象で、派遣職員と委託先職員は対象外。", "通常は事前承認と安全講習の両方が必要で、緊急時も承認は免除されない。"],
-      "forbidden_patterns": ["派遣職員.{0,8}(対象です|利用できます)", "事前承認.{0,8}(不要|免除される)"]
+    "schema_version": "1.1",
+    "corpus_dir": "corpus",
+    "notes": "2026-09-27に固定した未実行の独立合成holdout。意味上の支持は人手レビューを要求する。",
+    "acceptance": {
+        "min_item_coverage": 1.0,
+        "max_critical_misses": 0,
+        "max_unsupported_citations": 0
     },
-    {
-      "id": "MH02",
-      "query": "北拠点のタブレット料金と標準期間、標準期間後に延長する条件と上限を教えてください",
-      "category": "table-footnote",
-      "required_terms": ["北拠点", "1,800円", "12か月", "管理者", "期間満了前", "最長3か月"],
-      "required_evidence_terms": ["北拠点", "1,800円", "12か月", "管理者", "期間満了前", "最長3か月"],
-      "expected_sources": [
-        {"path": "tables/equipment-rate-sheet.md", "line_start": 3, "line_end": 9, "sha256": "18f226ccdfc6401001f9364e13a109ce59fd18def33249e1cea90ee67c2a552c"}
-      ],
-      "critical": true,
-      "expected_statements": ["北拠点の料金は月額1,800円で、標準貸出期間は12か月。", "延長は管理者承認と期間満了前の申請が必要で、最長3か月。"],
-      "forbidden_patterns": ["北拠点.{0,12}2,200円", "延長.{0,12}無条件"]
-    },
-    {
-      "id": "MH03",
-      "query": "モバイル機器一式の貸与期間、延長条件、終了後の返却期限と窓口を教えてください",
-      "category": "multi-document",
-      "required_terms": ["18か月", "資産担当者", "一度だけ", "最長4か月", "5営業日", "機器管理窓口"],
-      "required_evidence_terms": ["18か月", "資産担当者", "最長4か月", "5営業日", "機器管理窓口"],
-      "expected_sources": [
-        {"path": "policies/mobile-kit-loan.md", "line_start": 3, "line_end": 5, "sha256": "eb952b7e37a070c23e86d5d045a4c8993c88215bcd11d6b395e562762c8002f1"},
-        {"path": "procedures/mobile-kit-return.md", "line_start": 3, "line_end": 4, "sha256": "35c175a72d69301ec955e06bfa8912dfda4ed1e84e6473e419b2370b6c8fe8cc"}
-      ],
-      "critical": true,
-      "expected_statements": ["標準貸与期間は18か月で、資産担当者承認により一度だけ最長4か月延長できる。", "終了後5営業日以内に機器管理窓口へ返却する。"],
-      "forbidden_patterns": ["何度でも延長", "10営業日"]
-    },
-    {
-      "id": "MH04",
-      "query": "在宅勤務で保育サービスの費用を会社に請求できますか",
-      "category": "information-insufficiency",
-      "required_terms": [],
-      "required_evidence_terms": [],
-      "expected_sources": [],
-      "expected_abstention": true,
-      "abstention_patterns": ["(?:記載|明記|記述).{0,8}(?:ありません|されていません|されていない|見当たりません)", "(?:確認|判断)できません", "情報がありません", "資料だけでは.{0,8}(?:分かりません|判断できません)"],
-      "critical": true,
-      "expected_statements": [],
-      "forbidden_patterns": ["保育(?:サービス)?費用.{0,10}(?:支給|補助|精算).{0,4}(?:可能|できます|されます|対象です)"]
-    }
-  ]
+    "items": [
+        {
+            "id": "MH01",
+            "query": "正規職員と派遣職員の対象範囲、通常利用の条件、事故対応時に緩和される条件を教えてください",
+            "category": "scope-condition-exception",
+            "required_terms": [
+                "正規職員",
+                "派遣職員",
+                "委託先職員",
+                "事前承認",
+                "安全講習",
+                "情報管理責任者",
+                "両方"
+            ],
+            "required_evidence_terms": [
+                "正規職員",
+                "派遣職員",
+                "委託先職員",
+                "事前承認",
+                "安全講習",
+                "同伴"
+            ],
+            "expected_sources": [
+                {
+                    "path": "rules/access-control.md",
+                    "line_start": 3,
+                    "line_end": 8,
+                    "sha256": "0a24bd0e3058701e6fe18085a1e36ee75100a7ff0166fe2b24a84ad5c16cf5b3"
+                }
+            ],
+            "critical": true,
+            "expected_statements": [
+                "正規職員が対象で、派遣職員と委託先職員は対象外。",
+                "通常は事前承認と安全講習の両方が必要で、緊急時も承認は免除されない。"
+            ],
+            "forbidden_patterns": [
+                "派遣職員.{0,8}(対象です|利用できます)",
+                "事前承認.{0,8}(不要|免除される)"
+            ]
+        },
+        {
+            "id": "MH02",
+            "query": "北拠点のタブレット料金と標準期間、標準期間後に延長する条件と上限を教えてください",
+            "category": "table-footnote",
+            "required_terms": [
+                "北拠点",
+                "1,800円",
+                "12か月",
+                "管理者",
+                "期間満了前",
+                "最長3か月"
+            ],
+            "required_evidence_terms": [
+                "北拠点",
+                "1,800円",
+                "12か月",
+                "管理者",
+                "期間満了前",
+                "最長3か月"
+            ],
+            "expected_sources": [
+                {
+                    "path": "tables/equipment-rate-sheet.md",
+                    "line_start": 3,
+                    "line_end": 9,
+                    "sha256": "18f226ccdfc6401001f9364e13a109ce59fd18def33249e1cea90ee67c2a552c"
+                }
+            ],
+            "critical": true,
+            "expected_statements": [
+                "北拠点の料金は月額1,800円で、標準貸出期間は12か月。",
+                "延長は管理者承認と期間満了前の申請が必要で、最長3か月。"
+            ],
+            "forbidden_patterns": ["北拠点.{0,12}2,200円", "延長.{0,12}無条件"]
+        },
+        {
+            "id": "MH03",
+            "query": "モバイル機器一式の貸与期間、延長条件、終了後の返却期限と窓口を教えてください",
+            "category": "multi-document",
+            "required_terms": [
+                "18か月",
+                "資産担当者",
+                "一度だけ",
+                "最長4か月",
+                "5営業日",
+                "機器管理窓口"
+            ],
+            "required_evidence_terms": [
+                "18か月",
+                "資産担当者",
+                "最長4か月",
+                "5営業日",
+                "機器管理窓口"
+            ],
+            "expected_sources": [
+                {
+                    "path": "policies/mobile-kit-loan.md",
+                    "line_start": 3,
+                    "line_end": 5,
+                    "sha256": "eb952b7e37a070c23e86d5d045a4c8993c88215bcd11d6b395e562762c8002f1"
+                },
+                {
+                    "path": "procedures/mobile-kit-return.md",
+                    "line_start": 3,
+                    "line_end": 4,
+                    "sha256": "35c175a72d69301ec955e06bfa8912dfda4ed1e84e6473e419b2370b6c8fe8cc"
+                }
+            ],
+            "critical": true,
+            "expected_statements": [
+                "標準貸与期間は18か月で、資産担当者承認により一度だけ最長4か月延長できる。",
+                "終了後5営業日以内に機器管理窓口へ返却する。"
+            ],
+            "forbidden_patterns": ["何度でも延長", "10営業日"]
+        },
+        {
+            "id": "MH04",
+            "query": "在宅勤務で保育サービスの費用を会社に請求できますか",
+            "category": "information-insufficiency",
+            "required_terms": [],
+            "required_evidence_terms": [],
+            "expected_sources": [],
+            "expected_abstention": true,
+            "abstention_patterns": [
+                "(?:記載|明記|記述).{0,8}(?:ありません|されていません|されていない|見当たりません)",
+                "(?:確認|判断)できません",
+                "情報がありません",
+                "資料だけでは.{0,8}(?:分かりません|判断できません)"
+            ],
+            "critical": true,
+            "expected_statements": [],
+            "forbidden_patterns": [
+                "保育(?:サービス)?費用.{0,10}(?:支給|補助|精算).{0,4}(?:可能|できます|されます|対象です)"
+            ]
+        }
+    ]
 }

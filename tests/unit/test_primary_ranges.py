@@ -38,7 +38,10 @@ def test_title_wrapped_sections_are_units_and_ancillary_parts_are_demoted():
 
 
 def test_effective_date_section_with_transitional_measure_stays_primary():
-    text = NOTICE.replace("令和6年4月1日から適用する。", "令和6年4月1日から適用する。ただし経過措置として従前の様式も使用できる。")
+    text = NOTICE.replace(
+        "令和6年4月1日から適用する。",
+        "令和6年4月1日から適用する。ただし経過措置として従前の様式も使用できる。",
+    )
     main = {(u["start_line"], u["end_line"]) for u in ss.primary_units(text) if not u["ancillary"]}
     assert (10, 11) in main
 
@@ -73,11 +76,15 @@ def _documents(**texts):
 
 
 def test_title_variants_confirm_the_document():
-    docs = _documents(a="# 会計事務における押印の取扱いについて（通知）\n本文", b="# 旅費の支給について\n本文")
+    docs = _documents(
+        a="# 会計事務における押印の取扱いについて（通知）\n本文", b="# 旅費の支給について\n本文"
+    )
     result = ss.match_documents("会計事務における押印の取扱い の内容詳細", docs)
     assert result["confirmed"] == "a.md"
     # 全角・半角や括弧の表記ゆれを吸収する。
-    assert ss.match_documents("「会計事務における押印の取扱い」について", docs)["confirmed"] == "a.md"
+    assert (
+        ss.match_documents("「会計事務における押印の取扱い」について", docs)["confirmed"] == "a.md"
+    )
 
 
 def test_same_issuer_or_same_title_does_not_confirm():
@@ -110,7 +117,11 @@ def test_documents_from_chunks_uses_metadata_title_then_first_heading():
 
 
 def test_guided_scope_separates_breadth_from_granularity():
-    broad = ("この通知の内容詳細を教えて", "会計課の押印の取扱いについて詳しく", "この通知のポイント")
+    broad = (
+        "この通知の内容詳細を教えて",
+        "会計課の押印の取扱いについて詳しく",
+        "この通知のポイント",
+    )
     specific = ("この通知の適用日はいつですか", "この通知の例外を詳しく", "期限は？", "適用日")
     for query in broad:
         assert ap.classify_guided_scope(query).scope == ap.GUIDED_SCOPE_BROAD, query
@@ -121,7 +132,10 @@ def test_guided_scope_separates_breadth_from_granularity():
 
 def test_title_words_are_not_counted_as_asked_items():
     title = "適用除外の手続について"
-    assert ap.classify_guided_scope(f"{title}の内容", exclude_texts=(title,)).scope == ap.GUIDED_SCOPE_BROAD
+    assert (
+        ap.classify_guided_scope(f"{title}の内容", exclude_texts=(title,)).scope
+        == ap.GUIDED_SCOPE_BROAD
+    )
     assert ap.classify_guided_scope(f"{title}の内容").scope == ap.GUIDED_SCOPE_SPECIFIC
 
 
@@ -141,36 +155,36 @@ def test_guided_cues_do_not_change_v2_aspect_cues():
 # --- 実資料（発端事例）と同じ構造の照合（合成資料） -------------------------------------
 
 HEADER_NOTICE_LINES = (
-        "> 会発1225第２号",  # 1
-        "> 令和２年12月25日",  # 2
-        "",  # 3
-        "本省内部部局長",  # 4
-        "",  # 5
-        "施設等機関の長",  # 6
-        "",  # 7
-        "殿",  # 8
-        "",  # 9
-        "**大臣官房会計課長（公印省略）**",  # 10
-        "",  # 11
-        "# 会計手続における押印の見直しについて（通知）",  # 12
-        "",  # 13
-        "政府方針を踏まえ、会計手続における押印の見直しについて通知する。",  # 14
-        "",  # 15
-        "記",  # 16
-        "",  # 17
-        "## １ 押印の見直し",  # 18
-        "会計手続における押印は原則不要とする。",  # 19
-        "## ２ 真正性の確保",  # 20
-        "本人確認や連絡内容の記録等により真正性を確認する。",  # 21
-        "## ３ 実施時期",  # 22
-        "本通知は、令和３年１月１日から適用する。",  # 23
+    "> 会発1225第２号",  # 1
+    "> 令和２年12月25日",  # 2
+    "",  # 3
+    "本省内部部局長",  # 4
+    "",  # 5
+    "施設等機関の長",  # 6
+    "",  # 7
+    "殿",  # 8
+    "",  # 9
+    "**大臣官房会計課長（公印省略）**",  # 10
+    "",  # 11
+    "# 会計手続における押印の見直しについて（通知）",  # 12
+    "",  # 13
+    "政府方針を踏まえ、会計手続における押印の見直しについて通知する。",  # 14
+    "",  # 15
+    "記",  # 16
+    "",  # 17
+    "## １ 押印の見直し",  # 18
+    "会計手続における押印は原則不要とする。",  # 19
+    "## ２ 真正性の確保",  # 20
+    "本人確認や連絡内容の記録等により真正性を確認する。",  # 21
+    "## ３ 実施時期",  # 22
+    "本通知は、令和３年１月１日から適用する。",  # 23
 )
 HEADER_NOTICE = "\n".join(HEADER_NOTICE_LINES)
 CITING_MEMO_LINES = (
-        "事務連絡",
-        "大臣官房会計課監査指導室長",
-        "# 押印を前提としている契約関係書類の取扱いについて",
-        "令和２年12月25日付け会発 1225第２号をもって通知されたところです。",
+    "事務連絡",
+    "大臣官房会計課監査指導室長",
+    "# 押印を前提としている契約関係書類の取扱いについて",
+    "令和２年12月25日付け会発 1225第２号をもって通知されたところです。",
 )
 CITING_MEMO = "\n".join(CITING_MEMO_LINES)
 
@@ -183,7 +197,9 @@ def _corpus_documents():
             "laws/会計法-resegmented-01.md": "# 会計法\n本文\n",
             "notice/n-37-再委託の適正化（周知）.md": "# 再委託の適正化について\n会計課長\n本文\n",
         },
-        {"notice/会計課長通知（会計手続における押印の見直しについて）.md": "会計課長通知（会計手続における押印の見直しについて）"},
+        {
+            "notice/会計課長通知（会計手続における押印の見直しについて）.md": "会計課長通知（会計手続における押印の見直しについて）"
+        },
     )
 
 
@@ -200,14 +216,20 @@ def test_bracketed_formal_title_and_issuer_phrase():
     assert "会計手続における押印の見直し" in variants
     assert "会計課長通知" not in variants  # 発出者と種別だけの句は表題の中核にしない
     docs = _corpus_documents()
-    confirmed = ss.match_documents("会計手続における押印の見直しについての内容詳細", docs)["confirmed"]
+    confirmed = ss.match_documents("会計手続における押印の見直しについての内容詳細", docs)[
+        "confirmed"
+    ]
     assert confirmed.startswith("notice/会計課長通知")
 
 
 def test_issuer_and_subject_find_a_candidate_without_confirming():
-    result = ss.match_documents("押印を求めない事に関する会計課長通知の内容詳細を教えてください", _corpus_documents())
+    result = ss.match_documents(
+        "押印を求めない事に関する会計課長通知の内容詳細を教えてください", _corpus_documents()
+    )
     assert result["confirmed"] is None
-    assert [c["path"] for c in result["candidates"]] == ["notice/会計課長通知（会計手続における押印の見直しについて）.md"]
+    assert [c["path"] for c in result["candidates"]] == [
+        "notice/会計課長通知（会計手続における押印の見直しについて）.md"
+    ]
     assert result["candidates"][0]["reasons"] == ["issuer_subject"]
     # 発出者だけでは候補にも確定にもしない（「会計法」の表題の部分一致も拾わない）。
     assert ss.match_documents("会計課長通知の内容を教えて", _corpus_documents())["candidates"] == []
@@ -216,7 +238,9 @@ def test_issuer_and_subject_find_a_candidate_without_confirming():
 def test_subject_terms_alone_list_candidates():
     result = ss.match_documents("押印の見直しについて詳しく", _corpus_documents())
     assert result["confirmed"] is None
-    assert "notice/会計課長通知（会計手続における押印の見直しについて）.md" in [c["path"] for c in result["candidates"]]
+    assert "notice/会計課長通知（会計手続における押印の見直しについて）.md" in [
+        c["path"] for c in result["candidates"]
+    ]
 
 
 def test_full_document_number_uses_the_header_not_citations():

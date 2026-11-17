@@ -55,7 +55,10 @@ def _question_meta(receipt: dict) -> dict[str, dict]:
             for q in run.get("questions", []):
                 meta.setdefault(
                     q["question_id"],
-                    {"category": q.get("category", ""), "abstain_layer": q.get("abstain_layer", "")},
+                    {
+                        "category": q.get("category", ""),
+                        "abstain_layer": q.get("abstain_layer", ""),
+                    },
                 )
     return meta
 
@@ -213,7 +216,9 @@ def build_markdown(receipts: list[tuple[str, dict]]) -> str:
         fs = false_sufficient(retrieval_samples(r), _question_meta(r))
         for qid in sorted(fs):
             e = fs[qid]
-            lines.append(f"| {pattern_label(r)} | {qid} | {e['category']} | {e['sufficient']}/{e['trials']} |")
+            lines.append(
+                f"| {pattern_label(r)} | {qid} | {e['category']} | {e['sufficient']}/{e['trials']} |"
+            )
     lines.append("")
 
     for key, heading in (

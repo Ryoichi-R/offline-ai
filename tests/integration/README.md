@@ -13,9 +13,9 @@
 - 拒否時に既存install-stateのhashが変化しないこと
 - VRAM基準の推薦、保存先別の不足量、日本語表示、GPU配置観測のreceipt構造
 
-## 未完了の手動受入
+## ソース配布と搬送パッケージの手動受入
 
-fixture E2Eは実model、実GPU、実Ollama runtimeの動作保証ではありません。公開候補に対する正式な手動受入では、`release/preparation-policy.json`のmanual acceptanceに従い、次を別途実施します。
+ソース ZIP の受入は `release/preparation-policy.json` に従い、Windows 11 x64 でクリーン展開と合成資料を使う索引・CLI・Web のスモークを確認します。実モデル、実 GPU、Ollama 実機を含む搬送パッケージを検証する場合は、次を別途実施します。
 
 - 固定Ollama版と採用digestを使った実package生成
 - Windows 11 x64 clean環境、標準user権限、apostrophe path、別drive `OLLAMA_MODELS`

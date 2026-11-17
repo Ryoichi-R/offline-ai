@@ -39,7 +39,10 @@ def run(scenario):
     if not node:
         pytest.skip("Node.js required")
     result = subprocess.run(
-        [node, "-e", HARNESS, str(HTML), scenario], capture_output=True, text=True, timeout=20
+        [node, "-e", HARNESS, str(HTML), scenario],
+        capture_output=True,
+        encoding="utf-8",
+        timeout=20,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)

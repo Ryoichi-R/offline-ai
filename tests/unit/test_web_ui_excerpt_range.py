@@ -7,14 +7,37 @@ from test_web_ui_answer_quality import INDEX_HTML, run_node
 
 def test_saved_markdown_and_screen_label_partial_excerpts():
     items = [
-        {"path": "notice.md", "sourceTitle": "notice.md", "startLine": 6, "endLine": 9,
-         "snippet": "抜粋", "sourceSha256": "a" * 64,
-         "snippetStartLine": 8, "snippetEndLine": 8, "snippetTruncated": True},
-        {"path": "notice.md", "sourceTitle": "notice.md", "startLine": 1, "endLine": 3,
-         "snippet": "全体", "sourceSha256": "a" * 64,
-         "snippetStartLine": 1, "snippetEndLine": 3, "snippetTruncated": False},
-        {"path": "other.md", "sourceTitle": "other.md", "startLine": 1, "endLine": 9,
-         "snippet": "検索時", "sourceSha256": "b" * 64, "snippetTruncated": True},
+        {
+            "path": "notice.md",
+            "sourceTitle": "notice.md",
+            "startLine": 6,
+            "endLine": 9,
+            "snippet": "抜粋",
+            "sourceSha256": "a" * 64,
+            "snippetStartLine": 8,
+            "snippetEndLine": 8,
+            "snippetTruncated": True,
+        },
+        {
+            "path": "notice.md",
+            "sourceTitle": "notice.md",
+            "startLine": 1,
+            "endLine": 3,
+            "snippet": "全体",
+            "sourceSha256": "a" * 64,
+            "snippetStartLine": 1,
+            "snippetEndLine": 3,
+            "snippetTruncated": False,
+        },
+        {
+            "path": "other.md",
+            "sourceTitle": "other.md",
+            "startLine": 1,
+            "endLine": 9,
+            "snippet": "検索時",
+            "sourceSha256": "b" * 64,
+            "snippetTruncated": True,
+        },
     ]
     result = run_node(
         f"""
@@ -45,7 +68,14 @@ def test_evidence_list_shows_the_excerpt_label():
 
 
 def test_segment_ranges_are_listed_in_the_label():
-    item = {"snippetTruncated": True, "snippetStartLine": 30, "snippetEndLine": 58,
-            "snippetSegments": [{"startLine": 30, "endLine": 38, "text": "a"}, {"startLine": 53, "endLine": 58, "text": "b"}]}
+    item = {
+        "snippetTruncated": True,
+        "snippetStartLine": 30,
+        "snippetEndLine": 58,
+        "snippetSegments": [
+            {"startLine": 30, "endLine": 38, "text": "a"},
+            {"startLine": 53, "endLine": 58, "text": "b"},
+        ],
+    }
     result = run_node(f"out(ui._excerptRangeLabel({json.dumps(item)}));")
     assert result == "抜粋 行 30-38、53-58（根拠範囲の一部。区間の間と前後を省略）"
